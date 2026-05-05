@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Credentials and tokens (never commit these)
+credentials.json
+token.json
+
+# Sync state (local per-machine, not shared via git)
+.claude_mirror_manifest.json
+.claude_mirror_inbox.jsonl
+.claude_mirror_hash_cache.json
+# legacy names kept ignored during migration window:
+.claude_sync_manifest.json
+.claude_sync_inbox.jsonl
+.claude_sync_hash_cache.json
+
+# macOS
+.DS_Store
+ROADMAP.md
+
+# Editor / IDE / agent state (never relevant to this project)
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo

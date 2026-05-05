@@ -1,0 +1,80 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claude-mirror"
+version = "0.5.10"
+description = "Mirror & sync Claude Code project markdown across machines + cloud backends (Google Drive, Dropbox, OneDrive, WebDAV) with snapshots and Tier 2 multi-backend"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+authors = [
+    { name = "Alessio Bravi" },
+]
+keywords = [
+    "sync", "mirror", "backup", "snapshot", "claude", "claude-code",
+    "markdown", "google-drive", "dropbox", "onedrive", "webdav",
+    "multi-backend",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Communications :: File Sharing",
+    "Topic :: Software Development :: Version Control",
+    "Topic :: System :: Archiving :: Backup",
+    "Topic :: System :: Archiving :: Mirroring",
+    "Topic :: Utilities",
+    "Typing :: Typed",
+]
+dependencies = [
+    "click>=8.0",
+    "rich>=13.0",
+    "pyyaml>=6.0",
+    "requests>=2.28",
+    "google-auth-oauthlib>=1.2",
+    "google-api-python-client>=2.100",
+    "google-cloud-pubsub>=2.18",
+    "plyer>=2.1",
+    "dropbox>=12.0",   # Dropbox backend (always installed — see [project.optional-dependencies] for back-compat aliases)
+    "msal>=1.24",      # OneDrive backend (always installed — see [project.optional-dependencies] for back-compat aliases)
+]
+
+# Project URLs — rendered in the right-hand sidebar of the PyPI page
+# under "Project links". Order matters: PyPI shows them top-to-bottom
+# in the order declared, so the most-useful destinations come first.
+# IMPORTANT: this subtable MUST come AFTER every flat field of
+# [project] (description, dependencies, classifiers, etc.) — once
+# `[project.urls]` is opened, subsequent flat assignments are
+# interpreted as keys under `urls`, NOT as flat [project] fields.
+[project.urls]
+Homepage      = "https://github.com/alessiobravi/claude-mirror"
+Repository    = "https://github.com/alessiobravi/claude-mirror"
+Changelog     = "https://github.com/alessiobravi/claude-mirror/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/alessiobravi/claude-mirror/blob/main/README.md"
+Issues        = "https://github.com/alessiobravi/claude-mirror/issues"
+
+# Back-compat aliases: as of v0.5.10 every backend ships in the base install.
+# These extras are now no-ops, kept so historical install commands like
+# `pipx install 'claude-mirror[dropbox]'` keep working without erroring.
+[project.optional-dependencies]
+dropbox = []
+onedrive = []
+all = []
+
+[project.scripts]
+claude-mirror         = "claude_mirror.cli:cli"
+claude-mirror-install = "claude_mirror.install:install_cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["claude_mirror"]

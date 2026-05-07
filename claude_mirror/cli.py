@@ -558,33 +558,10 @@ class _CLIGroup(click.Group):
             raise
 
 
-def _legacy_state_banner() -> None:
-    """Warn if legacy ~/.config/claude_sync/ is still present.
-
-    Printed to stderr so it doesn't pollute machine-readable command output.
-    Skipped when invoking `migrate-state` (we'd be telling the user to run
-    the command they're already running) or when the env var is set.
-    """
-    if os.environ.get("CLAUDE_MIRROR_SUPPRESS_MIGRATION_BANNER"):
-        return
-    argv = " ".join(sys.argv[1:])
-    if "migrate-state" in argv:
-        return
-    legacy = Path.home() / ".config" / "claude_sync"
-    if legacy.exists():
-        click.echo(
-            f"\n\033[33m⚠\033[0m  Legacy state detected at {legacy} — "
-            f"run \033[1mclaude-mirror migrate-state --apply\033[0m to rename "
-            f"it to ~/.config/claude_mirror/ (one-shot, idempotent).\n",
-            err=True,
-        )
-
-
 @click.group(cls=_CLIGroup)
 @click.version_option()
 def cli() -> None:
     """Sync Claude project MD files across machines via cloud storage."""
-    _legacy_state_banner()
 
 
 _DEFAULT_CREDENTIALS = str(CONFIG_DIR / "credentials.json")
@@ -2763,153 +2740,57 @@ def log(config_path: str, limit: int) -> None:
     console.print(table)
 
 
+
+
 # ──────────────────────────────────────────────────────────────────────────
-# migrate-state — one-shot rename of legacy claude_sync on-disk paths to
-# claude_mirror. Local-only (config dir + per-project manifest/inbox/cache
-# files + token_file paths inside YAMLs). Remote folder renames stay manual:
-# `_claude_sync_snapshots/` → `_claude_mirror_snapshots/` etc. on the
-# storage backend, since folder-rename semantics differ per backend and
-# blast radius is high. After UI rename, the code resolves folders by
-# name on next sync — no further action needed.
+# completion — emit shell-completion source for the user to eval/source
+#
+# Click 8+ supports tab-completion natively. The traditional bootstrap is
+#   eval "$(_CLAUDE_MIRROR_COMPLETE=zsh_source claude-mirror)"
+# which is opaque enough that nobody discovers it. This command prints the
+# same script with one obvious invocation:
+#   eval "$(claude-mirror completion zsh)"
 # ──────────────────────────────────────────────────────────────────────────
 
-_LEGACY_CONFIG_DIR = Path.home() / ".config" / "claude_sync"
-_NEW_CONFIG_DIR    = Path.home() / ".config" / "claude_mirror"
-_FILE_RENAMES = {
-    ".claude_sync_manifest.json":   ".claude_mirror_manifest.json",
-    ".claude_sync_inbox.jsonl":     ".claude_mirror_inbox.jsonl",
-    ".claude_sync_hash_cache.json": ".claude_mirror_hash_cache.json",
-}
+@cli.command()
+@click.argument(
+    "shell",
+    type=click.Choice(["bash", "zsh", "fish"], case_sensitive=False),
+)
+def completion(shell: str) -> None:
+    """Emit shell tab-completion source for claude-mirror.
 
+    Add to your shell's startup file:
 
-def _detect_legacy_state() -> dict:
-    """Scan filesystem for legacy claude_sync paths. Returns a report dict."""
-    import yaml as _yaml
-    report = {
-        "legacy_config_dir": _LEGACY_CONFIG_DIR.exists(),
-        "legacy_files": [],            # list of (project_path, old_name, new_name)
-        "yaml_token_paths": [],        # list of (yaml_path, key, old_value, new_value)
-    }
-    # Scan both old and new config dirs (whichever exists) for project YAMLs
-    for cfg_dir in [_LEGACY_CONFIG_DIR, _NEW_CONFIG_DIR]:
-        if not cfg_dir.exists():
-            continue
-        for yml in cfg_dir.glob("*.yaml"):
-            try:
-                data = _yaml.safe_load(yml.read_text()) or {}
-            except Exception:
-                continue
-            # Find token_file / credentials_file paths still pointing at claude_sync
-            for key in ("token_file", "credentials_file"):
-                val = data.get(key, "")
-                if isinstance(val, str) and "/claude_sync/" in val:
-                    report["yaml_token_paths"].append(
-                        (yml, key, val, val.replace("/claude_sync/", "/claude_mirror/"))
-                    )
-            project_path = data.get("project_path", "")
-            if project_path and Path(project_path).expanduser().exists():
-                pp = Path(project_path).expanduser()
-                for old_name, new_name in _FILE_RENAMES.items():
-                    if (pp / old_name).exists():
-                        report["legacy_files"].append((pp, old_name, new_name))
-    return report
+    \b
+      # zsh — append to ~/.zshrc
+      eval "$(claude-mirror completion zsh)"
 
+    \b
+      # bash — append to ~/.bashrc
+      eval "$(claude-mirror completion bash)"
 
-@cli.command("migrate-state")
-@click.option("--apply", "apply", is_flag=True, default=False,
-              help="Execute the migration. Without this flag, runs in dry-run mode and only reports what would change.")
-def migrate_state(apply: bool) -> None:
-    """Rename legacy claude_sync on-disk paths to claude_mirror.
+    \b
+      # fish — write to the completions dir
+      claude-mirror completion fish > ~/.config/fish/completions/claude-mirror.fish
 
-    Renames the local config directory (~/.config/claude_sync → ~/.config/claude_mirror),
-    rewrites token_file and credentials_file paths inside each project YAML,
-    and renames .claude_sync_* manifest/inbox/cache files in each project.
-
-    REMOTE folder renames (e.g. _claude_sync_snapshots/ on Google Drive) are NOT
-    performed automatically — rename them in your backend's web UI. The code
-    resolves folders by name on next sync and will pick up the new names with
-    no further action.
-
-    Idempotent: safe to re-run. Dry-run by default; pass --apply to execute.
+    After restarting your shell, `claude-mirror <TAB>` completes commands
+    and `claude-mirror push <TAB>` completes flag names. High-value flags
+    (--config, --backend) also complete their values.
     """
-    import shutil
-    report = _detect_legacy_state()
-    n_total = (
-        (1 if report["legacy_config_dir"] else 0)
-        + len(report["legacy_files"])
-        + len(report["yaml_token_paths"])
+    from click.shell_completion import BashComplete, FishComplete, ZshComplete
+
+    shell_classes = {
+        "bash": BashComplete,
+        "zsh": ZshComplete,
+        "fish": FishComplete,
+    }
+    cls = shell_classes[shell.lower()]
+    comp = cls(
+        cli=cli,
+        ctx_args={},
+        prog_name="claude-mirror",
+        complete_var="_CLAUDE_MIRROR_COMPLETE",
     )
-    if n_total == 0:
-        console.print("[green]✓[/] No legacy claude_sync state found — nothing to migrate.")
-        return
-
-    mode = "[bold yellow]DRY-RUN[/]" if not apply else "[bold green]APPLYING[/]"
-    console.print(f"\n{mode} — claude_sync → claude_mirror on-disk migration\n")
-
-    # 1. File renames inside project directories
-    if report["legacy_files"]:
-        console.print(f"[bold]Per-project state files ({len(report['legacy_files'])}):[/]")
-        for pp, old_name, new_name in report["legacy_files"]:
-            old_p = pp / old_name
-            new_p = pp / new_name
-            if new_p.exists():
-                console.print(f"  [yellow]skip[/]  {old_p}  (target already exists)")
-                continue
-            console.print(f"  rename  {old_p}  →  {new_name}")
-            if apply:
-                old_p.rename(new_p)
-
-    # 2. Rewrite token_file / credentials_file paths inside YAMLs
-    if report["yaml_token_paths"]:
-        console.print(f"\n[bold]YAML path rewrites ({len(report['yaml_token_paths'])}):[/]")
-        # Group by file so we rewrite each YAML once
-        per_yaml: dict[Path, list] = {}
-        for yml, key, old_v, new_v in report["yaml_token_paths"]:
-            per_yaml.setdefault(yml, []).append((key, old_v, new_v))
-        for yml, edits in per_yaml.items():
-            for key, old_v, new_v in edits:
-                console.print(f"  {yml.name}::{key}: {old_v} → {new_v}")
-            if apply:
-                text = yml.read_text()
-                for _, old_v, new_v in edits:
-                    text = text.replace(old_v, new_v)
-                yml.write_text(text)
-
-    # 3. Move the config dir itself (LAST — must come after we've finished
-    #    reading project YAMLs from the legacy location)
-    if report["legacy_config_dir"]:
-        console.print(f"\n[bold]Config directory:[/]")
-        if _NEW_CONFIG_DIR.exists():
-            # Both exist — merge contents from legacy into new, preferring new
-            console.print(f"  merge   {_LEGACY_CONFIG_DIR}/*  →  {_NEW_CONFIG_DIR}/")
-            console.print(f"  delete  {_LEGACY_CONFIG_DIR}  (after merge)")
-            if apply:
-                for src in _LEGACY_CONFIG_DIR.iterdir():
-                    dest = _NEW_CONFIG_DIR / src.name
-                    if not dest.exists():
-                        shutil.move(str(src), str(dest))
-                # Remove if empty; otherwise leave as-is so user can reconcile
-                try:
-                    _LEGACY_CONFIG_DIR.rmdir()
-                except OSError:
-                    console.print(f"  [yellow]note[/] {_LEGACY_CONFIG_DIR} not empty after merge — keeping for manual review")
-        else:
-            console.print(f"  rename  {_LEGACY_CONFIG_DIR}  →  {_NEW_CONFIG_DIR}")
-            if apply:
-                _LEGACY_CONFIG_DIR.rename(_NEW_CONFIG_DIR)
-
-    console.print()
-    if not apply:
-        console.print("[dim]This was a dry-run. Re-run with [bold]--apply[/] to execute.[/]")
-    else:
-        console.print("[bold green]✓[/] Local migration complete.")
-        console.print(
-            "\n[bold]Manual remote folder rename (backend-specific):[/]\n"
-            "  Google Drive: rename folders in the Drive web UI:\n"
-            "    [dim]_claude_sync_snapshots/[/] → [bold]_claude_mirror_snapshots/[/]\n"
-            "    [dim]_claude_sync_blobs/[/]     → [bold]_claude_mirror_blobs/[/]\n"
-            "    [dim]_claude_sync_logs/[/]      → [bold]_claude_mirror_logs/[/]\n"
-            "  Dropbox / OneDrive / WebDAV: rename the same folders in their web UI.\n"
-            "  Folder IDs are preserved by rename, so no re-auth or sync break is needed.\n"
-            "  The code resolves folders by name on next sync and will pick up the new names."
-        )
+    # `.source()` returns the shell-specific script as a string
+    click.echo(comp.source())

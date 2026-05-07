@@ -340,6 +340,27 @@ See [Manual component installation](#manual-component-installation) if you prefe
 
 To verify desktop notifications are working, run `claude-mirror test-notify` after installation (see [Desktop notifications](#desktop-notifications) for platform-specific permission setup).
 
+### Step 3.5: Shell tab-completion
+
+`claude-mirror-install` automatically installs shell tab-completion as one of the components — it detects your shell (zsh / bash / fish), adds an `eval` line to your rc file (zsh / bash) or writes a completion file (fish), and prompts before any change. Marker comments wrap the addition so a future `claude-mirror-install --uninstall` removes it cleanly.
+
+After install, the installer offers to replace the current shell with a fresh interactive shell so the new completion is live immediately. If you decline, you can activate it yourself by either opening a new terminal or running `source ~/.zshrc` (zsh), `source ~/.bash_profile` on macOS or `source ~/.bashrc` on Linux (bash), or simply opening a new fish shell (fish auto-loads completion files from `~/.config/fish/completions`).
+
+Once active, `claude-mirror <TAB>` lists all commands, `claude-mirror push <TAB>` lists flags, and `claude-mirror init --backend <TAB>` shows the four valid backends `googledrive`, `dropbox`, `onedrive`, and `webdav`.
+
+If you want to install completion manually instead (or for a different shell on the same machine):
+
+```bash
+# zsh — append to ~/.zshrc
+eval "$(claude-mirror completion zsh)"
+
+# bash — append to ~/.bashrc
+eval "$(claude-mirror completion bash)"
+
+# fish — write to the completions dir
+claude-mirror completion fish > ~/.config/fish/completions/claude-mirror.fish
+```
+
 ### Step 4: Update
 
 For PyPI installs (the default — `pipx install claude-mirror`):
@@ -1587,7 +1608,7 @@ claude-mirror find-config [PATH]
 claude-mirror test-notify
 claude-mirror check-update
 claude-mirror update            [--apply] [--yes]   # one-shot upgrade: dry-run by default, --apply to execute
-claude-mirror migrate-state     [--apply]   # one-shot rename of legacy claude_sync local state (pre-v0.5.1)
+claude-mirror completion        {bash|zsh|fish}   # emit shell tab-completion source — eval into your shell rc
 claude-mirror status --pending  [--config PATH]   # Tier 2: show files with non-ok mirror state
 
 claude-mirror-install     [--uninstall]

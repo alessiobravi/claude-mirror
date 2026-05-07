@@ -445,7 +445,7 @@ class WebDAVBackend(StorageBackend):
             elif rel.startswith(base_stripped):
                 rel = rel[len(base_stripped):]
 
-            if not rel or rel.startswith(("_claude_sync", "_claude_mirror")):
+            if not rel or rel.startswith("_claude_mirror"):
                 continue
             # Drop entries whose path passes through a named excluded folder.
             if excluded and any(c in excluded for c in rel.split("/")):
@@ -491,7 +491,7 @@ class WebDAVBackend(StorageBackend):
                     sub_path_rel = sub_path[len(base_stripped) + 1:]
                 else:
                     sub_path_rel = sub_path
-                if sub_path_rel.startswith(("_claude_sync", "_claude_mirror")):
+                if sub_path_rel.startswith("_claude_mirror"):
                     continue
                 # Prune named excluded folders (e.g. _claude_sync_snapshots).
                 last_component = sub_path_rel.rstrip("/").split("/")[-1]
@@ -505,7 +505,7 @@ class WebDAVBackend(StorageBackend):
                 else:
                     file_rel = rel
 
-                if not file_rel or file_rel.startswith(("_claude_sync", "_claude_mirror")):
+                if not file_rel or file_rel.startswith("_claude_mirror"):
                     continue
 
                 etag = self._get_etag(response)

@@ -316,7 +316,7 @@ class SnapshotManager:
             if not f["name"].startswith("_")
             and not f["relative_path"].startswith(f"{SNAPSHOTS_FOLDER}/")
             and not f["relative_path"].startswith(f"{BLOBS_FOLDER}/")
-            and not f["name"].startswith(("_claude_mirror_", "_claude_sync_"))
+            and not f["name"].startswith("_claude_mirror_")
         ]
 
         def _copy_one(file_info: dict) -> None:

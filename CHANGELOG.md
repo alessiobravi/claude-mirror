@@ -4,6 +4,57 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.27] — 2026-05-07
+
+### Added
+- **`claude-mirror completion {bash|zsh|fish}`** emits shell tab-completion source for the user to eval into their shell rc. Click 8's native completion already works via `_CLAUDE_MIRROR_COMPLETE=<shell>_source claude-mirror`, but that bootstrap is opaque enough that nobody discovers it. The new command exposes the same script under a discoverable name:
+  ```bash
+  # zsh
+  eval "$(claude-mirror completion zsh)"
+
+  # bash
+  eval "$(claude-mirror completion bash)"
+
+  # fish
+  claude-mirror completion fish > ~/.config/fish/completions/claude-mirror.fish
+  ```
+- After installation, tab-completion handles:
+  - **Command names:** `claude-mirror <TAB>` → `auth / completion / delete / find-config / forget / gc / history / inbox / init / inspect / log / migrate-snapshots / migrate-state / pull / push / reload / restore / retry / snapshots / status / sync / test-notify / update / watch / watch-all` plus `check-update`
+  - **Flag names:** `claude-mirror push <TAB>` → `--config / --files / --force-local`
+  - **`click.Choice` values automatically** — e.g. `claude-mirror init --backend <TAB>` → `googledrive / dropbox / onedrive / webdav`
+  - **File paths for `--config <TAB>`** — handled by the shell itself (no extra completer needed)
+
+- **`claude-mirror-install` now auto-installs shell tab-completion** as one of its components. Pre-v0.5.27, users had to manually run `eval "$(claude-mirror completion zsh)"` to get tab-completion — most users never discovered it. The installer now:
+  - **Detects your shell** from `$SHELL` (zsh / bash / fish; falls back to platform default if unset).
+  - **Picks the right target file** — `~/.zshrc` for zsh; `~/.bash_profile` on macOS or `~/.bashrc` on Linux for bash; `~/.config/fish/completions/claude-mirror.fish` for fish.
+  - **Wraps the addition in marker comments** so the whole block can be found and removed cleanly by a future `claude-mirror-install --uninstall`. The begin marker is `# >>> claude-mirror tab-completion (added by claude-mirror-install) >>>`, the end marker is `# <<< claude-mirror tab-completion <<<`, and the `eval` line sits in between.
+  - **Prompts before any change** (consistent with the rest of the installer; declining skips this component without affecting the others).
+  - **Idempotent** — re-running install with no changes is a true no-op (no rewrite of the rc file). If the binary path changed (e.g. `pipx install -e` → PyPI install), the prompt offers to refresh the stored eval line.
+  - **Skips cleanly on unsupported shells** (sh, dash, csh, tcsh, ksh) with a warning rather than writing a broken file.
+- **Prominent activation banner at the end of `claude-mirror-install`.** When tab-completion is newly added to the rc file (or refreshed because the binary path changed), the install command finishes with a high-contrast yellow banner explaining that tab-completion is installed but is not yet active in the current shell, and pointing at the exact `source` command needed to activate it (or instructing the user to open a new terminal). The banner exists because the per-step `✓ Tab-completion installed in <path>` line during install was easy to skim past, leading users to think completion was working when it was not yet sourced into their current shell.
+- **Optional one-shot shell replacement during install.** After the activation banner the installer asks "Replace the current shell with a fresh one now to activate tab-completion immediately? (Default: No — open a new terminal manually instead.)". A `Y` answer calls `os.execvp(shell, [shell])`, replacing the install process with a fresh interactive shell that sources the user's rc file and picks up the new completion immediately. The default of `No` is intentional, because `os.execvp` discards any environment variables the user set during the install session and returns them to a fresh login-equivalent shell. For users who would rather avoid that side effect, opening a new terminal or running `source <rc-file>` manually has the same effect with no process replacement.
+
+### Tests
+- New `tests/test_completion.py` (7 tests) covers each shell's emitted script + invalid-shell rejection + case-insensitive shell argument + completion-command discoverability via top-level `--help`.
+- New `tests/test_install_completion.py` (22 tests) covers shell detection, target-file resolution, install (zsh, bash, fish + idempotency + update path), uninstall (preserves user content above and below the marker block), the unsupported-shell skip path, and the `_completion_activation_pending` module flag that drives the end-of-run banner (set on first install, set on refresh, NOT set on no-op idempotent skip, NOT set on unsupported-shell skip).
+
+### Removed
+- Removed legacy `claude-sync` migration support. Specifically:
+  - `claude-mirror migrate-state` command and its helpers (`_LEGACY_CONFIG_DIR`, `_NEW_CONFIG_DIR`, `_FILE_RENAMES`, `_detect_legacy_state`).
+  - `_legacy_state_banner` startup warning that detected `~/.config/claude_sync` and prompted users to migrate.
+  - `CLAUDE_MIRROR_SUPPRESS_MIGRATION_BANNER` env var.
+  - `LEGACY_SKILL_DIR` cleanup in `install.py:install_skill` that detected `~/.claude/skills/claude-sync` and prompted to remove it.
+  - `LEGACY_HOOK_COMMAND_PREFIXES` strip-and-prune logic in `install.py:install_hook` that scanned `~/.claude/settings.json` for `claude-sync inbox` entries and removed them.
+  - Dual-prefix folder-exclusion predicates `startswith(("_claude_sync", "_claude_mirror"))` narrowed back to single prefix `startswith("_claude_mirror")` in `claude_mirror/backends/onedrive.py`, `claude_mirror/backends/webdav.py`, and `claude_mirror/snapshots.py`.
+  - Legacy `.claude_sync_manifest.json`, `.claude_sync_inbox.jsonl`, and `.claude_sync_hash_cache.json` patterns from `.gitignore`.
+  - `migrate-state` row from `README.md`'s command reference table.
+
+### Notes
+- Pure CLI and installer feature pair; no behaviour change to sync, push, pull, snapshots, or any other working-tree command.
+- Total suite: 243 tests, runtime under one second.
+
+---
+
 ## [0.5.26] — 2026-05-07
 
 ### Added

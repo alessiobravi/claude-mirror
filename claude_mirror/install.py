@@ -15,6 +15,7 @@ import shutil
 import os
 import subprocess
 from pathlib import Path
+from typing import List, Optional
 
 import click
 
@@ -28,14 +29,8 @@ import click
 CLAUDE_BASE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))).expanduser()
 
 SKILL_DEST        = CLAUDE_BASE_DIR / "skills" / "claude-mirror" / "SKILL.md"
-LEGACY_SKILL_DIR  = CLAUDE_BASE_DIR / "skills" / "claude-sync"   # pre-v0.5.0
 SETTINGS_PATH     = CLAUDE_BASE_DIR / "settings.json"
 HOOK_COMMAND      = "claude-mirror inbox 2>/dev/null || true"
-
-# Pre-v0.5.0 hook command — still appears in some users' settings.json after
-# the rename. Removed automatically during install_hook so it doesn't keep
-# firing against a binary that no longer exists.
-LEGACY_HOOK_COMMAND_PREFIXES = ("claude-sync inbox",)
 
 LAUNCHD_LABEL = "com.claude-mirror.watch"
 LAUNCHD_PLIST = Path(f"~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist").expanduser()
@@ -122,16 +117,6 @@ def install_skill() -> None:
     shutil.copy2(source, SKILL_DEST)
     _ok("Skill installed.")
 
-    # One-shot cleanup of the pre-v0.5.0 skill directory (claude-sync rename).
-    # Idempotent — silently no-ops once the legacy dir has been removed.
-    if LEGACY_SKILL_DIR.exists():
-        click.echo(f"  Found legacy skill at {LEGACY_SKILL_DIR}")
-        if _confirm(f"Remove legacy claude-sync skill directory?"):
-            shutil.rmtree(LEGACY_SKILL_DIR)
-            _ok("Legacy skill removed.")
-        else:
-            _skip("Left legacy skill in place — Claude Code may load both.")
-
 
 def uninstall_skill() -> None:
     _section("Claude Code skill")
@@ -172,53 +157,16 @@ def install_hook() -> None:
     hooks = data.setdefault("hooks", {})
     pre   = hooks.setdefault("PreToolUse", [])
 
-    # Strip legacy claude-sync hook entries first (rename cleanup).
-    legacy_removed = 0
-    for entry in pre:
-        if not isinstance(entry, dict):
-            continue
-        kept = []
-        for h in entry.get("hooks", []):
-            if (
-                isinstance(h, dict)
-                and isinstance(h.get("command"), str)
-                and any(h["command"].startswith(p) for p in LEGACY_HOOK_COMMAND_PREFIXES)
-            ):
-                legacy_removed += 1
-            else:
-                kept.append(h)
-        entry["hooks"] = kept
-    # Prune wrapper entries whose hooks list is now empty (orphans left
-    # behind by the legacy strip above, or by hand-edited settings.json).
-    pre[:] = [
-        e for e in pre
-        if not (isinstance(e, dict) and not e.get("hooks"))
-    ]
-    if legacy_removed:
-        click.echo(f"  Removed {legacy_removed} legacy claude-sync hook entry(ies).")
-
-    # Idempotency check for the current hook before prompting.
+    # Idempotency check: if our hook is already present, no work to do.
     for entry in pre:
         if isinstance(entry, dict):
             for h in entry.get("hooks", []):
                 if isinstance(h, dict) and h.get("command") == HOOK_COMMAND:
-                    if legacy_removed:
-                        # We modified the file (legacy cleanup) — write the changes
-                        # even though the new hook was already there.
-                        SETTINGS_PATH.write_text(json.dumps(data, indent=2) + "\n")
-                        _ok("Legacy hook(s) cleaned up; current hook already present.")
-                    else:
-                        _skip("Hook already present — nothing to do.")
+                    _skip("Hook already present — nothing to do.")
                     return
 
     if not _confirm("Add PreToolUse hook to ~/.claude/settings.json?"):
-        if legacy_removed:
-            # User declined the new hook, but we still want to persist the
-            # legacy cleanup we already did to the in-memory dict.
-            SETTINGS_PATH.write_text(json.dumps(data, indent=2) + "\n")
-            _ok("Legacy hook(s) removed; new hook NOT installed (user declined).")
-        else:
-            _skip()
+        _skip()
         return
 
     pre.append({
@@ -457,6 +405,220 @@ def uninstall_systemd() -> None:
     _ok("systemd user service removed.")
 
 
+# ── shell tab-completion ───────────────────────────────────────────────────────
+
+# Markers wrap the eval line we add to the user's shell rc, so we can find
+# our addition unambiguously during uninstall (or replacement) without
+# clobbering user-edited content nearby. The phrasing is deliberately
+# verbose; users grepping their rc for "claude-mirror" should get hits
+# that explain themselves.
+_COMPLETION_MARK_BEGIN = "# >>> claude-mirror tab-completion (added by claude-mirror-install) >>>"
+_COMPLETION_MARK_END   = "# <<< claude-mirror tab-completion <<<"
+
+# Cross-call flag set by install_completion when it newly adds (or refreshes)
+# the rc-file eval line. install_cli reads this at the end of the install run
+# to decide whether to print the prominent activation banner + offer to
+# replace the current shell. Module-level state because the install_*
+# functions don't have a shared context object today; promotion to a
+# proper `InstallReport` dataclass would be the right cleanup if more flags
+# get added.
+_completion_activation_pending: bool = False
+
+
+def _detect_shell() -> Optional[str]:
+    """Return 'zsh', 'bash', 'fish', or None if we can't / shouldn't auto-install.
+
+    Resolution order:
+      1. SHELL env var basename.
+      2. /etc/passwd login shell (rare fallback; only if SHELL is unset).
+      3. Platform default (zsh on macOS, bash on Linux).
+
+    Returns None for unsupported shells (sh/dash/csh/etc.) — better to
+    skip the auto-install than write something that won't work.
+    """
+    shell_env = os.environ.get("SHELL", "")
+    name = Path(shell_env).name if shell_env else ""
+    if name in ("zsh", "bash", "fish"):
+        return name
+    # Mac default is zsh since Catalina; Linux default is bash.
+    if not name:
+        return "zsh" if platform.system() == "Darwin" else "bash"
+    # Anything else (sh, dash, csh, tcsh, ksh) — punt.
+    return None
+
+
+def _completion_target(shell: str) -> Optional[Path]:
+    """Where the eval line goes for each shell.
+
+    For zsh + bash we append to the interactive rc file. For fish we use
+    the dedicated completions directory (fish auto-loads from there).
+    """
+    home = Path.home()
+    if shell == "zsh":
+        return home / ".zshrc"
+    if shell == "bash":
+        # macOS Terminal.app starts bash as a login shell, so .bash_profile
+        # is the canonical interactive rc. Linux gnome-terminal etc. use
+        # .bashrc. Pick by platform.
+        if platform.system() == "Darwin":
+            return home / ".bash_profile"
+        return home / ".bashrc"
+    if shell == "fish":
+        return home / ".config" / "fish" / "completions" / "claude-mirror.fish"
+    return None
+
+
+def install_completion() -> None:
+    # Declare module-level global once at the top of the function so the
+    # subsequent assignments in the fish, refresh, and append branches all
+    # write to the module attribute. Python's compiler requires the global
+    # declaration to appear before any assignment to the name in the
+    # function scope, even if those assignments live in different branches.
+    global _completion_activation_pending
+
+    _section("Shell tab-completion")
+
+    shell = _detect_shell()
+    if shell is None:
+        _warn(
+            f"Shell '{Path(os.environ.get('SHELL', '')).name or 'unknown'}' "
+            "is not supported (only zsh / bash / fish). Skipping."
+        )
+        return
+
+    rc = _completion_target(shell)
+    if rc is None:
+        _warn("Could not determine target rc file. Skipping.")
+        return
+
+    click.echo(f"  Shell:  {shell}")
+    click.echo(f"  Target: {rc}")
+
+    # fish gets a dedicated completion file — write the script directly,
+    # no markers / no eval indirection. Idempotent: overwrite each time
+    # to pick up new commands.
+    if shell == "fish":
+        if not _confirm(f"Install fish completion to {rc}?"):
+            _skip()
+            return
+        rc.parent.mkdir(parents=True, exist_ok=True)
+        completion_script = subprocess.run(
+            [_find_binary(), "completion", "fish"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        rc.write_text(completion_script)
+        _ok(f"Fish completion installed at {rc}.")
+        _completion_activation_pending = True
+        return
+
+    # zsh / bash — eval the dynamic completion script from rc, wrapped
+    # in markers so we can find / remove it cleanly.
+    eval_line = f'eval "$({_find_binary()} completion {shell})"'
+    block = "\n".join([_COMPLETION_MARK_BEGIN, eval_line, _COMPLETION_MARK_END])
+
+    existing = rc.read_text() if rc.exists() else ""
+    if _COMPLETION_MARK_BEGIN in existing:
+        # Already installed. Compare just the eval line (ignoring surrounding
+        # whitespace) — if unchanged, this is a true no-op. If the eval line
+        # changed (e.g., binary path moved), offer to refresh.
+        if eval_line in existing:
+            _skip("Tab-completion already installed and current.")
+            return
+        if not _confirm("Tab-completion is installed but stale — update?"):
+            _skip()
+            return
+        new_content = _replace_completion_block(existing, block)
+        rc.write_text(new_content)
+        _ok(f"Tab-completion refreshed in {rc}.")
+        _completion_activation_pending = True
+        return
+
+    if not _confirm(f"Add tab-completion eval to {rc}?"):
+        _skip()
+        return
+
+    # Append, with a leading newline only if the file does not already end with one.
+    sep = "" if existing.endswith("\n") or not existing else "\n"
+    if not rc.exists():
+        rc.parent.mkdir(parents=True, exist_ok=True)
+    with rc.open("a") as f:
+        f.write(f"{sep}\n{block}\n")
+    _ok(f"Tab-completion installed in {rc}.")
+    # Set the activation flag so the end-of-run banner fires.
+    _completion_activation_pending = True
+
+
+def uninstall_completion() -> None:
+    _section("Shell tab-completion")
+
+    shell = _detect_shell()
+    if shell is None:
+        _skip("Shell unknown — nothing to remove.")
+        return
+
+    rc = _completion_target(shell)
+    if rc is None or not rc.exists():
+        _skip("No tab-completion installed at the expected location.")
+        return
+
+    if shell == "fish":
+        click.echo(f"  Will remove: {rc}")
+        if not _confirm("Remove fish completion file?"):
+            _skip()
+            return
+        rc.unlink()
+        _ok("Fish completion removed.")
+        return
+
+    existing = rc.read_text()
+    if _COMPLETION_MARK_BEGIN not in existing:
+        _skip(f"No claude-mirror completion block found in {rc}.")
+        return
+
+    click.echo(f"  Will strip the claude-mirror completion block from: {rc}")
+    if not _confirm("Remove tab-completion block?"):
+        _skip()
+        return
+
+    new_content = _replace_completion_block(existing, replacement="")
+    rc.write_text(new_content)
+    _ok(f"Tab-completion block removed from {rc}.")
+
+
+def _replace_completion_block(content: str, replacement: str = "") -> str:
+    """Replace the marker-wrapped block (and the surrounding blank lines) with `replacement`.
+
+    Used for both update (replacement = new block) and uninstall (replacement = "").
+    Tolerates the block being at the start, end, or middle of the file.
+    """
+    lines = content.splitlines(keepends=True)
+    out: List[str] = []
+    inside = False
+    for line in lines:
+        stripped = line.rstrip("\n")
+        if stripped == _COMPLETION_MARK_BEGIN:
+            inside = True
+            continue
+        if stripped == _COMPLETION_MARK_END:
+            inside = False
+            continue
+        if not inside:
+            out.append(line)
+    result = "".join(out)
+    if replacement:
+        # Append the new block followed by a trailing newline.
+        if result and not result.endswith("\n"):
+            result += "\n"
+        result += "\n" + replacement + "\n"
+    # Collapse the resulting double-blank-lines that the strip-and-rejoin
+    # creates around the removed block.
+    while "\n\n\n" in result:
+        result = result.replace("\n\n\n", "\n\n")
+    return result
+
+
 # ── entry point ────────────────────────────────────────────────────────────────
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
@@ -473,6 +635,7 @@ def install_cli(uninstall: bool) -> None:
     \b
       * Claude Code skill    → ~/.claude/skills/claude-mirror/SKILL.md
       * PreToolUse hook      → ~/.claude/settings.json
+      * Shell tab-completion → ~/.zshrc / ~/.bashrc / fish completions dir
       * Background watcher   → launchd (macOS) or systemd (Linux)
     """
     system = platform.system()
@@ -483,6 +646,7 @@ def install_cli(uninstall: bool) -> None:
 
         uninstall_skill()
         uninstall_hook()
+        uninstall_completion()
 
         if system == "Darwin":
             uninstall_launchd()
@@ -501,6 +665,7 @@ def install_cli(uninstall: bool) -> None:
 
         install_skill()
         install_hook()
+        install_completion()
 
         if system == "Darwin":
             install_launchd()
@@ -512,8 +677,62 @@ def install_cli(uninstall: bool) -> None:
 
         click.echo()
         click.echo(click.style("Installation complete.", bold=True))
+
+        # Tab-completion activation — by far the most-missed post-install step
+        # in older versions because the per-step "✓ installed" message was
+        # easy to skim past. Surface it as a high-contrast banner at the very
+        # end and offer to drop the user into a fresh shell so the eval line
+        # is sourced immediately.
+        if _completion_activation_pending:
+            shell_name = _detect_shell() or "shell"
+            rc = _completion_target(shell_name)
+            click.echo()
+            banner = "═" * 70
+            click.echo(click.style(banner, fg="yellow"))
+            click.echo(click.style(
+                "  Tab-completion is installed but is NOT YET ACTIVE in this shell.",
+                fg="yellow", bold=True,
+            ))
+            click.echo(click.style(
+                "  Open a brand-new terminal, OR run the following command in",
+                fg="yellow",
+            ))
+            click.echo(click.style(
+                "  the current terminal to activate tab-completion immediately:",
+                fg="yellow",
+            ))
+            click.echo()
+            click.echo(click.style(f"      source {rc}", fg="cyan", bold=True))
+            click.echo()
+            click.echo(click.style(banner, fg="yellow"))
+
+            # Offer to replace the current process with a fresh interactive shell
+            # so .zshrc / .bashrc gets re-sourced and tab-completion is live
+            # without the user typing anything else. Default is No because
+            # `os.execvp` replaces the current process — losing any environment
+            # variables the user set during this session, any pending shell
+            # state, and the install command's calling context. For someone
+            # mid-install that is usually fine (they have not accumulated
+            # session state worth preserving) but we ask explicitly.
+            if shell_name in ("zsh", "bash") and _confirm(
+                "Replace the current shell with a fresh one now to activate "
+                "tab-completion immediately? (Default: No — open a new terminal "
+                "manually instead.)",
+                default=False,
+            ):
+                shell_path = os.environ.get("SHELL", "/bin/" + shell_name)
+                click.echo(click.style(
+                    f"\nReplacing this shell with: {shell_path}",
+                    fg="green",
+                ))
+                # os.execvp replaces the current process image with the named
+                # binary. The new interactive shell will source the user's rc
+                # file, picking up the completion eval line we just installed.
+                os.execvp(shell_path, [shell_path])
+                # Unreachable — execvp does not return on success.
+
         click.echo()
         click.echo("Next steps:")
         click.echo("  1. claude-mirror init --wizard   (run in each project directory)")
-        click.echo("  2. claude-mirror auth             (authenticate with Google)")
+        click.echo("  2. claude-mirror auth             (authenticate with the configured backend)")
         click.echo("  3. /claude-mirror                 (invoke skill inside Claude Code)")

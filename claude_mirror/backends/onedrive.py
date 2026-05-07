@@ -427,7 +427,7 @@ class OneDriveBackend(StorageBackend):
 
                 if "folder" in item:
                     # Prune at recursion time — never API-call into the excluded folder.
-                    if name in excluded or name.startswith(("_claude_sync", "_claude_mirror")):
+                    if name in excluded or name.startswith("_claude_mirror"):
                         continue
                     if counters is not None:
                         counters[0] += 1

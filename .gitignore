@@ -15,10 +15,6 @@ token.json
 .claude_mirror_manifest.json
 .claude_mirror_inbox.jsonl
 .claude_mirror_hash_cache.json
-# legacy names kept ignored during migration window:
-.claude_sync_manifest.json
-.claude_sync_inbox.jsonl
-.claude_sync_hash_cache.json
 
 # macOS
 .DS_Store

@@ -62,10 +62,11 @@ from .hash_cache import HashCache
 
 console = Console(force_terminal=True)
 
+from ._constants import PARALLEL_WORKERS
+
 SNAPSHOTS_FOLDER = "_claude_mirror_snapshots"
 BLOBS_FOLDER = "_claude_mirror_blobs"
 SNAPSHOT_META_FILE = "_snapshot_meta.json"          # per-folder sidecar (full format)
-PARALLEL_WORKERS = 5
 
 MANIFEST_FORMAT_VERSION = "v2"
 MANIFEST_SUFFIX = ".json"

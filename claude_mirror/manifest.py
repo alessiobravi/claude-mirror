@@ -162,8 +162,6 @@ class Manifest:
         for part in parts:
             if part in ("..", "\\..", "/.."):
                 return False
-            if part.startswith("..") and (part == ".." or part in ("..", )):
-                return False
         # Rough additional defence: a resolved relative path that climbs
         # out of '.' will produce a leading '..' part, caught above.
         return True

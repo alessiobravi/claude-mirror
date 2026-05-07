@@ -20,8 +20,7 @@ from rich.table import Table
 from rich.text import Text
 
 from ._progress import _SharedElapsedColumn, make_phase_progress
-
-PARALLEL_WORKERS = 5
+from ._constants import PARALLEL_WORKERS
 
 from .backends import StorageBackend, redact_error
 from .config import Config

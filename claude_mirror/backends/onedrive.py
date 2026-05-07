@@ -22,6 +22,35 @@ from ._util import write_token_secure
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 SCOPES = ["Files.ReadWrite", "offline_access"]
 
+# Allowlist of MSAL exception class names that DEFINITELY mean "the user
+# must re-authenticate interactively". Substring matching ("Auth" / "Token"
+# in cls_name) was too broad: any exception whose name happened to contain
+# either substring (e.g. a hypothetical `TokenRateLimitError`, which is a
+# transient rate-limit, not a credential failure) would be classified as
+# AUTH and surface as a scary "re-authenticate" prompt, forcing the user
+# into pointless interactive flows for what should auto-retry.
+#
+# Only names on this allowlist trigger an unconditional AUTH classification.
+# `MsalServiceError` is intentionally excluded — it covers a broad range
+# of server-side conditions, only some of which need re-auth; those are
+# detected by the OAuth-error-code branch below (`invalid_grant`,
+# `AADSTS50058`, etc.).
+_MSAL_AUTH_CLASS_NAMES = frozenset({
+    "MsalUiRequiredError",          # silent-token failed; needs interactive
+    "InteractionRequiredAuthError", # MSAL Python alternative name
+})
+
+# OAuth / AAD error codes that unambiguously mean "refresh token is dead,
+# user must re-auth". These appear in the exception args/description for
+# MsalServiceError and similar broad exceptions; matching on the code
+# string keeps the classification narrow.
+_AUTH_ERROR_CODES = (
+    "invalid_grant",
+    "AADSTS50058",   # silent sign-in but no user signed in → re-auth
+    "AADSTS70008",   # refresh token expired
+    "AADSTS700082",  # refresh token expired due to inactivity
+)
+
 
 class OneDriveBackend(StorageBackend):
     """StorageBackend implementation for Microsoft OneDrive via Graph API."""
@@ -55,14 +84,28 @@ class OneDriveBackend(StorageBackend):
         except Exception:
             pass
 
-        # Heuristic on the exception class name — covers MsalUiRequiredError,
-        # any *AuthError / *TokenError variants from msal or callers.
+        # Class-name allowlist — only specific MSAL exceptions count as AUTH.
+        # See _MSAL_AUTH_CLASS_NAMES for rationale (replaces an over-broad
+        # "Auth" / "Token" substring match that misclassified transient
+        # token-rate-limit errors as auth failures).
         try:
             cls_name = type(exc).__name__
-            if "Auth" in cls_name or "Token" in cls_name:
+            if cls_name in _MSAL_AUTH_CLASS_NAMES:
                 return ErrorClass.AUTH
         except Exception:
-            pass
+            cls_name = ""
+
+        # For MsalServiceError and similar broad exceptions, inspect the
+        # OAuth/AAD error code from the exception args. Only the codes
+        # listed in _AUTH_ERROR_CODES mean "refresh token is dead, user
+        # must re-auth"; everything else (rate-limit, transient service
+        # errors) falls through to TRANSIENT or UNKNOWN below.
+        try:
+            err_text = " ".join(str(a) for a in getattr(exc, "args", ()))
+        except Exception:
+            err_text = ""
+        if err_text and any(code in err_text for code in _AUTH_ERROR_CODES):
+            return ErrorClass.AUTH
 
         # requests HTTPError — inspect status code + Graph error body.
         if isinstance(exc, requests.exceptions.HTTPError):

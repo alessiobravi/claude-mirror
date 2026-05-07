@@ -1879,12 +1879,12 @@ def _build_pending_renderable(engine: SyncEngine) -> RenderableType:
             )
         parts.append(seed_table)
         parts.append(Text.from_markup(
-            "[dim]A mirror is "
-            "[yellow]unseeded[/dim][dim] when files exist on the primary "
-            "but were never uploaded to that mirror — typically because "
-            "the mirror was added to `mirror_config_paths` after the "
-            "files were first pushed. Run the suggested command to "
-            "upload them to the mirror only (primary is not touched).[/]"
+            "[dim]A mirror is [yellow]unseeded[/yellow] when files exist "
+            "on the primary but were never uploaded to that mirror — "
+            "typically because the mirror was added to "
+            "`mirror_config_paths` after the files were first pushed. "
+            "Run the suggested command to upload them to the mirror only "
+            "(primary is not touched).[/dim]"
         ))
 
     if not parts:

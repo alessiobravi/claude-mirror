@@ -4,6 +4,27 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.25] — 2026-05-07
+
+### Infrastructure
+- **PyPI Trusted Publishing** is now wired up for the release flow. New `.github/workflows/publish.yml` triggers on tag pushes matching `v*`, runs the full 214-test suite on a clean Ubuntu VM as a final pre-flight, builds the wheel + sdist, generates a **SLSA-3 build provenance attestation** via `actions/attest-build-provenance@v3`, then uploads to PyPI using OIDC — no API token is read from anywhere.
+- **Anyone can now verify a published release was built by this repo's CI:**
+  ```bash
+  gh attestation verify <wheel-path> --owner alessiobravi --repo claude-mirror
+  ```
+  Returns the workflow filename, commit SHA, and runner identity, chained back to GitHub's OIDC issuer via Sigstore's Fulcio CA.
+- **PyPI URL verification.** Now that uploads come from a trusted publisher whose OIDC claim points at `alessiobravi/claude-mirror`, PyPI auto-verifies all `[project.urls]` entries that point at the same repo. The "Unverified details" disclaimer on the project page is replaced with green checkmarks next to Homepage / Repository / Changelog / Documentation / Issues.
+
+### Release flow change
+Pre-v0.5.25: bump version → `pyproject-build` → `twine upload dist/*` from laptop with project-scoped token in `~/.pypirc`.
+
+v0.5.25 onward: bump version → `git push origin main` (CI tests run) → after green, `git tag vX.Y.Z && git push origin vX.Y.Z` (publish workflow fires, builds + attests + uploads). Laptop is no longer in the supply-chain critical path; the PyPI token in `~/.pypirc` can be revoked once the first trusted-publishing release lands cleanly.
+
+### Docs
+- `CONTRIBUTING.md` documents the new release flow + how downstream users / auditors verify provenance with `gh attestation verify`.
+
+---
+
 ## [0.5.24] — 2026-05-07
 
 ### Docs

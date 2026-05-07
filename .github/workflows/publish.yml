@@ -1,0 +1,88 @@
+name: Publish to PyPI
+
+# Triggers ONLY on tag pushes matching v* (e.g. v0.5.25, v1.0.0).
+# Regular pushes to main do NOT trigger this workflow — they only run
+# the test workflow (.github/workflows/test.yml). Tagging is the
+# explicit "release this" gesture.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    name: Build, attest, and publish
+    runs-on: ubuntu-latest
+
+    # Required permissions for trusted publishing + provenance attestation:
+    #   id-token: write       — lets the runner request an OIDC token from
+    #                           GitHub's token issuer, which both PyPI's
+    #                           trusted publisher and Sigstore's Fulcio CA
+    #                           use to verify "this build was triggered by
+    #                           a workflow on alessiobravi/claude-mirror".
+    #   contents: read        — checkout needs to read the repo at the tag.
+    #   attestations: write   — actions/attest-build-provenance writes the
+    #                           SLSA attestation back to the GitHub
+    #                           attestations API for later `gh attestation
+    #                           verify` lookups.
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+
+    steps:
+      - name: Checkout the tagged commit
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      # Run the test suite one more time before publishing — the same tests
+      # already passed on the commit when it was pushed to main, but tests
+      # are cheap and PyPI uploads are immutable. Belt-and-braces.
+      - name: Install package + dev extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+      - name: Run tests
+        run: pytest tests/ -v --tb=short
+
+      # Build the wheel + sdist on a clean Ubuntu VM. This is the artifact
+      # that ships to PyPI; no developer laptop is in the chain.
+      - name: Build distribution
+        run: |
+          python -m pip install build
+          python -m build
+
+      - name: Verify package metadata
+        run: |
+          python -m pip install twine
+          twine check dist/*
+
+      # SLSA-3 build provenance attestation. Cryptographically signs a
+      # statement: "this exact wheel hash was built by this workflow run
+      # on this commit, here's the OIDC claim from GitHub". The signed
+      # statement is submitted to Sigstore's public Rekor transparency log;
+      # anyone can later run `gh attestation verify <wheel> --owner
+      # alessiobravi --repo claude-mirror` to confirm provenance.
+      - name: Generate build provenance attestation
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: 'dist/*'
+
+      # Upload to PyPI via OIDC trusted publishing. No PyPI token is read
+      # from anywhere — the action requests an OIDC token from GitHub
+      # claiming "I am workflow publish.yml on alessiobravi/claude-mirror"
+      # and PyPI matches that claim against the trusted publisher
+      # registered in PyPI's project settings. If the claim doesn't match
+      # what was registered, PyPI rejects with a clear error message.
+      #
+      # `attestations: true` tells PyPI to attach the SLSA attestation
+      # generated above to the release, so it shows up on the project page
+      # and is queryable via the PyPI JSON API.
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: true

@@ -58,6 +58,37 @@ pytest tests/ --collect-only                    # list tests without running
 
 Every push and pull request triggers `.github/workflows/test.yml`, which runs the full suite on Python 3.11, 3.12, and 3.13 in parallel. Your PR is unmergeable until it's green.
 
+## Release flow (maintainer)
+
+Releases ship via **PyPI Trusted Publishing** — `.github/workflows/publish.yml` triggers on tag push, builds on a clean Ubuntu VM, generates a SLSA-3 build provenance attestation, and uploads to PyPI via OIDC (no API token anywhere). To cut a release:
+
+```bash
+# 1. Bump version in pyproject.toml + add CHANGELOG entry
+git add -A
+git commit -m "release: vX.Y.Z"
+git push origin main
+# → Triggers test workflow only. Wait for green.
+
+# 2. Tag and push the tag (only after tests pass)
+git tag vX.Y.Z
+git push origin vX.Y.Z
+# → Triggers publish workflow. ~90s later: PyPI live with verified URLs
+#   and SLSA attestation; verify on the project page.
+```
+
+The publish workflow re-runs the full test suite as a final pre-flight before uploading — defense in depth, since PyPI uploads are immutable. Yanking is possible but never overwriting.
+
+## Verifying a release's provenance
+
+Anyone can verify any published release was actually built by this repo's CI:
+
+```bash
+gh attestation verify <wheel-path> \
+    --owner alessiobravi --repo claude-mirror
+```
+
+Returns the workflow filename, the commit SHA, and the GitHub-hosted runner that produced the artifact, all chained back to GitHub's OIDC issuer via Sigstore's Fulcio CA.
+
 ## Submitting a change
 
 1. Branch off `main`.

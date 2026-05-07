@@ -233,6 +233,52 @@ def test_pending_and_by_backend_are_mutually_exclusive(patch_load_engine):
 
 # ─── Empty manifest ────────────────────────────────────────────────────────────
 
+def test_by_backend_honors_exclude_patterns_on_live_listings(monkeypatch, make_config, fake_backend, mirror_backend, project_dir, write_files):
+    """Regression for the user-found bug: --by-backend was showing files
+    matched by exclude_patterns as 'unseeded' on mirrors, even though the
+    user had explicitly excluded them. The engine's get_status() applies
+    `self._is_excluded()` to its remote listing; the by-backend renderer
+    must do the same so excluded files don't pollute the table.
+
+    Setup: file_patterns includes `**/*.md` and `git/**`, exclude_patterns
+    excludes `git/cortex-demo/.git/**`. A `.git/objects/abc123` file is
+    seeded on the primary (simulating historical pushes) but should NOT
+    appear in the per-backend table because it's explicitly excluded.
+    """
+    write_files({"a.md": "alpha\n"})
+    cfg = make_config(
+        file_patterns=["**/*.md", "git/**"],
+        exclude_patterns=["git/cortex-demo/.git/**"],
+    )
+    engine = SyncEngine(
+        config=cfg, storage=fake_backend, manifest=Manifest(cfg.project_path),
+        merge=MergeHandler(), notifier=None, snapshots=None, mirrors=[mirror_backend],
+    )
+    # Seed the excluded path on the primary (simulating an old push from
+    # before exclusion was tightened, or a push from a different machine).
+    parent_id, basename = fake_backend.resolve_path(
+        "git/cortex-demo/.git/objects/abc123", fake_backend.root_folder_id,
+    )
+    fake_backend.upload_bytes(b"git-object-content", basename, parent_id)
+    # Seed an ordinary tracked file too.
+    parent_id, basename = fake_backend.resolve_path("a.md", fake_backend.root_folder_id)
+    fake_backend.upload_bytes(b"alpha\n", basename, parent_id)
+    h = Manifest.hash_file(str(project_dir / "a.md"))
+    engine.manifest.update_remote("a.md", "fake", remote_file_id="f-a",
+                                  synced_remote_hash=h, state="ok")
+
+    monkeypatch.setattr(cli_module, "_load_engine",
+                        lambda config_path, with_pubsub=True: (engine, cfg, fake_backend))
+    monkeypatch.setattr(cli_module, "_resolve_config", lambda p: p or "fake-config")
+
+    result = CliRunner().invoke(cli, ["status", "--by-backend"])
+    assert result.exit_code == 0, result.output
+    # The excluded path MUST NOT appear in the rendered output.
+    assert "git/cortex-demo/.git/objects/abc123" not in result.output
+    # The legitimate tracked file SHOULD appear.
+    assert "a.md" in result.output
+
+
 def test_by_backend_empty_manifest_prints_helpful_message(patch_load_engine):
     """Brand-new project with nothing pushed yet — the manifest is
     empty. The renderer should NOT print an empty table; instead,

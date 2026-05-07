@@ -1889,7 +1889,11 @@ def _build_pending_renderable(engine: SyncEngine) -> RenderableType:
                         and not f["relative_path"].startswith("_")
                         and not f["relative_path"].startswith(f"{SNAPSHOTS_FOLDER}/")
                         and not f["relative_path"].startswith(f"{BLOBS_FOLDER}/")
-                        and not f["relative_path"].startswith(f"{LOGS_FOLDER}/"))
+                        and not f["relative_path"].startswith(f"{LOGS_FOLDER}/")
+                        # Same exclude_patterns filtering the engine applies
+                        # to its remote listing — otherwise excluded files
+                        # surface as unseeded/deleted, which is wrong.
+                        and not engine._is_excluded(f["relative_path"]))
                 }
                 live_files[name] = seen
                 progress.update(task, detail=f"{len(seen)} file(s)")
@@ -2103,6 +2107,11 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
                     if (rel.startswith(f"{SNAPSHOTS_FOLDER}/")
                         or rel.startswith(f"{BLOBS_FOLDER}/")
                         or rel.startswith(f"{LOGS_FOLDER}/")):
+                        continue
+                    # Apply exclude_patterns the same way engine.get_status()
+                    # does — otherwise files the user has explicitly excluded
+                    # show up as orphans/unseeded, which is wrong.
+                    if engine._is_excluded(rel):
                         continue
                     seen.add(rel)
                 live_files[name] = seen

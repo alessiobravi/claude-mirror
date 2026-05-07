@@ -1385,19 +1385,29 @@ def status(config_path: str, short: bool, pending: bool, watch_interval: Optiona
     engine, _, _ = _load_engine(_resolve_config(config_path), with_pubsub=False)
 
     if watch_interval is None:
-        # Snapshot path: render once and exit. Behaviourally identical to
-        # pre-watch versions — the heavy work happens inside the helper.
-        console.print(_build_status_renderable(engine, short=short, pending=pending))
+        # Snapshot path: render once and exit. The transient dual-row
+        # Progress lives inside _build_status_renderable so the user
+        # sees "Local: hashing 42/120 files" + "Remote: explored 7
+        # folder(s), 312 file(s)" updating live during the scan, rather
+        # than a silent pause followed by a finished table.
+        console.print(_build_status_renderable(
+            engine, short=short, pending=pending, with_progress=True,
+        ))
         return
 
     # Watch mode: refresh in place every watch_interval seconds. Each
     # iteration re-runs engine.get_status() (local hashing + remote listing),
     # so the user pays N-seconds of compute per cycle for "live" output.
     # Exit cleanly on Ctrl+C with a friendly message instead of a stack trace.
+    # The outer rich.live.Live owns the live region, so we suppress the
+    # snapshot-path's inner Progress (would conflict with Live's render
+    # loop and produce flicker / interleaved output).
     try:
         with Live(console=console, refresh_per_second=4, screen=False) as live:
             while True:
-                renderable = _build_status_renderable(engine, short=short, pending=pending)
+                renderable = _build_status_renderable(
+                    engine, short=short, pending=pending, with_progress=False,
+                )
                 live.update(renderable)
                 _status_watch_sleep(watch_interval)
     except KeyboardInterrupt:
@@ -1422,6 +1432,7 @@ def _build_status_renderable(
     *,
     short: bool,
     pending: bool,
+    with_progress: bool = False,
 ) -> RenderableType:
     """Build a Rich renderable describing the engine's current sync state.
 
@@ -1431,13 +1442,47 @@ def _build_status_renderable(
     every refresh interval, which is the intended trade-off for "live"
     output.
 
+    `with_progress` controls whether the local-hashing + remote-listing
+    phases render their own dual-row transient Progress while running.
+    True for the one-shot snapshot path (so the user sees live updates
+    during the scan); False for the watch-mode loop where the outer
+    rich.live.Live already owns the live region.
+
     Returns a Rich object (Group / Table / Text) that callers can either
     `console.print(...)` or pass to `Live.update(...)`.
     """
     if pending:
         return _build_pending_renderable(engine)
 
-    states = engine.get_status()
+    if with_progress:
+        # Mirrors the original engine.show_status() phase progress: two
+        # rows ("Local" / "Remote") that update independently as the
+        # callbacks fire from inside engine.get_status(). The Progress
+        # is transient so the rows clear once the scan completes and the
+        # final table can render in their place.
+        from rich.progress import Progress, SpinnerColumn, TextColumn
+        from ._progress import _SharedElapsedColumn
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold]{task.description:<8}"),
+            TextColumn("{task.fields[detail]}", style="dim"),
+            _SharedElapsedColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            local_task  = progress.add_task("Local",  total=None, detail="starting…", show_time=True)
+            remote_task = progress.add_task("Remote", total=None, detail="starting…", show_time=False)
+
+            def _on_local(msg: str) -> None:
+                progress.update(local_task, detail=msg)
+
+            def _on_remote(msg: str) -> None:
+                progress.update(remote_task, detail=msg)
+
+            states = engine.get_status(on_local=_on_local, on_remote=_on_remote)
+    else:
+        states = engine.get_status()
 
     # Per-file table (omitted in --short mode).
     parts: list[RenderableType] = []

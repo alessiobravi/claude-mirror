@@ -92,6 +92,35 @@ def test_status_without_watch_flag_runs_once_and_exits(patch_load_engine):
     mock_live.assert_not_called()
 
 
+def test_status_snapshot_path_wires_phase_progress_callbacks(monkeypatch, patch_load_engine, fake_engine):
+    """Regression test: the snapshot-mode status path MUST pass on_local
+    and on_remote callbacks into engine.get_status() so the dual-row
+    transient Progress (Local: 'hashing 42/120 files' / Remote:
+    'explored 7 folder(s)…') updates live during the scan.
+
+    Pre-v0.5.30, status() called engine.show_status() which did this
+    wiring. The v0.5.30 --watch refactor extracted _build_status_renderable
+    but initially dropped the callbacks — this caused a silent pause
+    during the scan with the full table appearing all at once at the
+    end. The fix re-wires the callbacks via with_progress=True; this
+    test pins that contract so it can't regress again."""
+    captured: dict[str, object] = {}
+    real_get_status = fake_engine.get_status
+
+    def spy(*args, **kwargs):
+        # Record whether the snapshot path forwarded the phase callbacks.
+        captured["on_local"]  = kwargs.get("on_local")
+        captured["on_remote"] = kwargs.get("on_remote")
+        return real_get_status(*args, **kwargs)
+
+    monkeypatch.setattr(fake_engine, "get_status", spy)
+
+    result = CliRunner().invoke(cli, ["status"])
+    assert result.exit_code == 0, result.output
+    assert callable(captured.get("on_local")),  "on_local callback NOT forwarded — phase progress would be silent"
+    assert callable(captured.get("on_remote")), "on_remote callback NOT forwarded — phase progress would be silent"
+
+
 # ---------------------------------------------------------------------------
 # 2. --watch enters Live mode and calls Live.update at least once
 # ---------------------------------------------------------------------------

@@ -32,8 +32,13 @@ Two additive features bundled into one release: a colorized diff command and con
 - **New `claude-mirror prune` CLI command** for ad-hoc / manual invocation. Reads the four `keep_*` fields from the project YAML by default; any `--keep-last`, `--keep-daily`, `--keep-monthly`, `--keep-yearly` flag overrides the corresponding config field for that one run only (the YAML is not modified). Dry-run by default per the project's destructive-ops convention; require `--delete` plus a typed `YES` (or `--yes` for non-interactive use) to actually remove anything.
 - 17 new tests in `tests/test_retention.py` cover: config field defaults + YAML round-trip; the algorithm across all four buckets independently; the union behaviour when all four compose; dry-run = no writes; the CLI's dry-run-by-default + typed-YES + flag-overrides-config invariants.
 
+### Fixed — `claude-mirror status` lost its live phase progress in v0.5.30
+- **Regression** introduced when `status --watch` was added in v0.5.30: the refactor extracted `_build_status_renderable` from the original `engine.show_status()` but dropped the `on_local` / `on_remote` phase-progress callback wiring. As a result, the snapshot-mode `claude-mirror status` ran silently during local hashing + remote listing, then dumped the full table all at once at the end — instead of the dual-row "Local: hashing 42/120 files" / "Remote: explored 7 folder(s), 312 file(s)" updates.
+- Fix: `_build_status_renderable` gained a `with_progress` parameter. `status` (snapshot path) calls it with `with_progress=True`, which opens a transient dual-row Progress and forwards `on_local` + `on_remote` callbacks into `engine.get_status(...)` — restoring the pre-v0.5.30 live updates. `status --watch` keeps `with_progress=False` because the outer `rich.live.Live` already owns the live region (running both at once would interleave/flicker).
+- Pinned with a regression test in `tests/test_status_watch.py` that asserts the snapshot path forwards both callbacks into `get_status` so this behaviour can't silently regress again.
+
 ### Updated — README and command summary
-- README "How it works" / quality-gates line updated to reflect the now-302 tests and Python 3.11 / 3.12 / 3.13 / 3.14 matrix (the doc tweaks from the v0.5.31 cycle, held back for this feature bump).
+- README "How it works" / quality-gates line updated to reflect the now-303 tests and Python 3.11 / 3.12 / 3.13 / 3.14 matrix (the doc tweaks from the v0.5.31 cycle, held back for this feature bump).
 - Command-summary block now includes `claude-mirror diff` and `claude-mirror prune` with their flags.
 - CONTRIBUTING.md updated to mention Python 3.14 in the CI matrix.
 

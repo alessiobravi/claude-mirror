@@ -18,7 +18,7 @@ Built originally for Claude Code projects (where most context lives in markdown)
 
 **Supported backends:** Google Drive, Dropbox, Microsoft OneDrive, any WebDAV server (Nextcloud, OwnCloud, Apache mod_dav, Synology/QNAP NAS, Box.com, etc.), and any SFTP/SSH-accessible server (VPS, NAS, shared hosting, self-hosted Linux). Each project picks its own primary backend independently — different projects on the same machine can use different backends.
 
-**Quality gates:** Every commit and pull request runs **303 automated tests** on Python 3.11, 3.12, 3.13, and 3.14 in parallel via GitHub Actions — covering the 3-way diff sync core, both snapshot formats, path-traversal safety, conflict resolution, auth flows, all four backends (with HTTP-level mocking), the notifier inbox under concurrent writers, and the watcher daemon's SIGHUP hot-reload. CI must be green before any PR can merge. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the test conventions and how to run them locally.
+**Quality gates:** Every commit and pull request runs **329 automated tests** on Python 3.11, 3.12, 3.13, and 3.14 in parallel via GitHub Actions — covering the 3-way diff sync core, both snapshot formats, path-traversal safety, conflict resolution, auth flows, all five backends (with HTTP-level / SSH-level mocking), the notifier inbox under concurrent writers, and the watcher daemon's SIGHUP hot-reload. CI must be green before any PR can merge. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the test conventions and how to run them locally.
 
 ---
 

@@ -89,6 +89,11 @@ _NO_WATCHER_CHECK_CMDS = {
     "init", "auth",
     "find-config", "test-notify",
     "inbox",
+    # `doctor` is diagnosing setup health — printing a "watcher not running"
+    # warning on top of doctor's own checks would be redundant noise; doctor
+    # also gets called specifically when the user already suspects something
+    # is wrong, so the watcher hint isn't useful here.
+    "doctor",
 }
 
 
@@ -2944,3 +2949,386 @@ def completion(shell: str) -> None:
     )
     # `.source()` returns the shell-specific script as a string
     click.echo(comp.source())
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# `claude-mirror doctor` — one-shot configuration diagnosis
+# ──────────────────────────────────────────────────────────────────────────
+# Runs through every common configuration check and prints concrete fix
+# commands when something is wrong. Exit code 0 if every check passes, 1
+# if any fail — composes cleanly with shell scripts and CI.
+#
+# Replaces the "why isn't my sync working?" support-thread loop with a
+# single command. Each check is independent and renders its result as it
+# runs; later checks still execute even if earlier ones fail, so the user
+# sees the FULL set of issues in one pass rather than playing whack-a-mole.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
+    """Run the doctor check sequence for one config + its mirrors.
+
+    Returns the list of failure summaries (empty list ⇒ everything passed).
+    Renders each check's icon/result/fix-hint to `console` as it runs so
+    the user sees live progress rather than a single end-of-run dump.
+
+    Splitting this out from the CLI command itself keeps the wiring small
+    and means the test suite can poke individual scenarios without
+    having to mock click's progress / sys.exit machinery.
+    """
+    import json as _json
+
+    failures: list[str] = []
+
+    # ───── Check 1: primary config exists and parses ─────
+    # If this fails, every later check is meaningless — bail with a single
+    # actionable hint pointing at the wizard.
+    try:
+        primary_config = Config.load(cfg_path)
+    except FileNotFoundError:
+        console.print(
+            f"  [red]✗[/] config file not found: [bold]{cfg_path}[/]\n"
+            f"      [yellow]Fix:[/] run "
+            f"[bold]claude-mirror init --wizard --config {cfg_path}[/] "
+            f"to create a config."
+        )
+        failures.append(f"config file not found: {cfg_path}")
+        return failures
+    except Exception as e:
+        console.print(
+            f"  [red]✗[/] config file does not parse: [bold]{cfg_path}[/]\n"
+            f"      [dim]{e}[/]\n"
+            f"      [yellow]Fix:[/] run "
+            f"[bold]claude-mirror init --wizard --config {cfg_path}[/] "
+            f"to create a fresh config, or fix the YAML by hand."
+        )
+        failures.append(f"config file does not parse: {cfg_path}")
+        return failures
+    console.print(f"  [green]✓[/] config file parses: [bold]{cfg_path}[/]")
+
+    # Build the list of (config_path, config) pairs to check. For Tier 2
+    # multi-backend setups, the primary's `mirror_config_paths` references
+    # additional configs — each gets the SAME check sequence applied.
+    backends_to_check: list[tuple[str, Config]] = [(cfg_path, primary_config)]
+    for mirror_path in primary_config.mirror_config_paths:
+        try:
+            mirror_resolved = (
+                mirror_path
+                if Path(mirror_path).is_absolute()
+                else _resolve_config(mirror_path)
+            )
+            mirror_cfg = Config.load(mirror_resolved)
+            backends_to_check.append((mirror_resolved, mirror_cfg))
+        except Exception as e:
+            console.print(
+                f"  [red]✗[/] mirror config does not load: "
+                f"[bold]{mirror_path}[/]\n"
+                f"      [dim]{e}[/]\n"
+                f"      [yellow]Fix:[/] verify the path in "
+                f"`mirror_config_paths` of [bold]{cfg_path}[/], or "
+                f"remove the entry."
+            )
+            failures.append(f"mirror config does not load: {mirror_path}")
+
+    # ───── Per-backend checks ─────
+    for path, config in backends_to_check:
+        # Filter: skip backends not matching --backend NAME (case-insensitive).
+        if backend_filter and (config.backend or "").lower() != backend_filter.lower():
+            console.print(
+                f"\n[dim]── skipped: {config.backend} "
+                f"({path}) — does not match --backend {backend_filter}[/]"
+            )
+            continue
+
+        console.print(
+            f"\n[bold]── checking {config.backend} backend "
+            f"({path})[/]"
+        )
+
+        # ───── Check 2: credentials file exists ─────
+        # Required for googledrive / dropbox / onedrive (OAuth client JSON).
+        # WebDAV doesn't use a credentials file — the WebDAV username +
+        # password live in the YAML — so we skip this check there.
+        backend_name = (config.backend or "").lower()
+        if backend_name == "webdav":
+            console.print(
+                "  [dim]·[/] credentials file: skipped (WebDAV uses inline "
+                "username/password)"
+            )
+        else:
+            creds_path = Path(config.credentials_file)
+            if not creds_path.exists():
+                console.print(
+                    f"  [red]✗[/] credentials file missing: "
+                    f"[bold]{creds_path}[/]\n"
+                    f"      [yellow]Fix:[/] re-download credentials.json "
+                    f"from your cloud provider's developer console and "
+                    f"place at [bold]{creds_path}[/]."
+                )
+                failures.append(f"credentials file missing: {creds_path}")
+            else:
+                console.print(
+                    f"  [green]✓[/] credentials file exists: "
+                    f"[dim]{creds_path}[/]"
+                )
+
+        # ───── Check 3: token file exists, parses, has refresh credentials ─────
+        # WebDAV stores its credentials in the YAML rather than a token
+        # file, so the test there is "username AND password are non-empty
+        # in the config".
+        if backend_name == "webdav":
+            if not config.webdav_username or not config.webdav_password:
+                console.print(
+                    f"  [red]✗[/] WebDAV credentials missing in config: "
+                    f"[bold]{path}[/]\n"
+                    f"      [yellow]Fix:[/] run "
+                    f"[bold]claude-mirror auth --config {path}[/] "
+                    f"to authenticate."
+                )
+                failures.append(f"WebDAV credentials missing: {path}")
+            else:
+                console.print(
+                    "  [green]✓[/] WebDAV credentials present in config "
+                    "(username + password)"
+                )
+        else:
+            token_path = Path(config.token_file)
+            if not token_path.exists():
+                console.print(
+                    f"  [red]✗[/] token file missing: [bold]{token_path}[/]\n"
+                    f"      [yellow]Fix:[/] run "
+                    f"[bold]claude-mirror auth --config {path}[/] "
+                    f"to authenticate."
+                )
+                failures.append(f"token file missing: {token_path}")
+            else:
+                # Parse and check for a refresh-capable credential.
+                try:
+                    token_data = _json.loads(token_path.read_text())
+                except (OSError, _json.JSONDecodeError) as e:
+                    console.print(
+                        f"  [red]✗[/] token file unreadable / corrupt: "
+                        f"[bold]{token_path}[/]\n"
+                        f"      [dim]{e}[/]\n"
+                        f"      [yellow]Fix:[/] run "
+                        f"[bold]claude-mirror auth --config {path}[/] "
+                        f"to re-authenticate."
+                    )
+                    failures.append(f"token file corrupt: {token_path}")
+                else:
+                    has_refresh = bool(
+                        isinstance(token_data, dict)
+                        and token_data.get("refresh_token")
+                    )
+                    if not has_refresh:
+                        console.print(
+                            f"  [red]✗[/] token file has no refresh_token: "
+                            f"[bold]{token_path}[/]\n"
+                            f"      [yellow]Fix:[/] run "
+                            f"[bold]claude-mirror auth --config {path}[/] "
+                            f"(consent screen must be shown to issue a new "
+                            f"refresh_token)."
+                        )
+                        failures.append(f"token has no refresh_token: {token_path}")
+                    else:
+                        console.print(
+                            f"  [green]✓[/] token file present with refresh_token: "
+                            f"[dim]{token_path}[/]"
+                        )
+
+        # ───── Check 4: backend connectivity ─────
+        # Instantiate the backend, fetch credentials, make ONE light read
+        # call (list_folders on the root folder). On exception, branch on
+        # exception class to give a specific fix hint.
+        connectivity_ok = False
+        try:
+            storage = _create_storage(config)
+            storage.get_credentials()
+            storage.list_folders(config.root_folder, name=None)
+            connectivity_ok = True
+        except BaseException as exc:  # noqa: BLE001 — diagnostic, must not bubble
+            # Classify via the backend's own classifier when possible — it
+            # knows about HTTP status codes, OAuth `invalid_grant`, etc.
+            exc_class_name = type(exc).__name__
+            exc_text = str(exc)
+            try:
+                # Re-create a fresh backend just for classification — the
+                # failed one may not be in a usable state. classify_error
+                # is documented to never raise.
+                klass = _create_storage(config).classify_error(exc)
+            except Exception:
+                klass = None
+
+            from .backends import ErrorClass as _EC
+
+            # AUTH-class → user must run `claude-mirror auth`.
+            is_auth = (
+                klass == _EC.AUTH
+                or "RefreshError" in exc_class_name
+                or "invalid_grant" in exc_text.lower()
+                or "401" in exc_text
+            )
+            # Permission-class → 403 / forbidden / token revoked at server.
+            is_permission = (
+                klass == _EC.PERMISSION
+                or "403" in exc_text
+                or "permission" in exc_text.lower()
+                or "forbidden" in exc_text.lower()
+            )
+            # 404 → folder ID wrong (Drive); user must check provider UI.
+            is_not_found = (
+                klass == _EC.FILE_REJECTED and "404" in exc_text
+            ) or "404" in exc_text or "not found" in exc_text.lower()
+            # Network-class → transient transport / DNS / timeout failures.
+            is_network = (
+                klass == _EC.TRANSIENT
+                or isinstance(exc, (TimeoutError, ConnectionError))
+                or "TransportError" in exc_class_name
+                or "timed out" in exc_text.lower()
+                or "connection" in exc_text.lower()
+            )
+
+            if is_auth:
+                hint = (
+                    f"[yellow]Fix:[/] token revoked or refresh failed. Run "
+                    f"[bold]claude-mirror auth --config {path}[/] to "
+                    f"re-authenticate."
+                )
+            elif is_permission:
+                hint = (
+                    f"[yellow]Fix:[/] insufficient permissions for the "
+                    f"configured folder. Run "
+                    f"[bold]claude-mirror auth --config {path}[/] or check "
+                    f"folder sharing in the provider's web UI."
+                )
+            elif is_not_found:
+                hint = (
+                    f"[yellow]Fix:[/] folder ID "
+                    f"[bold]{config.root_folder!r}[/] not found. Verify "
+                    f"it in the cloud provider's web UI and update "
+                    f"[bold]{path}[/]."
+                )
+            elif is_network:
+                hint = (
+                    "[yellow]Fix:[/] check internet connectivity (and any "
+                    "corporate proxy / VPN settings) and retry."
+                )
+            else:
+                hint = (
+                    f"[yellow]Fix:[/] inspect the error above and re-run "
+                    f"[bold]claude-mirror auth --config {path}[/] if it "
+                    f"looks auth-related."
+                )
+
+            console.print(
+                f"  [red]✗[/] backend connectivity failed "
+                f"({exc_class_name}): [dim]{exc_text[:160]}[/]\n"
+                f"      {hint}"
+            )
+            failures.append(f"connectivity failed for {config.backend}: {exc_class_name}")
+
+        if connectivity_ok:
+            console.print(
+                f"  [green]✓[/] backend connectivity ok "
+                f"([dim]list_folders on root succeeded[/])"
+            )
+
+        # ───── Check 5: project_path exists locally ─────
+        # Only check on the primary — every mirror config validated by
+        # `_create_storage_set` must point at the SAME project_path, so
+        # checking it once on the primary is sufficient. We still emit
+        # an info line for mirror configs so the output is symmetric.
+        proj = Path(config.project_path).expanduser()
+        if not proj.exists():
+            console.print(
+                f"  [red]✗[/] project_path does not exist: [bold]{proj}[/]\n"
+                f"      [yellow]Fix:[/] update `project_path` in "
+                f"[bold]{path}[/] to point at the actual project directory."
+            )
+            failures.append(f"project_path missing: {proj}")
+        elif not proj.is_dir():
+            console.print(
+                f"  [red]✗[/] project_path is not a directory: "
+                f"[bold]{proj}[/]\n"
+                f"      [yellow]Fix:[/] update `project_path` in "
+                f"[bold]{path}[/] to point at the actual project directory."
+            )
+            failures.append(f"project_path not a directory: {proj}")
+        else:
+            console.print(
+                f"  [green]✓[/] project_path exists: [dim]{proj}[/]"
+            )
+
+        # ───── Check 6: manifest integrity (if present) ─────
+        # Manifest.load() auto-recovers from a corrupt manifest by moving
+        # it aside, which would mask the issue from the user. So we read
+        # the file ourselves first; if it fails to parse as JSON, we
+        # report and suggest removing it.
+        from .manifest import MANIFEST_FILE
+        manifest_path = proj / MANIFEST_FILE
+        if not manifest_path.exists():
+            console.print(
+                f"  [dim]·[/] manifest not present yet "
+                f"([dim]{MANIFEST_FILE}[/]) — first sync will create it"
+            )
+        else:
+            try:
+                _json.loads(manifest_path.read_text())
+                console.print(
+                    f"  [green]✓[/] manifest parses: [dim]{manifest_path}[/]"
+                )
+            except (OSError, _json.JSONDecodeError) as e:
+                console.print(
+                    f"  [red]✗[/] manifest is corrupt: [bold]{manifest_path}[/]\n"
+                    f"      [dim]{e}[/]\n"
+                    f"      [yellow]Fix:[/] remove it and re-sync — "
+                    f"[bold]rm {manifest_path} && "
+                    f"claude-mirror sync --config {path}[/]"
+                )
+                failures.append(f"manifest corrupt: {manifest_path}")
+
+    return failures
+
+
+@cli.command()
+@click.option("--config", "config_path", default="",
+              help="Config file path. Auto-detected from cwd if omitted.")
+@click.option("--backend", "backend_filter", default="",
+              help="Limit checks to one backend by name "
+                   "(googledrive, dropbox, onedrive, webdav). Default: "
+                   "check all configured backends including Tier 2 mirrors.")
+def doctor(config_path: str, backend_filter: str) -> None:
+    """Diagnose claude-mirror configuration health.
+
+    Runs through every common configuration check and reports what is
+    wrong with concrete fix commands. Exit code 0 on all-pass, 1 on
+    any failure — composes cleanly with shell scripts and CI.
+
+    \b
+    Checks performed (per backend, including Tier 2 mirrors):
+      1. Config file exists and parses
+      2. Credentials file exists (skipped for WebDAV)
+      3. Token file exists, parses, has refresh_token
+         (or for WebDAV: username + password in config)
+      4. Backend connectivity (list_folders on the configured root)
+      5. project_path exists locally and is a directory
+      6. Manifest integrity (if a manifest file is present)
+
+    \b
+    Examples:
+      claude-mirror doctor
+      claude-mirror doctor --config ~/.config/claude_mirror/work.yaml
+      claude-mirror doctor --backend dropbox
+    """
+    cfg_path = _resolve_config(config_path)
+    console.print(f"[bold]claude-mirror doctor[/] — {cfg_path}\n")
+
+    failures = _run_doctor_checks(cfg_path, backend_filter)
+
+    if failures:
+        console.print(
+            f"\n[red bold]✗ {len(failures)} issue(s) found.[/] "
+            f"Fix the items above and re-run [bold]claude-mirror doctor[/]."
+        )
+        sys.exit(1)
+    console.print("\n[green bold]✓ All checks passed.[/]")

@@ -46,12 +46,27 @@ SYSTEMD_SERVICE_NAME = "claude-mirror-watch"
 # ── helpers ────────────────────────────────────────────────────────────────────
 
 def _find_skill_source() -> Path | None:
-    """Locate the skill source file (repo or installed package layout)."""
-    # Development / repo layout: install.py lives in claude_mirror/, skill is ../skills/
+    """Locate the skill source file. Resolution order:
+
+    1. Bundled inside the wheel at `claude_mirror/_skill/claude-mirror.md`
+       (the PyPI install path — see pyproject.toml `force-include`).
+    2. Repo / editable-install layout at `<repo>/skills/claude-mirror.md`,
+       which is where the source lives in git.
+
+    Returning the bundled copy first means PyPI users get a working skill
+    install via `claude-mirror-install` with no manual download step.
+    Returning the repo copy as fallback keeps the dev workflow unchanged
+    (editable installs continue to find the un-bundled source).
+    """
     here = Path(__file__).parent
-    candidate = here.parent / "skills" / "claude-mirror.md"
-    if candidate.exists():
-        return candidate
+    # PyPI / wheel install — bundled by Hatchling's force-include.
+    bundled = here / "_skill" / "claude-mirror.md"
+    if bundled.exists():
+        return bundled
+    # Editable install from a clone — source still in repo's skills/ dir.
+    repo = here.parent / "skills" / "claude-mirror.md"
+    if repo.exists():
+        return repo
     return None
 
 

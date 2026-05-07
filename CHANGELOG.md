@@ -4,6 +4,28 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.22] — 2026-05-07
+
+### Fixed
+- **`claude-mirror-install` now installs the Claude Code skill for PyPI users.** Pre-v0.5.22, `_find_skill_source()` only checked the editable-install layout (`<install.py>/../skills/claude-mirror.md`). For users who installed via `pipx install claude-mirror` from PyPI, that resolved to `<venv>/lib/python3.X/site-packages/skills/`, which doesn't exist — the installer printed `Skill source file not found — skipping` and the user got the binary without the skill.
+  - **Fix in two parts:**
+    1. **Wheel now bundles the skill.** `pyproject.toml` adds a `[tool.hatch.build.targets.wheel.force-include]` directive mapping `skills/claude-mirror.md` → `claude_mirror/_skill/claude-mirror.md` inside the wheel. The 14,711-byte file is now present in every PyPI install at `<site-packages>/claude_mirror/_skill/claude-mirror.md`.
+    2. **`_find_skill_source()` checks the bundled location first**, falling back to the repo `skills/` directory for editable installs from a clone. Both paths return the same content; the resolution order means PyPI users never miss it.
+- **No code change for editable-install users.** The repo `skills/claude-mirror.md` is still authoritative; the bundled copy is generated at wheel-build time.
+
+### Tests
+- New `tests/test_skill_bundling.py` (4 tests) pins both resolution paths:
+  - `test_find_skill_source_returns_existing_path_in_dev_layout` — editable install (the test environment) resolves to the repo file successfully.
+  - `test_find_skill_source_prefers_bundled_over_repo` — when both layouts exist, the bundled wheel copy wins.
+  - `test_find_skill_source_falls_back_to_repo_when_bundled_missing` — editable installs without `_skill/` still find the source.
+  - `test_find_skill_source_returns_none_when_neither_exists` — graceful no-op so `install_skill()` can show its own friendly skip message.
+- Suite now totals **214 tests**, still <1 s.
+
+### Verified
+- Built v0.5.22 wheel, installed into a fresh venv (`python3 -m venv /tmp/...`), verified `_find_skill_source()` returns the bundled `claude_mirror/_skill/claude-mirror.md` (14,711 bytes) — the first version where PyPI users get a complete `claude-mirror-install`.
+
+---
+
 ## [0.5.21] — 2026-05-07
 
 This release is a coordinated multi-agent test-coverage push. **210 tests** now pass in <1 s; coverage of every major feature surface jumped from ~10% to ~70%. No runtime behaviour change beyond a single import fix in `snapshots.py`.

@@ -4,6 +4,40 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.30] — 2026-05-07
+
+Three additive features bundled into one release.
+
+### Added — `claude-mirror doctor [--config PATH] [--backend NAME]`
+- **One-shot configuration diagnostic** that replaces the "why isn't my sync working" support thread. Runs through six check categories per backend (primary plus every Tier 2 mirror in `mirror_config_paths`):
+  1. Config file parses
+  2. Credentials file present (skipped for WebDAV which uses username + password)
+  3. Token file has `refresh_token`, or for WebDAV has `username` + `password`
+  4. Backend connectivity via `get_credentials()` plus a `list_folders(root, name=None)` smoke call, with class-specific fix hints based on the exception type (auth / permission / 404 / network / unknown)
+  5. `project_path` exists and is a directory
+  6. Manifest JSON integrity (read directly rather than via `Manifest.load()`, which auto-quarantines corrupt files and would mask the failure)
+- All checks always run (no early exit) so the user sees every issue in one pass. Exit code 0 on all-pass, 1 on any failure — composes cleanly with shell scripts and CI.
+- `--backend NAME` limits checks to one backend (relevant for users with Tier 2 multi-mirror setups who want to debug just one).
+- 10 new tests in `tests/test_doctor.py` cover happy-path, each failure category, the per-backend filter, and the exit-code contract.
+
+### Added — `claude-mirror status --watch SECONDS`
+- Live-updating sync state via `rich.live.Live`. `claude-mirror status --watch 10` refreshes the status display in place every 10 seconds until the user presses Ctrl+C; on interrupt, prints "watch stopped" and exits cleanly without a stack trace.
+- Refresh interval is validated as `IntRange(min=1, max=3600)` at the Click layer; values outside that range error before the loop starts.
+- Snapshot mode (without `--watch`) is byte-for-byte unchanged — the same rendering helper `_build_status_renderable` produces a Rich `Group`/`Table`/`Text` consumed by both `console.print` (snapshot) and `Live.update` (watch).
+- `--watch` is also wired into the Tier 2 pending-state view (`status --pending --watch 10`), refactored into a parallel `_build_pending_renderable` helper.
+- 7 new tests in `tests/test_status_watch.py` cover the snapshot regression, Live entry, multi-iteration loop with Ctrl+C exit, the click-level interval validation, the "watch stopped" stop message, and the renderable-helper return type.
+
+### Added — `parallel_workers` config field (project-scoped)
+- New YAML field `parallel_workers: int = 5` (default 5, matching the previous hardcoded constant). Override per project to tune `ThreadPoolExecutor` concurrency for blob uploads, snapshot copies, recursive listings, and other parallel operations. Useful for slow CPUs (lower), fat home connections (higher), and rate-limited APIs (lower).
+- Every existing call site of `PARALLEL_WORKERS` (4 in `sync.py`, 13 in `snapshots.py`) now reads `self.config.parallel_workers` instead of the module-level constant. The constant in `claude_mirror/_constants.py` is preserved as the documented default value of the new field; the `tests/test_constants.py` `is`-identity invariant continues to pass.
+- 5 new tests in `tests/test_parallel_workers_config.py` cover the default value, YAML override, the boundary at zero, the constant fallback invariant, and an end-to-end test that wraps `concurrent.futures.ThreadPoolExecutor` and asserts `max_workers=3` propagates when the config sets `parallel_workers=3`.
+
+### Notes
+- Total suite: 265 tests, runtime under one second.
+- All three features ship as additive changes — no observable behaviour change for existing configs (defaults match the prior hardcoded values; `--watch` is opt-in; `doctor` is a new command).
+
+---
+
 ## [0.5.29] — 2026-05-07
 
 ### Added

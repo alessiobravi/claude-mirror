@@ -1,0 +1,11 @@
+# Configures the GitHub issue-creation chooser.
+# https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/configuring-issue-templates-for-your-repository
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability (private)
+    url: https://github.com/alessiobravi/claude-mirror/security/advisories/new
+    about: |
+      Report a security issue privately via GitHub's security-advisory feature
+      rather than filing a public bug report. The maintainer is notified
+      immediately and can respond confidentially. See SECURITY.md for the
+      full policy.

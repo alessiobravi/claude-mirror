@@ -4,6 +4,19 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.29] — 2026-05-07
+
+### Added
+- **`SECURITY.md`** at the repo root. Documents the security-advisory reporting flow (GitHub's private security-advisory form at `https://github.com/alessiobravi/claude-mirror/security/advisories/new` rather than public issues), what the maintainer commits to (acknowledgement within seven days, fix in a private branch shipped as a patch release, credit in the CHANGELOG unless the reporter asks otherwise, no bug bounty), what is in scope (the `claude_mirror/` package, the helper scripts in `skills/`, the CLI commands, the CI workflows, and anything that ships in the wheel or sdist) and out of scope (third-party SDKs, the user's own environment, the cloud backends themselves, the Claude Code agent platform). Also enumerates what claude-mirror's design protects against (no maintainer-operated infrastructure on the data path, chmod 0600 token files, path-traversal guards via `_safe_join`, error-message redaction via `redact_error`, TLS with default certificate verification on every network call, and a fixed allowlist of network destinations) so reporters know which boundaries to test.
+- **`.github/ISSUE_TEMPLATE/bug_report.md`** standard bug-report template. Pre-fills the fields that diagnosis usually needs (`claude-mirror --version`, OS and version, Python version, backend in use, install method, the exact command, the steps to reproduce, the full error output, what the reporter has already tried) so incoming reports come in a useful shape rather than a free-form sentence. Includes a top-of-template note redirecting security issues to the private security-advisory form.
+- **`.github/ISSUE_TEMPLATE/config.yml`** wires a "Security vulnerability (private)" option into GitHub's issue-creation chooser, pointing at the same security-advisory URL. Blank issues remain enabled for cases the bug-report template does not fit.
+
+### Notes
+- Pure repository-metadata patch; no runtime behaviour change. Tests stay at 243.
+- The GitHub repo's "About" sidebar (description and topic tags) is set via the GitHub web UI, not the repo contents, so it ships as a manual operation alongside this commit rather than as code.
+
+---
+
 ## [0.5.28] — 2026-05-07
 
 ### Docs

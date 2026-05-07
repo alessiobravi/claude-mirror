@@ -16,7 +16,7 @@ Built originally for Claude Code projects (where most context lives in markdown)
 - **Near-real-time collaboration.** Pub/Sub (Drive), long-poll (Dropbox), or polling (OneDrive / WebDAV) push remote changes to other machines within seconds. Optional per-project Slack webhooks pipe events to a team channel.
 - **No-loss conflict resolution.** When both sides change a file, interactive choice: keep local, keep remote, open `$EDITOR` for manual merge, or skip. No silent overwrites.
 
-**Supported backends:** Google Drive, Dropbox, Microsoft OneDrive, and any WebDAV server (Nextcloud, OwnCloud, Apache mod_dav, Synology/QNAP NAS, Box.com, etc.). Each project picks its own primary backend independently — different projects on the same machine can use different backends.
+**Supported backends:** Google Drive, Dropbox, Microsoft OneDrive, any WebDAV server (Nextcloud, OwnCloud, Apache mod_dav, Synology/QNAP NAS, Box.com, etc.), and any SFTP/SSH-accessible server (VPS, NAS, shared hosting, self-hosted Linux). Each project picks its own primary backend independently — different projects on the same machine can use different backends.
 
 **Quality gates:** Every commit and pull request runs **303 automated tests** on Python 3.11, 3.12, 3.13, and 3.14 in parallel via GitHub Actions — covering the 3-way diff sync core, both snapshot formats, path-traversal safety, conflict resolution, auth flows, all four backends (with HTTP-level mocking), the notifier inbox under concurrent writers, and the watcher daemon's SIGHUP hot-reload. CI must be green before any PR can merge. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the test conventions and how to run them locally.
 
@@ -79,6 +79,16 @@ Built originally for Claude Code projects (where most context lives in markdown)
 - No cloud account required — works on LAN, no API quotas, full data ownership
 - Uses `requests` (already an explicit dependency, no extras needed)
 
+### SFTP
+
+- Standard SSH file transfer — works against any OpenSSH server, NAS device with SSH (Synology, QNAP, TrueNAS), VPS, shared hosting account, or self-hosted Linux box
+- SSH key authentication (preferred) or password fallback for LAN-only setups
+- Host-fingerprint verification via `~/.ssh/known_hosts` — same trust model as the `ssh` CLI
+- Polling-based change detection — same as WebDAV / OneDrive (configurable, default 30s; no native push events over SFTP)
+- Server-side `sha256sum` + `cp -p` via SSH `exec_command` when available; auto-falls back to client-side hashing for SFTP-only / `internal-sftp`-jailed accounts that disallow shell commands
+- No cloud account, no OAuth, no per-vendor app registration — if you can `ssh user@host`, you can `claude-mirror push`
+- Uses `paramiko>=3.0` (included in the base package, no extras needed)
+
 ---
 
 ## Prerequisites
@@ -93,6 +103,7 @@ Plus, depending on the backend you choose:
 | Dropbox | A Dropbox account and a Dropbox app (free, created at [dropbox.com/developers](https://www.dropbox.com/developers)) |
 | OneDrive | A Microsoft account and an Azure AD app registration (free, created at [portal.azure.com](https://portal.azure.com)) |
 | WebDAV | A WebDAV server URL + username + app password (e.g. Nextcloud / OwnCloud / NAS / Apache mod_dav) |
+| SFTP | An SSH-accessible server (VPS / NAS / shared hosting / self-hosted Linux) — SSH key recommended, password fallback OK on LAN |
 
 ---
 
@@ -263,6 +274,68 @@ Decide on a folder name (e.g. `claude-mirror-myproject`) and create it on the We
 
 Use the WebDAV server's native share/permissions UI to grant each collaborator read+write access to the project folder.
 
+### Option E: SFTP setup (any server with SSH access)
+
+SFTP requires no cloud account or app registration — any OpenSSH server works. If you can `ssh user@host` interactively, you can use it as a claude-mirror backend.
+
+#### Step 1: Choose authentication (SSH key strongly recommended)
+
+SSH key authentication is the supported default. Password authentication is supported as a LAN-only fallback for legacy / NAS setups that don't accept keys.
+
+If you don't already have a key, generate one:
+
+```bash
+ssh-keygen -t ed25519 -C "claude-mirror@$(hostname)"
+# Press enter to accept the default path (~/.ssh/id_ed25519)
+# Use a passphrase or leave empty — claude-mirror runs non-interactively, so an empty passphrase or an ssh-agent-loaded key both work
+```
+
+#### Step 2: Add the public key to the server
+
+The simplest path is `ssh-copy-id`, which appends your public key to the remote `~/.ssh/authorized_keys` over a single password-authenticated SSH connection:
+
+```bash
+ssh-copy-id -i ~/.ssh/id_ed25519.pub alice@files.example.com
+```
+
+If `ssh-copy-id` is not available (some NAS firmwares strip it), append the key manually:
+
+```bash
+cat ~/.ssh/id_ed25519.pub | ssh alice@files.example.com 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'
+```
+
+#### Step 3: Verify interactive SSH works (and trust the host fingerprint)
+
+This step is the prerequisite that lets `claude-mirror` connect non-interactively later — you must accept the server's host fingerprint into `~/.ssh/known_hosts` once, from the OpenSSH client, before claude-mirror can verify it on subsequent connects.
+
+```bash
+ssh alice@files.example.com
+# First time: ssh prints the host's fingerprint and asks "Are you sure you want to continue connecting (yes/no)?"
+# Type "yes" to add it to ~/.ssh/known_hosts, then exit.
+```
+
+If `claude-mirror` later refuses to connect with a host-key mismatch error, this is the file to inspect or update.
+
+#### Step 4: Decide on the server-side folder
+
+Pick an absolute path on the server where the project will live, e.g. `/home/alice/claude-mirror/myproject`. You don't need to pre-create it — `claude-mirror` will `mkdir -p` the folder on first connect if it doesn't exist.
+
+If the account is chrooted to a smaller subtree (Step 5), use a path relative to that chroot — e.g. `/myproject` if the account is jailed to `/home/alice/sftp/`.
+
+#### Step 5 (optional): Lock the account down to SFTP-only
+
+For a dedicated mirror account, add the following to the server's `/etc/ssh/sshd_config`:
+
+```
+Match User alice
+    ForceCommand internal-sftp
+    ChrootDirectory /home/alice/sftp
+    AllowTcpForwarding no
+    X11Forwarding no
+```
+
+Trade-off: `internal-sftp` disables shell `exec_command`, so the server-side `sha256sum` + `cp -p` optimizations are unavailable. `claude-mirror` falls back automatically to client-side hashing + `get`/`put` for snapshots — slightly slower on large files, but otherwise functionally identical.
+
 ---
 
 ## Part 2 — Installation (every machine)
@@ -289,7 +362,7 @@ pipx ensurepath     # adds ~/.local/bin to PATH if not already there
 pipx install claude-mirror
 ```
 
-All backends (Google Drive, Dropbox, OneDrive, WebDAV) ship in this single install — no per-backend extras needed. Pick which one to use later via `claude-mirror init --backend ...`.
+All backends (Google Drive, Dropbox, OneDrive, WebDAV, SFTP) ship in this single install — no per-backend extras needed. Pick which one to use later via `claude-mirror init --backend ...`.
 
 Verify the install:
 
@@ -346,7 +419,7 @@ To verify desktop notifications are working, run `claude-mirror test-notify` aft
 
 After install, the installer offers to replace the current shell with a fresh interactive shell so the new completion is live immediately. If you decline, you can activate it yourself by either opening a new terminal or running `source ~/.zshrc` (zsh), `source ~/.bash_profile` on macOS or `source ~/.bashrc` on Linux (bash), or simply opening a new fish shell (fish auto-loads completion files from `~/.config/fish/completions`).
 
-Once active, `claude-mirror <TAB>` lists all commands, `claude-mirror push <TAB>` lists flags, and `claude-mirror init --backend <TAB>` shows the four valid backends `googledrive`, `dropbox`, `onedrive`, and `webdav`.
+Once active, `claude-mirror <TAB>` lists all commands, `claude-mirror push <TAB>` lists flags, and `claude-mirror init --backend <TAB>` shows the five valid backends `googledrive`, `dropbox`, `onedrive`, `webdav`, and `sftp`.
 
 If you want to install completion manually instead (or for a different shell on the same machine):
 
@@ -564,7 +637,7 @@ Available flags:
 | Flag | Default | Description |
 |---|---|---|
 | `--wizard` | — | Launch interactive setup wizard. |
-| `--backend` | `googledrive` | Storage backend: `googledrive`, `dropbox`, `onedrive`, or `webdav`. |
+| `--backend` | `googledrive` | Storage backend: `googledrive`, `dropbox`, `onedrive`, `webdav`, or `sftp`. |
 | `--drive-folder-id ID` | — | Google Drive folder ID (Google Drive only). |
 | `--gcp-project-id ID` | — | Google Cloud project ID (Google Drive only). |
 | `--pubsub-topic-id ID` | — | Pub/Sub topic ID (Google Drive only). |
@@ -1288,7 +1361,7 @@ Use Tier 2 (`mirror_config_paths`) for any real mirroring use case. Reach for th
 
 ## Auto-start the watcher
 
-Use `claude-mirror watch-all` to watch every project in a single process. It auto-discovers all configs in `~/.config/claude_mirror/` and starts one notification listener per project, each in its own thread. Projects using different backends are handled transparently — each thread picks the right notifier for its backend (Pub/Sub for Google Drive, long-polling for Dropbox, periodic polling for OneDrive and WebDAV):
+Use `claude-mirror watch-all` to watch every project in a single process. It auto-discovers all configs in `~/.config/claude_mirror/` and starts one notification listener per project, each in its own thread. Projects using different backends are handled transparently — each thread picks the right notifier for its backend (Pub/Sub for Google Drive, long-polling for Dropbox, periodic polling for OneDrive, WebDAV, and SFTP):
 
 ```bash
 claude-mirror watch-all
@@ -1639,7 +1712,7 @@ It searches all `~/.config/claude_mirror/*.yaml` files for one whose `project_pa
 
 ```
 claude-mirror init        [--wizard]
-                        [--backend googledrive|dropbox|onedrive|webdav]
+                        [--backend googledrive|dropbox|onedrive|webdav|sftp]
                         [--project PATH]
                         [--drive-folder-id ID] [--gcp-project-id ID] [--pubsub-topic-id ID]
                         [--credentials-file PATH]
@@ -1647,6 +1720,10 @@ claude-mirror init        [--wizard]
                         [--onedrive-client-id ID] [--onedrive-folder PATH]
                         [--webdav-url URL] [--webdav-username USER] [--webdav-password PASS]
                         [--webdav-insecure-http]   # opt-in to plain http:// (NOT recommended — credentials in cleartext)
+                        [--sftp-host HOST] [--sftp-port PORT] [--sftp-username USER]
+                        [--sftp-key-file PATH] [--sftp-password PASS]
+                        [--sftp-known-hosts-file PATH] [--sftp-strict-host-check/--no-sftp-strict-host-check]
+                        [--sftp-folder PATH]
                         [--poll-interval SECS]
                         [--slack/--no-slack] [--slack-webhook-url URL] [--slack-channel CHAN]
                         [--token-file PATH] [--patterns GLOB ...] [--exclude GLOB ...] [--config PATH]
@@ -1755,6 +1832,36 @@ file_patterns:
 machine_name: workstation
 user: alice
 ```
+
+### SFTP
+
+```yaml
+backend: sftp
+project_path: /home/user/work/myproject
+sftp_host: files.example.com           # hostname or IP of the SSH server
+sftp_port: 22                          # default 22 — change if the server listens elsewhere
+sftp_username: alice                   # the SSH user — same one you'd use with `ssh user@host`
+sftp_key_file: ~/.ssh/id_ed25519       # PREFERRED — path to the private key file
+sftp_password: ""                      # FALLBACK — leave empty when using a key; LAN-only when set
+sftp_known_hosts_file: ~/.ssh/known_hosts   # where the host fingerprint is read from
+sftp_strict_host_check: true           # default true — refuse to connect on host-key mismatch (set false ONLY for trusted LAN with rotating IPs)
+sftp_folder: /home/alice/claude-mirror/myproject   # absolute path on the server (or relative to the chroot if `internal-sftp` is in use)
+token_file: /home/user/.config/claude_mirror/sftp-myproject-token.json
+poll_interval: 30                      # seconds between remote-state polls (no native push events on SFTP)
+file_patterns:
+  - "**/*.md"
+machine_name: workstation
+user: alice
+# Optional: snapshot retention policy. Each field defaults to 0 (= disabled).
+# Union of every selector's keep-set is retained; everything else is pruned
+# automatically after each successful `claude-mirror push`.
+keep_last:    7      # always keep the 7 newest snapshots
+keep_daily:   14     # plus one snapshot per day for the last 14 days
+keep_monthly: 12     # plus one snapshot per month for the last 12 months
+keep_yearly:  5      # plus one snapshot per year for the last 5 years
+```
+
+The password (when used) is stored only in the token file (chmod 0600), never in this YAML. SSH key files are read from disk on every connect; their permissions are your responsibility (OpenSSH refuses to use a key file that's group- or world-readable).
 
 ### With Slack notifications
 
@@ -2185,7 +2292,7 @@ claude-mirror reads older configs and manifests transparently — there is nothi
 
 claude-mirror is provided **as is, without warranty of any kind**, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and noninfringement. By downloading, installing, or running this software you accept full and exclusive responsibility for any consequences of its use, including without limitation:
 
-- **Data loss, corruption, or accidental deletion** of your local files, your remote storage (Google Drive, Dropbox, OneDrive, WebDAV server), or any backups thereof — whether caused by a bug, a misconfiguration, an interrupted sync, a network failure, a backend API change, an authentication problem, or otherwise.
+- **Data loss, corruption, or accidental deletion** of your local files, your remote storage (Google Drive, Dropbox, OneDrive, WebDAV server, SFTP server), or any backups thereof — whether caused by a bug, a misconfiguration, an interrupted sync, a network failure, a backend API change, an authentication problem, or otherwise.
 - **Unintended overwrites** during conflict resolution, `pull`, `push`, or `restore` operations.
 - **Disclosure of file contents** to anyone who has access to the configured remote folder, the Pub/Sub topic, the Slack channel, or the local machine. claude-mirror syncs whatever matches the configured `file_patterns` — review your patterns and `exclude_patterns` carefully before pushing.
 - **Charges or quota consumption** on Google Cloud, Microsoft Azure, Dropbox, or any other third-party service used as a backend.

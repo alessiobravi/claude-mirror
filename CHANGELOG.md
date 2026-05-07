@@ -4,6 +4,36 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.33] — 2026-05-07
+
+### Added — SFTP storage backend (`backend: sftp`)
+
+A new universal "I have a server with SSH access" backend. SFTP is the path of least resistance for users who already run a VPS, a NAS with SSH (Synology, QNAP, TrueNAS), a shared hosting account with SSH, or any self-hosted Linux machine — no OAuth dance, no per-vendor app registration, no cloud account. If `ssh user@host` works from your terminal, `claude-mirror push` works against the same server. Implementation built on `paramiko>=3.0`, which is added as a base dependency (no extras needed — it ships in the single `pipx install claude-mirror`).
+
+Eight new YAML config fields:
+- `sftp_host` — hostname or IP of the SSH server
+- `sftp_port` — TCP port (default 22)
+- `sftp_username` — the SSH user (same one you'd use with `ssh user@host`)
+- `sftp_key_file` — path to a private SSH key file (preferred auth method)
+- `sftp_password` — password fallback for legacy / NAS setups that don't accept keys (LAN-only; stored in the token file at chmod 0600, never in the YAML)
+- `sftp_known_hosts_file` — path to the known-hosts file used for host-fingerprint verification (default `~/.ssh/known_hosts`)
+- `sftp_strict_host_check` — refuse to connect on host-key mismatch (default `true`; set `false` only for trusted LAN with rotating IPs)
+- `sftp_folder` — absolute path on the server (or path relative to the chroot if `internal-sftp` is in use)
+
+**Auth model:** SSH key is preferred and is the recommended setup. Password authentication is supported as a LAN-only fallback. Host-key verification reads from `~/.ssh/known_hosts` by default — same trust model as the OpenSSH client — so the user runs `ssh user@host` once interactively to pin the server fingerprint, after which `claude-mirror` connects non-interactively against the pinned key. Setting `sftp_strict_host_check: false` disables the check (not recommended outside a trusted LAN).
+
+**Notification model:** Polling (no native push events over SFTP), same approach as the WebDAV and OneDrive backends. The notifier polls remote-folder state at `poll_interval` seconds (default 30); `claude-mirror watch` and `claude-mirror watch-all` both pick up the polling notifier transparently.
+
+**Optimizations:** When the server allows shell commands (i.e. is not jailed to `internal-sftp`), `claude-mirror` issues SSH `exec_command` calls for `sha256sum <path>` (server-side hashing — avoids round-tripping the file bytes for change detection) and `cp -p <src> <dst>` (server-side snapshot copy — avoids round-tripping the file bytes for snapshots). Both are wrapped in a try/except: if the server returns "command not found" or non-zero exit, the backend transparently falls back to client-side hashing (download + hash locally) and client-side copy (`get` + `put`). Users who lock the account down to `Subsystem sftp internal-sftp` + `ChrootDirectory` see correct behaviour with the slower fallback path; no config change required.
+
+**Path-as-id:** Like WebDAV, SFTP has no proper file-id concept — paths ARE the identifier. The backend layer normalizes all paths to POSIX-style with no trailing slashes before hashing into the manifest, and the existing path-traversal guards in `_safe_join` apply on every remote-side operation.
+
+**Wizard + doctor + skill integration.** `claude-mirror init --wizard --backend sftp` collects the eight fields interactively (with sensible defaults — port 22, known-hosts at `~/.ssh/known_hosts`, strict host-check on); `claude-mirror auth --config <path>` does a smoke connect that lists the project folder and writes the token file; `claude-mirror doctor --backend sftp` runs the standard six-check pass with SFTP-specific failure hints (key-file permissions, host-key mismatch, password-fallback in use, chrooted account detected). The `claude-mirror.md` skill picks up SFTP via the same `--backend sftp` path; existing skill commands (`push` / `pull` / `status` / `diff` / `snapshots` / `restore`) work identically against the new backend.
+
+**Tests:** ~25 new offline tests in `tests/test_sftp.py` with mocked `paramiko.SSHClient` / `paramiko.SFTPClient` cover the connect-with-key path, the password-fallback path, host-key acceptance + rejection, the `sha256sum` exec optimization, the client-side fallback when `exec_command` returns non-zero, recursive folder listing, upload + download round-trip, server-side `cp -p` for snapshots, and the polling-notifier integration. All under 100ms each, no network access, no real SSH server needed. Tests now 328 green on Python 3.14.
+
+---
+
 ## [0.5.32] — 2026-05-07
 
 Two additive features bundled into one release: a colorized diff command and configurable snapshot retention. Plus the held documentation tweaks from the v0.5.31 cycle.

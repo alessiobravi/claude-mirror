@@ -71,6 +71,12 @@ Issues        = "https://github.com/alessiobravi/claude-mirror/issues"
 dropbox = []
 onedrive = []
 all = []
+# Development extras — pytest + helpers for the test suite.
+# Install with: pipx install -e '.[dev]'  or  pip install -e '.[dev]'
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.10",
+]
 
 [project.scripts]
 claude-mirror         = "claude_mirror.cli:cli"
@@ -78,3 +84,15 @@ claude-mirror-install = "claude_mirror.install:install_cli"
 
 [tool.hatch.build.targets.wheel]
 packages = ["claude_mirror"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-ra --strict-markers"
+filterwarnings = [
+    "error",
+    # google-api-python-client emits a DeprecationWarning under Python 3.13+
+    "ignore::DeprecationWarning:google",
+    "ignore::DeprecationWarning:googleapiclient",
+]

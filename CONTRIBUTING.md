@@ -38,6 +38,15 @@ skills/               ← Claude Code skill source (installed via `claude-mirror
 - **Tests should be fast.** The full suite runs in well under a second today; keep that property. If you need a slow test, mark it with `@pytest.mark.slow` so it can be filtered out.
 - **Warnings are errors.** `pyproject.toml` sets `filterwarnings = "error"` — a `DeprecationWarning` from upstream usually means a future-version breakage to flag. If a specific warning is genuinely unactionable, add it to the `pyproject.toml` filter list with a comment explaining why.
 
+## Shell tab-completion code
+
+Tab-completion has two surfaces in the codebase, with dedicated test files for each:
+
+- **The `completion` Click command** in `claude_mirror/cli.py` emits the per-shell completion script via Click 8's `BashComplete`, `ZshComplete`, and `FishComplete` classes. Tests live in `tests/test_completion.py` and cover each shell's emitted script, the case-insensitive shell argument, the unsupported-shell rejection path, and discoverability via the top-level `--help`.
+- **The `install_completion` and `uninstall_completion` functions** in `claude_mirror/install.py` handle the rc-file editing during `claude-mirror-install`. Tests live in `tests/test_install_completion.py` and cover shell detection from `$SHELL`, target-file resolution per platform, the marker-comment-wrapped install block, idempotent re-runs, the update path when the binary path changes, the uninstall path that preserves user content above and below the block, and the `_completion_activation_pending` module-level flag that drives the end-of-install activation banner.
+
+If you are adding a new completion-emitting feature (such as a value-completer for a specific flag), update both the runtime code in `cli.py` and the corresponding tests in `test_completion.py`. If you are changing how the installer writes to rc files (such as supporting a new shell), update both `install.py` and `test_install_completion.py`. The `_completion_activation_pending` flag is module-level state; if you add a new install path that should also trigger the end-of-install banner, set the flag from that path.
+
 ## Style
 
 - No `Co-Authored-By:` trailers in commit messages.

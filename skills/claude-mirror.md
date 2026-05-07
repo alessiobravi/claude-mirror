@@ -194,6 +194,29 @@ To start it for the current project:
 claude-mirror watch --config <config-path>
 ```
 
+## Shell tab-completion
+
+`claude-mirror-install` auto-installs shell tab-completion for the user's detected shell (zsh, bash, or fish). Pressing `<TAB>` after `claude-mirror` shows all commands; after a specific command, it shows the relevant flags; for `click.Choice` flags such as `--backend` it shows the valid choices (`googledrive`, `dropbox`, `onedrive`, `webdav`).
+
+If the user reports that tab-completion is not working after running `claude-mirror-install`, the most common cause is that the current shell session was started before the rc file was modified by the installer. Two fixes:
+
+```bash
+# (zsh) re-source the rc file in the current shell
+source ~/.zshrc
+
+# OR open a new terminal — both work
+```
+
+To reinstall or inspect the completion script directly:
+
+```bash
+claude-mirror completion zsh    # emit zsh completion script to stdout
+claude-mirror completion bash   # emit bash completion script to stdout
+claude-mirror completion fish   # emit fish completion script to stdout
+```
+
+For users running `claude-mirror` inside Claude Code's own shell snapshot (rather than a real iTerm or Terminal session), tab-completion will not work; the snapshot does not re-source rc files dynamically. Direct the user to test tab-completion in their normal terminal.
+
 ## Error recovery
 
 ### Authentication error (`RefreshError` or `Not authenticated`)

@@ -4,6 +4,17 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.28] — 2026-05-07
+
+### Docs
+- **Skill (`skills/claude-mirror.md`) gains a "Shell tab-completion" section.** Pre-v0.5.28, the v0.5.27 tab-completion feature was documented in `README.md` and `CHANGELOG.md` but not in the skill that ships at `~/.claude/skills/claude-mirror/SKILL.md`. The Claude Code agent reading the skill now knows that `claude-mirror-install` auto-installs tab-completion, that the `completion` command can emit the script directly for any of the three supported shells, and that the most common reason tab-completion fails to work after install is that the user's current shell session was started before the rc-file edit (fix: re-source the rc file or open a new terminal).
+- **`CONTRIBUTING.md` documents the two tab-completion code surfaces** for future contributors: the `completion` Click command in `claude_mirror/cli.py` (tests at `tests/test_completion.py`) and the `install_completion` / `uninstall_completion` functions in `claude_mirror/install.py` (tests at `tests/test_install_completion.py`). The new paragraph describes which file to touch for which kind of change and explicitly calls out the `_completion_activation_pending` module-level flag that drives the end-of-install activation banner.
+
+### Notes
+- Pure documentation patch; no runtime behaviour change. Suite stays at 243 tests.
+
+---
+
 ## [0.5.27] — 2026-05-07
 
 ### Added

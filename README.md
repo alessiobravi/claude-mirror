@@ -5,9 +5,18 @@
 [![Python](https://img.shields.io/pypi/pyversions/claude-mirror)](https://pypi.org/project/claude-mirror/)
 [![License](https://img.shields.io/pypi/l/claude-mirror)](https://github.com/alessiobravi/claude-mirror/blob/main/LICENSE)
 
-Sync Claude project MD files across machines via cloud storage, with real-time notifications and snapshot-based disaster recovery.
+**Mirror your project files across machines and cloud backends — with multi-cloud redundancy, time-travel disaster recovery, and real-time collaboration signals.**
 
-**Supported backends:** Google Drive, Dropbox, Microsoft OneDrive, and any WebDAV server (Nextcloud, OwnCloud, Apache mod_dav, Synology/QNAP NAS, Box.com, etc.). Each project chooses its own backend independently — different projects on the same machine can use different backends.
+Built originally for Claude Code projects (where most context lives in markdown), but the file-pattern glob is configurable to sync any file type. The default `file_patterns: ["**/*.md"]` keeps just Claude context files in sync; set it to `["**/*"]` to mirror the entire project tree, or any other glob (e.g. `["**/*.py", "**/*.md"]`) to scope what gets synced.
+
+### Why use it
+
+- **Multi-cloud redundancy.** Push to multiple backends in parallel (e.g. Google Drive + Dropbox + OneDrive). Any single provider's outage, account suspension, or quota cap never costs you data. Per-mirror retry queues mean a transient failure on one backend never blocks the rest.
+- **Time-travel disaster recovery.** Every push and sync auto-creates a snapshot. `claude-mirror history PATH` shows every version of any file across snapshots; `claude-mirror restore` rolls a single file or the whole project back to any past timestamp. Two storage formats: content-addressed blobs (identical content across snapshots stored once) or full per-snapshot copies.
+- **Near-real-time collaboration.** Pub/Sub (Drive), long-poll (Dropbox), or polling (OneDrive / WebDAV) push remote changes to other machines within seconds. Optional per-project Slack webhooks pipe events to a team channel.
+- **No-loss conflict resolution.** When both sides change a file, interactive choice: keep local, keep remote, open `$EDITOR` for manual merge, or skip. No silent overwrites.
+
+**Supported backends:** Google Drive, Dropbox, Microsoft OneDrive, and any WebDAV server (Nextcloud, OwnCloud, Apache mod_dav, Synology/QNAP NAS, Box.com, etc.). Each project picks its own primary backend independently — different projects on the same machine can use different backends.
 
 **Quality gates:** Every commit and pull request runs **214 automated tests** on Python 3.11, 3.12, and 3.13 in parallel via GitHub Actions — covering the 3-way diff sync core, both snapshot formats, path-traversal safety, conflict resolution, auth flows, all four backends (with HTTP-level mocking), the notifier inbox under concurrent writers, and the watcher daemon's SIGHUP hot-reload. CI must be green before any PR can merge. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the test conventions and how to run them locally.
 

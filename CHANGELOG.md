@@ -4,6 +4,18 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.24] — 2026-05-07
+
+### Docs
+- **README opening rewritten to describe what claude-mirror actually does, not just its original use case.** Pre-v0.5.24, the headline read "Sync Claude project MD files across machines…" — accurate to the project's origin but misleading about its current scope. The file-pattern glob has always been configurable, but the marketing copy implied markdown-only. New headline: "Mirror your project files across machines and cloud backends — with multi-cloud redundancy, time-travel disaster recovery, and real-time collaboration signals." Followed by an explicit note that `file_patterns` is a glob (default `["**/*.md"]`, but `["**/*"]` mirrors everything, and any glob like `["**/*.py", "**/*.md"]` scopes what gets synced).
+- **Added a "Why use it" bullet section right at the top** with four value props that previously were buried in the "How it works" technical section: multi-cloud redundancy (Tier 2 mirroring as outage / suspension / quota survival), time-travel DR (`history` + `restore` to any past timestamp, with both blob and full snapshot formats explained), near-real-time collaboration (per-backend notification mechanics in one line each), and no-loss conflict resolution (the four interactive choices). Drive-by visitors now see why this exists before they see how it works.
+- **Backend support reordered.** Now appears after the value props instead of mixed in with the headline pitch. Same content, better information hierarchy.
+
+### Notes
+- No code change. Wheel + sdist rebuilt only because the README change is the long-description on PyPI's project page; uploading v0.5.24 refreshes that page.
+
+---
+
 ## [0.5.23] — 2026-05-07
 
 ### Docs

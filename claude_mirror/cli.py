@@ -1395,9 +1395,22 @@ def status(config_path: str, short: bool, pending: bool, watch_interval: Optiona
             while True:
                 renderable = _build_status_renderable(engine, short=short, pending=pending)
                 live.update(renderable)
-                time.sleep(watch_interval)
+                _status_watch_sleep(watch_interval)
     except KeyboardInterrupt:
         console.print("\n[dim]watch stopped[/]")
+
+
+def _status_watch_sleep(interval: int) -> None:
+    """Indirection over time.sleep for the --watch loop only.
+
+    Exists so tests can monkeypatch THIS function to raise KeyboardInterrupt
+    instead of patching the global time.sleep. The global patch was fragile —
+    it would trigger from any unrelated time.sleep call along the request
+    path (stdlib retry loops, threading internals, urllib backoff, etc.),
+    which raised KeyboardInterrupt outside the watch loop's try/except and
+    surfaced as "Aborted!" exit_code 1 in CI on Python 3.11/3.12/3.13.
+    """
+    time.sleep(interval)
 
 
 def _build_status_renderable(

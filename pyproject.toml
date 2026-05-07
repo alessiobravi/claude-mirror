@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "claude-mirror"
-version = "0.5.30"
+version = "0.5.31"
 description = "Mirror & sync Claude Code project markdown across machines + cloud backends (Google Drive, Dropbox, OneDrive, WebDAV) with snapshots and Tier 2 multi-backend"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -29,6 +29,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: 3 :: Only",
     "Topic :: Communications :: File Sharing",
     "Topic :: Software Development :: Version Control",

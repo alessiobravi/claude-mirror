@@ -4,6 +4,20 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.31] — 2026-05-07
+
+CI fix for the v0.5.30 watch-mode tests, plus Python 3.14 added to the supported matrix.
+
+### Fixed — `status --watch` test suite green on Linux Python 3.11/3.12/3.13
+- The three watch-mode tests in `tests/test_status_watch.py` failed in CI on Ubuntu / Python 3.11, 3.12, and 3.13 with `Aborted!` exit_code 1, while passing locally on Python 3.14 / macOS. Root cause: the tests monkey-patched `time.sleep` globally to raise `KeyboardInterrupt`, but the global patch could fire from unrelated stdlib code paths between `CliRunner.invoke` and the watch loop's `try/except`, surfacing as Click's `Abort()` instead of being caught by the loop's interrupt handler.
+- Fix: introduced a thin `_status_watch_sleep(interval)` indirection in `claude_mirror/cli.py` that the watch loop calls instead of `time.sleep` directly. Tests now patch `cli_module._status_watch_sleep` (one specific call site) rather than the global `time.sleep`, eliminating the interference. No production behaviour change — the helper is a one-line wrapper.
+
+### Added — Python 3.14 to test matrix and PyPI classifiers
+- `.github/workflows/test.yml` now runs the test suite on Python 3.11, 3.12, 3.13, and 3.14 (matching the maintainer's local dev version, so future regressions surface uniformly across all supported versions before they reach a release tag).
+- Added `Programming Language :: Python :: 3.14` to `pyproject.toml` classifiers so the PyPI page and resolver correctly advertise 3.14 support.
+
+---
+
 ## [0.5.30] — 2026-05-07
 
 Three additive features bundled into one release.

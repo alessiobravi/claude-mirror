@@ -98,15 +98,19 @@ def test_status_without_watch_flag_runs_once_and_exits(patch_load_engine):
 
 def test_status_with_watch_flag_enters_live_mode(monkeypatch, patch_load_engine):
     """With --watch N, `status` enters a rich.live.Live context and calls
-    Live.update() before each sleep. Patching time.sleep to raise
-    KeyboardInterrupt on the first call exits the loop after one iteration."""
+    Live.update() before each sleep. Patching the watch-loop sleep helper
+    to raise KeyboardInterrupt on the first call exits the loop after one
+    iteration. We patch `_status_watch_sleep` rather than `time.sleep`
+    globally — a global patch can fire from unrelated stdlib code paths
+    (urllib retries, subprocess internals, threading) and bypass the
+    loop's try/except, surfacing as Click "Aborted!" exit_code 1."""
     sleep_calls = {"n": 0}
 
     def fake_sleep(_seconds):
         sleep_calls["n"] += 1
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(cli_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(cli_module, "_status_watch_sleep", fake_sleep)
 
     # Spy on Live so we can verify update() was invoked.
     fake_live = MagicMock()
@@ -139,7 +143,7 @@ def test_status_watch_iterates_until_keyboard_interrupt(monkeypatch, patch_load_
             raise KeyboardInterrupt
         return None
 
-    monkeypatch.setattr(cli_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(cli_module, "_status_watch_sleep", fake_sleep)
 
     fake_live = MagicMock()
     fake_live_ctx = MagicMock()
@@ -188,7 +192,7 @@ def test_status_watch_keyboard_interrupt_prints_stop_message(
     def fake_sleep(_seconds):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(cli_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(cli_module, "_status_watch_sleep", fake_sleep)
 
     fake_live = MagicMock()
     fake_live_ctx = MagicMock()

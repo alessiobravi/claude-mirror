@@ -329,7 +329,7 @@ class SnapshotManager:
             )
 
         if project_files:
-            workers = min(PARALLEL_WORKERS, len(project_files))
+            workers = min(self.config.parallel_workers, len(project_files))
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 list(ex.map(_copy_one, project_files))
 
@@ -373,7 +373,7 @@ class SnapshotManager:
             except Exception as e:
                 return backend, e
 
-        workers = min(PARALLEL_WORKERS, len(self._mirrors))
+        workers = min(self.config.parallel_workers, len(self._mirrors))
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = [ex.submit(_one, b) for b in self._mirrors]
             for fut in as_completed(futs):
@@ -503,7 +503,7 @@ class SnapshotManager:
             return digest
 
         if to_upload:
-            workers = min(PARALLEL_WORKERS, len(to_upload))
+            workers = min(self.config.parallel_workers, len(to_upload))
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 list(ex.map(_upload_blob, to_upload))
 
@@ -563,7 +563,7 @@ class SnapshotManager:
             except Exception as e:
                 return backend, e
 
-        workers = min(PARALLEL_WORKERS, len(self._mirrors))
+        workers = min(self.config.parallel_workers, len(self._mirrors))
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = [ex.submit(_one, b) for b in self._mirrors]
             for fut in as_completed(futs):
@@ -680,7 +680,7 @@ class SnapshotManager:
                 }
 
             if folders:
-                workers = min(PARALLEL_WORKERS, len(folders))
+                workers = min(self.config.parallel_workers, len(folders))
                 with ThreadPoolExecutor(max_workers=workers) as ex:
                     futs = [ex.submit(_fetch_full_meta, f) for f in folders]
                     for fut in as_completed(futs):
@@ -693,7 +693,7 @@ class SnapshotManager:
             progress.update(full_task, detail="completed")
 
             if manifest_files:
-                workers = min(PARALLEL_WORKERS, len(manifest_files))
+                workers = min(self.config.parallel_workers, len(manifest_files))
                 with ThreadPoolExecutor(max_workers=workers) as ex:
                     futs = [ex.submit(_fetch_blob_meta, f) for f in manifest_files]
                     for fut in as_completed(futs):
@@ -931,13 +931,13 @@ class SnapshotManager:
 
         entries: list[dict] = []
         if blobs_snaps:
-            workers = min(PARALLEL_WORKERS, len(blobs_snaps))
+            workers = min(self.config.parallel_workers, len(blobs_snaps))
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 for result in ex.map(_check_blobs, blobs_snaps):
                     if result:
                         entries.append(result)
         if full_snaps:
-            workers = min(PARALLEL_WORKERS, len(full_snaps))
+            workers = min(self.config.parallel_workers, len(full_snaps))
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 for result in ex.map(_check_full, full_snaps):
                     if result:
@@ -1353,7 +1353,7 @@ class SnapshotManager:
             return rel_path
 
         if files:
-            workers = min(PARALLEL_WORKERS, len(files))
+            workers = min(self.config.parallel_workers, len(files))
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 futs = {ex.submit(_download_one, f): f for f in files}
                 for fut in as_completed(futs):
@@ -1435,7 +1435,7 @@ class SnapshotManager:
         downloadable = [(p, h) for p, h in path_to_hash.items() if h in hash_to_id]
         ok = 0
         if downloadable:
-            workers = min(PARALLEL_WORKERS, len(downloadable))
+            workers = min(self.config.parallel_workers, len(downloadable))
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 futs = {ex.submit(_download_one, item): item for item in downloadable}
                 for fut in as_completed(futs):
@@ -1595,7 +1595,7 @@ class SnapshotManager:
                 except Exception:
                     return False
 
-            workers = min(PARALLEL_WORKERS, len(orphans))
+            workers = min(self.config.parallel_workers, len(orphans))
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 futs = [ex.submit(_delete_one, o) for o in orphans]
                 for fut in as_completed(futs):
@@ -2085,7 +2085,7 @@ class SnapshotManager:
             return rel, sha
 
         if files:
-            workers = min(PARALLEL_WORKERS, len(files))
+            workers = min(self.config.parallel_workers, len(files))
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 for rel, sha in ex.map(_convert_one, files):
                     path_to_hash[rel] = sha
@@ -2168,7 +2168,7 @@ class SnapshotManager:
 
         items = list(path_to_hash.items())
         if items:
-            workers = min(PARALLEL_WORKERS, len(items))
+            workers = min(self.config.parallel_workers, len(items))
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 list(ex.map(_materialise_one, items))
 

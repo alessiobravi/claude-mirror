@@ -105,6 +105,14 @@ class Config:
     # opt out of failure-only notifications.
     notify_failures: bool = True
 
+    # parallel_workers: maximum concurrent ThreadPoolExecutor workers
+    # used for blob uploads, snapshot copies, recursive listings, and
+    # other parallel operations. Tune up on fat connections, down on
+    # rate-limited APIs / slow CPUs. Default 5 mirrors the
+    # `claude_mirror._constants.PARALLEL_WORKERS` fallback used when
+    # no Config object is available.
+    parallel_workers: int = 5
+
     def __post_init__(self) -> None:
         if not self.credentials_file:
             self.credentials_file = str(CONFIG_DIR / "credentials.json")

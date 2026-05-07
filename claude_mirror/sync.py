@@ -248,7 +248,7 @@ class SyncEngine:
                 return results
 
             _local(f"hashing {len(misses)} new file(s) (0/{len(misses)}, {cached_count} cached)")
-            workers = min(PARALLEL_WORKERS, len(misses))
+            workers = min(self.config.parallel_workers, len(misses))
             done = 0
 
             def _hash(rel: str) -> str:
@@ -979,7 +979,7 @@ class SyncEngine:
                 return [], [item]
 
         succeeded, failed = [], []
-        workers = min(PARALLEL_WORKERS, len(items))
+        workers = min(self.config.parallel_workers, len(items))
 
         # Render either inside a caller-supplied Progress (composed dual-line
         # view) or in our own transient Progress.
@@ -1053,7 +1053,7 @@ class SyncEngine:
                                 detail="nothing to check")
             return [], []
         safe, conflicts = [], []
-        workers = min(PARALLEL_WORKERS, len(states))
+        workers = min(self.config.parallel_workers, len(states))
         if progress is not None and task_id is not None:
             progress.update(task_id, total=len(states), completed=0,
                             detail=f"0/{len(states)}")
@@ -1193,7 +1193,7 @@ class SyncEngine:
 
         if not self._mirrors:
             return
-        workers = min(PARALLEL_WORKERS, len(self._mirrors))
+        workers = min(self.config.parallel_workers, len(self._mirrors))
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = [ex.submit(_push_one, b) for b in self._mirrors]
             for fut in as_completed(futs):

@@ -199,7 +199,7 @@ claude-mirror watch --config <config-path>
 
 ## Shell tab-completion
 
-`claude-mirror-install` auto-installs shell tab-completion for the user's detected shell (zsh, bash, or fish). Pressing `<TAB>` after `claude-mirror` shows all commands; after a specific command, it shows the relevant flags; for `click.Choice` flags such as `--backend` it shows the valid choices (`googledrive`, `dropbox`, `onedrive`, `webdav`).
+`claude-mirror-install` auto-installs shell tab-completion for the user's detected shell (zsh, bash, or fish). Pressing `<TAB>` after `claude-mirror` shows all commands; after a specific command, it shows the relevant flags; for `click.Choice` flags such as `--backend` it shows the valid choices (`googledrive`, `dropbox`, `onedrive`, `webdav`, `sftp`).
 
 If the user reports that tab-completion is not working after running `claude-mirror-install`, the most common cause is that the current shell session was started before the rc file was modified by the installer. Two fixes:
 
@@ -251,6 +251,32 @@ These rules apply whenever the active project has a `memory/` directory or MEMOR
 2. Diff against current memory
 3. Produce a structured analysis of what changed and what should be updated in memory (new facts, stale entries, discrepancies across files)
 4. Ask for confirmation before writing to memory or pushing to Drive
+
+## Backend recipes
+
+### SFTP (self-hosted SSH server)
+
+YAML config (excerpt):
+
+```yaml
+backend: sftp
+sftp_host: storage.example.com
+sftp_port: 22
+sftp_username: alice
+sftp_key_file: ~/.ssh/id_ed25519
+sftp_folder: /srv/claude-mirror/myproject
+poll_interval: 30
+```
+
+Bring it up:
+
+```bash
+claude-mirror init --wizard --backend sftp
+claude-mirror auth   --config <config-path>
+claude-mirror push   --config <config-path>
+```
+
+SFTP has no native push notifications — claude-mirror falls back to polling (see `poll_interval`).
 
 ## Important rules
 

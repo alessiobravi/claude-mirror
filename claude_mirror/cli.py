@@ -610,7 +610,7 @@ def _run_wizard() -> dict:
     console.print("\n[bold cyan]claude-mirror setup wizard[/]\n")
     console.print("Press Enter to accept the [dim]default[/] shown in brackets.\n")
 
-    _SUPPORTED_BACKENDS = ("googledrive", "dropbox", "onedrive", "webdav")
+    _SUPPORTED_BACKENDS = ("googledrive", "dropbox", "onedrive", "webdav", "sftp")
 
     # Backend
     console.print(
@@ -645,7 +645,15 @@ def _run_wizard() -> dict:
     webdav_username = ""
     webdav_password = ""
     webdav_insecure_http = False
-    poll_interval = 30  # default; only meaningful for onedrive/webdav
+    sftp_host = ""
+    sftp_port = 22
+    sftp_username = ""
+    sftp_key_file = ""
+    sftp_password = ""
+    sftp_known_hosts_file = "~/.ssh/known_hosts"
+    sftp_strict_host_check = True
+    sftp_folder = ""
+    poll_interval = 30  # default; only meaningful for onedrive/webdav/sftp
 
     if backend == "googledrive":
         # Credentials file
@@ -755,9 +763,111 @@ def _run_wizard() -> dict:
         )
         import getpass
         webdav_password = getpass.getpass("Password: ")
+    elif backend == "sftp":
+        # Host
+        console.print(
+            "\n[dim]SFTP host: hostname or IP of the SSH/SFTP server.[/]"
+            "\n[dim]  Example: storage.example.com  or  10.0.0.42[/]\n"
+        )
+        while True:
+            sftp_host = click.prompt("SFTP host").strip()
+            if sftp_host:
+                break
+            console.print("[red]Host cannot be empty.[/]")
+
+        # Port
+        console.print(
+            "\n[dim]SFTP port: TCP port for SSH on the server (default 22).[/]\n"
+        )
+        while True:
+            sftp_port = click.prompt("SFTP port", default=22, type=int)
+            if 1 <= sftp_port <= 65535:
+                break
+            console.print(
+                "[red]Port must be in range 1..65535.[/]"
+            )
+
+        # Username
+        console.print(
+            "\n[dim]Username for SSH/SFTP login.[/]\n"
+        )
+        while True:
+            sftp_username = click.prompt("SFTP username").strip()
+            if sftp_username:
+                break
+            console.print("[red]Username cannot be empty.[/]")
+
+        # Auth choice — key (default) or password
+        console.print(
+            "\n[dim]Authentication method:[/]"
+            "\n[dim]  k = SSH private key (recommended)[/]"
+            "\n[dim]  p = password (LAN/test only — stored plain in YAML)[/]\n"
+        )
+        auth_choice = click.prompt(
+            "Authenticate with [k]ey or [p]assword?",
+            default="k",
+            type=click.Choice(["k", "p"], case_sensitive=False),
+        ).lower()
+
+        if auth_choice == "k":
+            console.print(
+                "\n[dim]Path to your SSH private key. Tilde-expanded.[/]\n"
+            )
+            raw_key = click.prompt(
+                "SSH private key file", default="~/.ssh/id_ed25519"
+            )
+            sftp_key_file = str(Path(raw_key).expanduser())
+            if not Path(sftp_key_file).exists():
+                console.print(
+                    f"[yellow]⚠ Key file not found at "
+                    f"{sftp_key_file} on this machine — accepting anyway "
+                    f"(it may exist on the deployment host).[/]"
+                )
+        else:
+            console.print(
+                "\n[red]⚠ Password will be stored in plain text in the "
+                "YAML config.[/] Recommended only for closed-LAN setups; "
+                "switch to key-based auth for any internet-reachable server.\n"
+            )
+            import getpass
+            sftp_password = getpass.getpass("SFTP password: ")
+
+        # known_hosts file
+        console.print(
+            "\n[dim]known_hosts file: where paramiko looks up host fingerprints.[/]"
+            "\n[dim]  Default ~/.ssh/known_hosts is fine for most users; "
+            "paramiko creates the file on first connect if missing.[/]\n"
+        )
+        sftp_known_hosts_file = click.prompt(
+            "known_hosts file", default="~/.ssh/known_hosts"
+        )
+
+        # Strict host-key checking
+        sftp_strict_host_check = click.confirm(
+            "Reject unknown host fingerprints? "
+            "(disable only for one-shot LAN setups)",
+            default=True,
+        )
+
+        # Remote folder
+        console.print(
+            "\n[dim]SFTP folder: absolute path on the server where project "
+            "files live. Must start with '/'.[/]"
+            f"\n[dim]  Example: /srv/claude-mirror/{project_name}[/]\n"
+        )
+        while True:
+            raw_folder = click.prompt("SFTP folder").strip()
+            if not raw_folder.startswith("/"):
+                console.print(
+                    "[red]Folder must be an absolute path "
+                    "(start with '/').[/]"
+                )
+                continue
+            sftp_folder = raw_folder.rstrip("/") or "/"
+            break
 
     # Polling interval for backends without push notifications.
-    if backend in ("onedrive", "webdav"):
+    if backend in ("onedrive", "webdav", "sftp"):
         console.print(
             "\n[dim]Poll interval (seconds): how often the watcher checks for "
             "remote changes. Lower = more responsive, higher = less network use.[/]\n"
@@ -775,6 +885,8 @@ def _run_wizard() -> dict:
         derived_token = str(CONFIG_DIR / f"onedrive-{project_name}-token.json")
     elif backend == "webdav":
         derived_token = str(CONFIG_DIR / f"webdav-{project_name}-token.json")
+    elif backend == "sftp":
+        derived_token = str(CONFIG_DIR / f"sftp-{project_name}-token.json")
     else:
         derived_token = str(CONFIG_DIR / f"{backend}-{project_name}-token.json")
     raw_token = click.prompt("Token file", default=derived_token)
@@ -831,7 +943,17 @@ def _run_wizard() -> dict:
         console.print(f"  WebDAV URL:    {webdav_url}")
         console.print(f"  Username:      {webdav_username}")
         console.print(f"  Password:      {'*' * len(webdav_password)}")
-    if backend in ("onedrive", "webdav"):
+    elif backend == "sftp":
+        console.print(f"  SFTP host:     {sftp_host}:{sftp_port}")
+        console.print(f"  Username:      {sftp_username}")
+        if sftp_key_file:
+            console.print(f"  Key file:      {sftp_key_file}")
+        if sftp_password:
+            console.print(f"  Password:      {'*' * len(sftp_password)}")
+        console.print(f"  known_hosts:   {sftp_known_hosts_file}")
+        console.print(f"  Strict host:   {sftp_strict_host_check}")
+        console.print(f"  SFTP folder:   {sftp_folder}")
+    if backend in ("onedrive", "webdav", "sftp"):
         console.print(f"  Poll interval: {poll_interval}s")
     console.print(f"  Patterns:      {', '.join(patterns)}")
 
@@ -885,6 +1007,14 @@ def _run_wizard() -> dict:
         webdav_username=webdav_username,
         webdav_password=webdav_password,
         webdav_insecure_http=webdav_insecure_http,
+        sftp_host=sftp_host,
+        sftp_port=sftp_port,
+        sftp_username=sftp_username,
+        sftp_key_file=sftp_key_file,
+        sftp_password=sftp_password,
+        sftp_known_hosts_file=sftp_known_hosts_file,
+        sftp_strict_host_check=sftp_strict_host_check,
+        sftp_folder=sftp_folder,
         poll_interval=poll_interval,
         slack_enabled=slack_enabled,
         slack_webhook_url=slack_webhook_url,
@@ -901,7 +1031,7 @@ def _run_wizard() -> dict:
 @cli.command()
 @click.option("--project", default="", help="Path to the Claude project directory.")
 @click.option("--backend", "backend_opt", default="googledrive", show_default=True,
-              help="Storage backend: googledrive | dropbox | onedrive | webdav.")
+              help="Storage backend: googledrive | dropbox | onedrive | webdav | sftp.")
 @click.option("--drive-folder-id", default="", help="Google Drive folder ID to sync into.")
 @click.option("--gcp-project-id", default="", help="Google Cloud project ID.")
 @click.option("--pubsub-topic-id", default="", help="Pub/Sub topic ID.")
@@ -914,8 +1044,23 @@ def _run_wizard() -> dict:
 @click.option("--webdav-password", default="", help="WebDAV password or app password.")
 @click.option("--webdav-insecure-http", "webdav_insecure_http", is_flag=True, default=False,
               help="Allow http:// WebDAV URLs (cleartext basic-auth). NOT recommended; only for closed LAN test setups.")
+@click.option("--sftp-host", default="", help="SFTP server hostname or IP.")
+@click.option("--sftp-port", default=22, show_default=True, type=int,
+              help="SFTP server port (1..65535).")
+@click.option("--sftp-username", default="", help="SFTP username.")
+@click.option("--sftp-key-file", default="",
+              help="Path to SSH private key for SFTP auth (tilde-expanded).")
+@click.option("--sftp-password", default="",
+              help="SFTP password (LAN-only fallback; stored plain in YAML).")
+@click.option("--sftp-known-hosts-file", default="~/.ssh/known_hosts", show_default=True,
+              help="Path to SSH known_hosts file used for host-key verification.")
+@click.option("--sftp-strict-host-check/--no-sftp-strict-host-check",
+              "sftp_strict_host_check", default=True, show_default=True,
+              help="Reject unknown SFTP host fingerprints. Disable only for one-shot LAN setups.")
+@click.option("--sftp-folder", default="",
+              help="Absolute server-side folder path for SFTP storage (must start with '/').")
 @click.option("--poll-interval", "poll_interval", default=30, show_default=True, type=int,
-              help="Polling interval in seconds for backends without push notifications (OneDrive, WebDAV).")
+              help="Polling interval in seconds for backends without push notifications (OneDrive, WebDAV, SFTP).")
 @click.option("--slack-webhook-url", default="", help="Slack incoming webhook URL for sync notifications.")
 @click.option("--slack-channel", default="", help="Slack channel override (default: webhook's channel).")
 @click.option("--slack/--no-slack", "slack_flag", default=False, help="Enable/disable Slack notifications.")
@@ -949,6 +1094,14 @@ def init(
     webdav_username: str,
     webdav_password: str,
     webdav_insecure_http: bool,
+    sftp_host: str,
+    sftp_port: int,
+    sftp_username: str,
+    sftp_key_file: str,
+    sftp_password: str,
+    sftp_known_hosts_file: str,
+    sftp_strict_host_check: bool,
+    sftp_folder: str,
     poll_interval: int,
     slack_webhook_url: str,
     slack_channel: str,
@@ -985,6 +1138,14 @@ def init(
         webdav_username  = values["webdav_username"]
         webdav_password  = values["webdav_password"]
         webdav_insecure_http = values["webdav_insecure_http"]
+        sftp_host        = values["sftp_host"]
+        sftp_port        = values["sftp_port"]
+        sftp_username    = values["sftp_username"]
+        sftp_key_file    = values["sftp_key_file"]
+        sftp_password    = values["sftp_password"]
+        sftp_known_hosts_file = values["sftp_known_hosts_file"]
+        sftp_strict_host_check = values["sftp_strict_host_check"]
+        sftp_folder      = values["sftp_folder"]
         poll_interval    = values["poll_interval"]
         slack_enabled    = values["slack_enabled"]
         slack_webhook_url = values["slack_webhook_url"]
@@ -1031,6 +1192,19 @@ def init(
                     ("--webdav-password", webdav_password),
                 ] if not val
             ]
+        elif backend == "sftp":
+            # Either a key OR a password is acceptable for auth — require
+            # at least one. Folder, host, and username are always required.
+            missing = [
+                name for name, val in [
+                    ("--project", project),
+                    ("--sftp-host", sftp_host),
+                    ("--sftp-username", sftp_username),
+                    ("--sftp-folder", sftp_folder),
+                ] if not val
+            ]
+            if not sftp_key_file and not sftp_password:
+                missing.append("--sftp-key-file or --sftp-password")
         else:
             console.print(f"[red]Unknown backend: {backend}[/]")
             sys.exit(1)
@@ -1061,6 +1235,36 @@ def init(
                 )
                 sys.exit(1)
 
+        # SFTP-specific validation: folder must be absolute, port in range.
+        if backend == "sftp":
+            if not sftp_folder.startswith("/"):
+                console.print(
+                    "[red]✗ --sftp-folder must be an absolute path "
+                    "(start with '/').[/]"
+                )
+                sys.exit(1)
+            sftp_folder = sftp_folder.rstrip("/") or "/"
+            if not (1 <= sftp_port <= 65535):
+                console.print(
+                    f"[red]✗ --sftp-port must be in range 1..65535 "
+                    f"(got {sftp_port}).[/]"
+                )
+                sys.exit(1)
+            if sftp_key_file:
+                sftp_key_file = str(Path(sftp_key_file).expanduser())
+                if not Path(sftp_key_file).exists():
+                    console.print(
+                        f"[yellow]⚠ Key file not found at "
+                        f"{sftp_key_file} on this machine — accepting "
+                        f"anyway (it may exist on the deployment host).[/]"
+                    )
+            if sftp_password and not sftp_key_file:
+                console.print(
+                    "[yellow]⚠ Password stored in plain text in YAML.[/] "
+                    "Recommended only for closed-LAN setups; switch to "
+                    "key-based auth for any internet-reachable server."
+                )
+
         project_path = str(Path(project).expanduser().resolve())
         if not Path(project_path).exists():
             console.print(f"[red]Project path does not exist: {project_path}[/]")
@@ -1079,6 +1283,9 @@ def init(
             elif backend == "webdav":
                 project_name = Path(project_path).name
                 token_file = str(CONFIG_DIR / f"webdav-{project_name}-token.json")
+            elif backend == "sftp":
+                project_name = Path(project_path).name
+                token_file = str(CONFIG_DIR / f"sftp-{project_name}-token.json")
             else:
                 project_name = Path(project_path).name
                 token_file = str(CONFIG_DIR / f"{backend}-{project_name}-token.json")
@@ -1106,6 +1313,14 @@ def init(
         webdav_username=webdav_username,
         webdav_password=webdav_password,
         webdav_insecure_http=webdav_insecure_http,
+        sftp_host=sftp_host,
+        sftp_port=sftp_port,
+        sftp_username=sftp_username,
+        sftp_key_file=sftp_key_file,
+        sftp_password=sftp_password,
+        sftp_known_hosts_file=sftp_known_hosts_file,
+        sftp_strict_host_check=sftp_strict_host_check,
+        sftp_folder=sftp_folder,
         poll_interval=poll_interval,
         slack_enabled=slack_enabled,
         slack_webhook_url=slack_webhook_url,
@@ -1132,6 +1347,10 @@ def init(
     elif backend == "webdav":
         console.print(f"[green]WebDAV URL:[/]          {webdav_url}")
         console.print("\nRun [bold]claude-mirror auth[/] to authenticate with your WebDAV server.")
+    elif backend == "sftp":
+        console.print(f"[green]SFTP host:[/]           {sftp_host}:{sftp_port}")
+        console.print(f"[green]SFTP folder:[/]         {sftp_folder}")
+        console.print("\nRun [bold]claude-mirror auth[/] to verify the SFTP connection.")
 
     # Auto-reload the watcher if it is running
     _try_reload_watcher()
@@ -3354,11 +3573,17 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
         # Required for googledrive / dropbox / onedrive (OAuth client JSON).
         # WebDAV doesn't use a credentials file — the WebDAV username +
         # password live in the YAML — so we skip this check there.
+        # SFTP also stores host/user/key/password inline in the YAML.
         backend_name = (config.backend or "").lower()
         if backend_name == "webdav":
             console.print(
                 "  [dim]·[/] credentials file: skipped (WebDAV uses inline "
                 "username/password)"
+            )
+        elif backend_name == "sftp":
+            console.print(
+                "  [dim]·[/] credentials file: skipped (SFTP uses inline "
+                "host/user/key in YAML)"
             )
         else:
             creds_path = Path(config.credentials_file)
@@ -3395,6 +3620,41 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
                 console.print(
                     "  [green]✓[/] WebDAV credentials present in config "
                     "(username + password)"
+                )
+        elif backend_name == "sftp":
+            # SFTP requires host + username + folder, plus AT LEAST ONE
+            # auth material (key file path or password). All five fields
+            # live in the YAML — there is no separate token file.
+            sftp_host_v = getattr(config, "sftp_host", "") or ""
+            sftp_user_v = getattr(config, "sftp_username", "") or ""
+            sftp_folder_v = getattr(config, "sftp_folder", "") or ""
+            sftp_key_v = getattr(config, "sftp_key_file", "") or ""
+            sftp_pw_v = getattr(config, "sftp_password", "") or ""
+            sftp_missing = []
+            if not sftp_host_v:
+                sftp_missing.append("sftp_host")
+            if not sftp_user_v:
+                sftp_missing.append("sftp_username")
+            if not sftp_folder_v:
+                sftp_missing.append("sftp_folder")
+            if not sftp_key_v and not sftp_pw_v:
+                sftp_missing.append("sftp_key_file or sftp_password")
+            if sftp_missing:
+                console.print(
+                    f"  [red]✗[/] SFTP config incomplete: "
+                    f"missing [bold]{', '.join(sftp_missing)}[/] in "
+                    f"[bold]{path}[/]\n"
+                    f"      [yellow]Fix:[/] run "
+                    f"[bold]claude-mirror init --wizard --config {path}[/] "
+                    f"or edit the YAML to add the missing fields."
+                )
+                failures.append(
+                    f"SFTP config incomplete ({', '.join(sftp_missing)}): {path}"
+                )
+            else:
+                console.print(
+                    "  [green]✓[/] SFTP credentials present in config "
+                    "(host + username + folder + key/password)"
                 )
         else:
             token_path = Path(config.token_file)
@@ -3443,13 +3703,28 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
 
         # ───── Check 4: backend connectivity ─────
         # Instantiate the backend, fetch credentials, make ONE light read
-        # call (list_folders on the root folder). On exception, branch on
-        # exception class to give a specific fix hint.
+        # call (list_folders on the root folder, or sftp.stat for SFTP).
+        # On exception, branch on exception class to give a specific fix.
         connectivity_ok = False
         try:
             storage = _create_storage(config)
-            storage.get_credentials()
-            storage.list_folders(config.root_folder, name=None)
+            if backend_name == "sftp":
+                # SFTP exposes a paramiko.SFTPClient via get_credentials();
+                # stat'ing the configured folder doubles as both a "session
+                # opens" check AND a "folder exists / readable" check.
+                sftp_client = storage.get_credentials()
+                sftp_folder_v = getattr(config, "sftp_folder", "") or "/"
+                _stat = sftp_client.stat(sftp_folder_v)
+                # paramiko returns SFTPAttributes; mode bit S_IFDIR (0o040000)
+                # tells us it's a directory.
+                import stat as _stat_mod
+                if not _stat_mod.S_ISDIR(_stat.st_mode):
+                    raise RuntimeError(
+                        f"sftp_folder is not a directory: {sftp_folder_v}"
+                    )
+            else:
+                storage.get_credentials()
+                storage.list_folders(config.root_folder, name=None)
             connectivity_ok = True
         except BaseException as exc:  # noqa: BLE001 — diagnostic, must not bubble
             # Classify via the backend's own classifier when possible — it
@@ -3493,7 +3768,44 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
                 or "connection" in exc_text.lower()
             )
 
-            if is_auth:
+            if backend_name == "sftp":
+                # SFTP-specific fix hints — point at concrete server-side
+                # actions (host-key trust, port reachability, server-side
+                # mkdir, account ACLs) rather than generic OAuth / web-UI
+                # remedies that don't apply.
+                _sftp_host = getattr(config, "sftp_host", "") or "?"
+                _sftp_port = getattr(config, "sftp_port", 22)
+                _sftp_folder_v = getattr(config, "sftp_folder", "") or "?"
+                if is_auth:
+                    hint = (
+                        f"[yellow]Fix:[/] SSH authentication failed. Run "
+                        f"[bold]claude-mirror auth --config {path}[/] to "
+                        f"re-verify host key + key/password."
+                    )
+                elif is_network:
+                    hint = (
+                        f"[yellow]Fix:[/] network reachability — check "
+                        f"[bold]ping {_sftp_host}[/] and that port "
+                        f"[bold]{_sftp_port}[/] is open."
+                    )
+                elif is_permission:
+                    hint = (
+                        f"[yellow]Fix:[/] your account lacks access to "
+                        f"[bold]{_sftp_folder_v}[/] on the server."
+                    )
+                elif is_not_found:
+                    hint = (
+                        f"[yellow]Fix:[/] [bold]{_sftp_folder_v}[/] doesn't "
+                        f"exist on the server. Create it (server-side "
+                        f"`mkdir`) or change `sftp_folder` in [bold]{path}[/]."
+                    )
+                else:
+                    hint = (
+                        f"[yellow]Fix:[/] inspect the error above. Verify "
+                        f"host/port/credentials in [bold]{path}[/] and "
+                        f"re-run [bold]claude-mirror auth --config {path}[/]."
+                    )
+            elif is_auth:
                 hint = (
                     f"[yellow]Fix:[/] token revoked or refresh failed. Run "
                     f"[bold]claude-mirror auth --config {path}[/] to "
@@ -3533,10 +3845,97 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
             failures.append(f"connectivity failed for {config.backend}: {exc_class_name}")
 
         if connectivity_ok:
-            console.print(
-                f"  [green]✓[/] backend connectivity ok "
-                f"([dim]list_folders on root succeeded[/])"
+            if backend_name == "sftp":
+                _sftp_folder_v = getattr(config, "sftp_folder", "") or "/"
+                console.print(
+                    f"  [green]✓[/] SFTP connectivity ok "
+                    f"([dim]session opened + stat({_sftp_folder_v}) "
+                    f"succeeded[/])"
+                )
+            else:
+                console.print(
+                    f"  [green]✓[/] backend connectivity ok "
+                    f"([dim]list_folders on root succeeded[/])"
+                )
+
+        # ───── SFTP-specific auxiliary checks ─────
+        # Local-filesystem checks for SFTP only — key file readability,
+        # known_hosts presence (when strict-host-check is on), and a
+        # plaintext-password advisory when the YAML stores a bare
+        # password. These run regardless of connectivity outcome so the
+        # user sees every fixable issue in one pass.
+        if backend_name == "sftp":
+            sftp_key_v = getattr(config, "sftp_key_file", "") or ""
+            sftp_pw_v = getattr(config, "sftp_password", "") or ""
+            sftp_kh_v = (
+                getattr(config, "sftp_known_hosts_file", "")
+                or "~/.ssh/known_hosts"
             )
+            sftp_strict_v = bool(
+                getattr(config, "sftp_strict_host_check", True)
+            )
+
+            # Key file readable.
+            if sftp_key_v:
+                key_expanded = str(Path(sftp_key_v).expanduser())
+                if not os.access(key_expanded, os.R_OK):
+                    console.print(
+                        f"  [red]✗[/] SSH key file not readable: "
+                        f"[bold]{key_expanded}[/]\n"
+                        f"      [yellow]Fix:[/] key file at "
+                        f"[bold]{key_expanded}[/] is not readable by "
+                        f"the current user. Check permissions "
+                        f"(typically 0600) — "
+                        f"[bold]chmod 600 {key_expanded}[/]."
+                    )
+                    failures.append(
+                        f"SFTP key file not readable: {key_expanded}"
+                    )
+                else:
+                    console.print(
+                        f"  [green]✓[/] SSH key file readable: "
+                        f"[dim]{key_expanded}[/]"
+                    )
+
+            # known_hosts file present (only required when strict checking).
+            if sftp_strict_v:
+                kh_expanded = str(Path(sftp_kh_v).expanduser())
+                if not os.path.exists(kh_expanded):
+                    console.print(
+                        f"  [red]✗[/] known_hosts file missing: "
+                        f"[bold]{kh_expanded}[/]\n"
+                        f"      [yellow]Fix:[/] first connect via "
+                        f"[bold]ssh "
+                        f"{getattr(config, 'sftp_username', 'user')}@"
+                        f"{getattr(config, 'sftp_host', 'host')}[/] "
+                        f"to populate it, or set "
+                        f"[bold]sftp_strict_host_check: false[/] in "
+                        f"[bold]{path}[/] for one-shot LAN setups."
+                    )
+                    failures.append(
+                        f"SFTP known_hosts missing: {kh_expanded}"
+                    )
+                else:
+                    console.print(
+                        f"  [green]✓[/] known_hosts file present: "
+                        f"[dim]{kh_expanded}[/]"
+                    )
+            else:
+                console.print(
+                    "  [yellow]⚠[/] SFTP strict host-key check is "
+                    "disabled — host fingerprints will not be verified. "
+                    "Acceptable for closed-LAN setups; risky on the "
+                    "open internet."
+                )
+
+            # Plaintext password advisory (warning, not failure).
+            if sftp_pw_v:
+                console.print(
+                    f"  [yellow]⚠[/] SFTP password is stored in plain "
+                    f"text in [bold]{path}[/]. Recommended only for "
+                    f"LAN/test setups. Switch to key-based auth for "
+                    f"any internet-reachable server."
+                )
 
         # ───── Check 5: project_path exists locally ─────
         # Only check on the primary — every mirror config validated by
@@ -3600,7 +3999,7 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
               help="Config file path. Auto-detected from cwd if omitted.")
 @click.option("--backend", "backend_filter", default="",
               help="Limit checks to one backend by name "
-                   "(googledrive, dropbox, onedrive, webdav). Default: "
+                   "(googledrive, dropbox, onedrive, webdav, sftp). Default: "
                    "check all configured backends including Tier 2 mirrors.")
 def doctor(config_path: str, backend_filter: str) -> None:
     """Diagnose claude-mirror configuration health.
@@ -3612,10 +4011,13 @@ def doctor(config_path: str, backend_filter: str) -> None:
     \b
     Checks performed (per backend, including Tier 2 mirrors):
       1. Config file exists and parses
-      2. Credentials file exists (skipped for WebDAV)
+      2. Credentials file exists (skipped for WebDAV / SFTP)
       3. Token file exists, parses, has refresh_token
-         (or for WebDAV: username + password in config)
-      4. Backend connectivity (list_folders on the configured root)
+         (or for WebDAV / SFTP: required fields present in config)
+      4. Backend connectivity (list_folders on the configured root, or
+         sftp.stat for SFTP)
+      4a. SFTP only: key file readable, known_hosts present (if strict
+          host-check is on), plaintext-password advisory
       5. project_path exists locally and is a directory
       6. Manifest integrity (if a manifest file is present)
 

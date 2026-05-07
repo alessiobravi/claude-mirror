@@ -4,6 +4,41 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.32] — 2026-05-07
+
+Two additive features bundled into one release: a colorized diff command and configurable snapshot retention. Plus the held documentation tweaks from the v0.5.31 cycle.
+
+### Added — `claude-mirror diff <path>`
+- **Colorized line-diff of local vs remote** for a single tracked file. Diff direction is remote → local, so green `+` lines are what would be pushed and red `-` lines are what would be pulled, making "should I push, pull, or merge?" answerable at a glance before doing any of those.
+- Handles every state combination cleanly:
+  - both sides differ — full unified diff with `@@` hunk headers and configurable context (`--context N`, default 3)
+  - only-on-local — every line shown as added (would be pushed)
+  - only-on-remote — every line shown as deleted (would be pulled)
+  - identical — single "in sync" message, exit 0
+  - binary file (NUL-byte sniff or non-utf8 decode) — refused with a one-line note rather than rendering garbage
+  - missing on both sides — clear error, exit 1
+- Path argument accepts both project-relative (`memory/CLAUDE.md`) and absolute paths inside the project root; absolute paths outside the project root are rejected up-front with the project root surfaced in the error.
+- 20 new tests in `tests/test_diff.py` cover the binary heuristic, every render state, and the CLI command across all path-resolution cases.
+- Implementation in a new `claude_mirror/_diff.py` module so the rendering logic is decoupled from the CLI wiring and reusable from future surfaces (VS Code extension, web dashboard if either ever ships).
+
+### Added — Snapshot retention policies (`keep_last`, `keep_daily`, `keep_monthly`, `keep_yearly`)
+- **Four new YAML config fields** that compose into a multi-bucket retention policy:
+  - `keep_last` — keep the N newest snapshots regardless of age
+  - `keep_daily` — for the last N days, keep the newest snapshot in each day-bucket (UTC)
+  - `keep_monthly` — for the last N months, keep the newest snapshot in each month-bucket
+  - `keep_yearly` — for the last N years, keep the newest snapshot in each year-bucket
+- Each is independent — the **union** of every selector's keep-set is retained — so a user can compose "newest 7 + last 30 days + last 12 months + last 5 years" cleanly without overlap concerns. Every field defaults to `0` (= disabled), so existing projects see zero behaviour change.
+- **Auto-prune after `claude-mirror push`**: when any retention field is non-zero in the config, push runs `prune_per_retention(...)` after the upload finishes and logs the deletion summary. Setting the YAML field IS the consent — no extra confirmation prompt fires for the auto-prune path.
+- **New `claude-mirror prune` CLI command** for ad-hoc / manual invocation. Reads the four `keep_*` fields from the project YAML by default; any `--keep-last`, `--keep-daily`, `--keep-monthly`, `--keep-yearly` flag overrides the corresponding config field for that one run only (the YAML is not modified). Dry-run by default per the project's destructive-ops convention; require `--delete` plus a typed `YES` (or `--yes` for non-interactive use) to actually remove anything.
+- 17 new tests in `tests/test_retention.py` cover: config field defaults + YAML round-trip; the algorithm across all four buckets independently; the union behaviour when all four compose; dry-run = no writes; the CLI's dry-run-by-default + typed-YES + flag-overrides-config invariants.
+
+### Updated — README and command summary
+- README "How it works" / quality-gates line updated to reflect the now-302 tests and Python 3.11 / 3.12 / 3.13 / 3.14 matrix (the doc tweaks from the v0.5.31 cycle, held back for this feature bump).
+- Command-summary block now includes `claude-mirror diff` and `claude-mirror prune` with their flags.
+- CONTRIBUTING.md updated to mention Python 3.14 in the CI matrix.
+
+---
+
 ## [0.5.31] — 2026-05-07
 
 CI fix for the v0.5.30 watch-mode tests, plus Python 3.14 added to the supported matrix.

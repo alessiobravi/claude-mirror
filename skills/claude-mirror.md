@@ -135,7 +135,10 @@ claude-mirror retry                                      --config <config-path> 
 claude-mirror retry    --backend NAME [--dry-run]        --config <config-path>   # retry one backend only / preview without sending
 claude-mirror status   --pending                         --config <config-path>   # show files with non-ok mirror state
 claude-mirror forget   <timestamp> [<timestamp> ...]     --config <config-path>   # delete specific snapshots
-claude-mirror forget   --keep-last 50                    --config <config-path>   # retention pruning
+claude-mirror forget   --keep-last 50                    --config <config-path>   # retention pruning (single-selector form)
+claude-mirror prune                                      --config <config-path>   # apply YAML's keep_last/keep_daily/keep_monthly/keep_yearly policy (dry-run by default)
+claude-mirror prune    --delete --yes                    --config <config-path>   # apply retention policy non-interactively (cron / CI)
+claude-mirror diff     <path>                            --config <config-path>   # colorized line-diff of local vs remote for one file
 claude-mirror gc                                         --config <config-path>   # reclaim orphan blobs after forget
 claude-mirror migrate-snapshots --to {blobs|full}        --config <config-path>   # convert snapshots between formats (admin-only; rarely skill-triggered)
 claude-mirror log       --config <config-path>

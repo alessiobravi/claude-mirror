@@ -113,6 +113,32 @@ class Config:
     # no Config object is available.
     parallel_workers: int = 5
 
+    # Snapshot retention policy (v0.5.32+).
+    #
+    # When any of these is > 0, `claude-mirror push` automatically prunes
+    # snapshots older than the policy's keep-set after a successful push,
+    # AND `claude-mirror prune` (no selectors) reads the same fields to
+    # know what to delete. Each is evaluated independently and the union
+    # of their keep-sets is retained — so the user can compose
+    # "newest 7 + last 30 days + last 12 months + last 5 years" cleanly.
+    #
+    #   keep_last     — keep the N newest snapshots regardless of age.
+    #   keep_daily    — for the last N days, keep the newest snapshot
+    #                   in each day-bucket (UTC). N=7 keeps up to 7
+    #                   snapshots, one per day.
+    #   keep_monthly  — for the last N months, keep the newest snapshot
+    #                   in each month-bucket. Months are bucketed by
+    #                   year+month (UTC). N=12 keeps up to 12 snapshots.
+    #   keep_yearly   — for the last N years, keep the newest snapshot
+    #                   in each year-bucket.
+    #
+    # All four default to 0 = disabled. With every field at 0, push runs
+    # exactly as before and `prune` requires explicit CLI selectors.
+    keep_last: int = 0
+    keep_daily: int = 0
+    keep_monthly: int = 0
+    keep_yearly: int = 0
+
     def __post_init__(self) -> None:
         if not self.credentials_file:
             self.credentials_file = str(CONFIG_DIR / "credentials.json")

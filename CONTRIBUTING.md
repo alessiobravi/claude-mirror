@@ -65,7 +65,7 @@ pytest tests/ --collect-only                    # list tests without running
 
 ## CI
 
-Every push and pull request triggers `.github/workflows/test.yml`, which runs the full suite on Python 3.11, 3.12, and 3.13 in parallel. Your PR is unmergeable until it's green.
+Every push and pull request triggers `.github/workflows/test.yml`, which runs the full suite on Python 3.11, 3.12, 3.13, and 3.14 in parallel. Your PR is unmergeable until it's green.
 
 ## Release flow (maintainer)
 

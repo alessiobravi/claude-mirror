@@ -22,6 +22,7 @@ from rich.text import Text
 from .backends import StorageBackend
 from .backends.googledrive import GoogleDriveBackend
 from .config import Config, CONFIG_DIR
+from ._diff import render_diff
 from .events import SyncEvent, SyncLog, SYNC_LOG_NAME, LOGS_FOLDER
 from .manifest import Manifest
 from .merge import MergeHandler
@@ -94,6 +95,9 @@ _NO_WATCHER_CHECK_CMDS = {
     # also gets called specifically when the user already suspects something
     # is wrong, so the watcher hint isn't useful here.
     "doctor",
+    # `prune` and `diff` are read-mostly housekeeping — the watcher hint
+    # is unrelated and just adds noise to the rendered output.
+    "prune", "diff",
 }
 
 
@@ -1583,8 +1587,117 @@ def sync(config_path: str) -> None:
               help="Treat local content as authoritative: push all changed files without interactive conflict resolution.")
 def push(files: tuple, config_path: str, force_local: bool) -> None:
     """Push local changes to Drive. Optionally specify FILES to push."""
-    engine, _, _ = _load_engine(_resolve_config(config_path))
+    engine, cfg, _ = _load_engine(_resolve_config(config_path))
     engine.push(list(files) if files else None, force_local=force_local)
+    _maybe_auto_prune(engine, cfg)
+
+
+def _maybe_auto_prune(engine: SyncEngine, cfg: Config) -> None:
+    """Run snapshot retention pruning if any keep_* policy field is set.
+
+    Called after a successful push. Opt-in via config — every keep_*
+    field defaults to 0, so projects without retention configured see
+    zero behaviour change. When active, runs in non-dry-run mode (the
+    user has consented by setting the config field) and logs the prune
+    summary so deletions stay visible.
+    """
+    if not any((cfg.keep_last, cfg.keep_daily, cfg.keep_monthly, cfg.keep_yearly)):
+        return
+    if engine.snapshots is None:
+        return
+    try:
+        engine.snapshots.prune_per_retention(
+            keep_last=cfg.keep_last,
+            keep_daily=cfg.keep_daily,
+            keep_monthly=cfg.keep_monthly,
+            keep_yearly=cfg.keep_yearly,
+            dry_run=False,
+        )
+    except Exception as e:
+        # Pruning is opportunistic housekeeping — never fail the push
+        # because retention couldn't complete. The error is surfaced so
+        # the user can investigate, but exit code stays 0.
+        console.print(f"[yellow]auto-prune skipped:[/] {e}")
+
+
+@cli.command()
+@click.argument("path", type=str)
+@click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
+@click.option("--context", "context_lines", type=click.IntRange(min=0, max=200), default=3,
+              show_default=True, help="Number of context lines around each hunk.")
+def diff(path: str, config_path: str, context_lines: int) -> None:
+    """Show a colorized line-diff of local vs remote for one file.
+
+    PATH can be a project-relative path or an absolute path inside the
+    project. The output is a unified diff (remote → local) with green
+    additions, red deletions, and dim context lines — a quick way to
+    decide whether to push, pull, or merge before doing either.
+
+    \b
+    Cases handled cleanly:
+      - both sides differ — full unified diff
+      - only on local       — every line shown as added (would be pushed)
+      - only on remote      — every line shown as deleted (would be pulled)
+      - in sync             — single "identical" line, exit code 0
+      - binary file         — refused with a one-line note, exit code 0
+
+    \b
+    Examples:
+      claude-mirror diff memory/CLAUDE.md
+      claude-mirror diff /Users/me/proj/memory/CLAUDE.md
+      claude-mirror diff CHANGELOG.md --context 8
+    """
+    engine, _, _ = _load_engine(_resolve_config(config_path), with_pubsub=False)
+
+    project_root = Path(engine.config.project_path).resolve()
+    candidate = Path(path)
+    if candidate.is_absolute():
+        try:
+            rel_path = str(candidate.resolve().relative_to(project_root))
+        except ValueError:
+            console.print(
+                f"[red]Path is outside the project root.[/]\n"
+                f"  path:    {candidate}\n"
+                f"  project: {project_root}"
+            )
+            sys.exit(1)
+    else:
+        rel_path = str(candidate).replace("\\", "/").lstrip("./")
+
+    # Find the file in engine state. We don't run a full status (slow on
+    # large trees) — just resolve the local path + look up the remote
+    # entry by relative path.
+    local_path = project_root / rel_path
+    local_bytes: Optional[bytes] = None
+    if local_path.exists() and local_path.is_file():
+        local_bytes = local_path.read_bytes()
+
+    remote_bytes: Optional[bytes] = None
+    try:
+        remote_entries = engine.storage.list_files_recursive(engine._folder_id)
+    except Exception as e:
+        console.print(f"[red]Could not list remote files:[/] {e}")
+        sys.exit(1)
+
+    remote_match = next(
+        (f for f in remote_entries if f.get("relative_path") == rel_path),
+        None,
+    )
+    if remote_match is not None:
+        try:
+            remote_bytes = engine.storage.download_file(remote_match["id"])
+        except Exception as e:
+            console.print(f"[red]Could not download remote copy:[/] {e}")
+            sys.exit(1)
+
+    if local_bytes is None and remote_bytes is None:
+        console.print(
+            f"[red]No such file:[/] {rel_path}\n"
+            f"[dim]Not present locally and not found on the remote.[/]"
+        )
+        sys.exit(1)
+
+    console.print(render_diff(local_bytes, remote_bytes, rel_path, context_lines=context_lines))
 
 
 @cli.command()
@@ -2651,6 +2764,137 @@ def forget(
             sys.exit(1)
 
     snap.forget(**selector_kwargs, dry_run=False)
+
+
+@cli.command()
+@click.option("--keep-last", "keep_last", type=click.IntRange(min=0, max=100000),
+              default=None,
+              help="Override config: keep the N newest snapshots regardless of age.")
+@click.option("--keep-daily", "keep_daily", type=click.IntRange(min=0, max=10000),
+              default=None,
+              help="Override config: for the last N days, keep the newest snapshot in each day-bucket.")
+@click.option("--keep-monthly", "keep_monthly", type=click.IntRange(min=0, max=10000),
+              default=None,
+              help="Override config: for the last N months, keep the newest snapshot in each month-bucket.")
+@click.option("--keep-yearly", "keep_yearly", type=click.IntRange(min=0, max=10000),
+              default=None,
+              help="Override config: for the last N years, keep the newest snapshot in each year-bucket.")
+@click.option("--delete", "do_delete", is_flag=True, default=False,
+              help="Actually DELETE the snapshots outside the retention keep-set. "
+                   "WITHOUT this flag, prune runs in dry-run mode (the safe default).")
+@click.option("--yes", "skip_confirm", is_flag=True, default=False,
+              help="With --delete, skip the typed-YES confirmation prompt. "
+                   "Required for non-interactive use (cron, CI).")
+@click.option("--config", "config_path", default="",
+              help="Config file path. Auto-detected from cwd if omitted.")
+def prune(
+    keep_last: Optional[int],
+    keep_daily: Optional[int],
+    keep_monthly: Optional[int],
+    keep_yearly: Optional[int],
+    do_delete: bool,
+    skip_confirm: bool,
+    config_path: str,
+) -> None:
+    """Apply a multi-bucket retention policy to remote snapshots.
+
+    \b
+    SAFE BY DEFAULT — running `claude-mirror prune` with no --delete flag
+    performs a dry-run only. To actually delete, you must:
+      1. pass --delete explicitly, AND
+      2. confirm by typing YES (or pass --yes for non-interactive use).
+
+    \b
+    Reads the four `keep_*` fields from the project YAML by default:
+      keep_last     newest N regardless of age
+      keep_daily    one per day for the last N days
+      keep_monthly  one per month for the last N months
+      keep_yearly   one per year for the last N years
+    Each is independent — the union of their keep-sets is retained.
+    Any --keep-* CLI flag overrides the corresponding config field for
+    this run only (the YAML is not modified).
+
+    \b
+    Examples:
+      claude-mirror prune                                  # dry-run with config
+      claude-mirror prune --delete                         # apply config policy
+      claude-mirror prune --keep-last 5 --delete           # ad-hoc one-off
+      claude-mirror prune --keep-daily 7 --keep-monthly 12 --delete --yes
+    """
+    cfg_path = _resolve_config(config_path)
+    config = Config.load(cfg_path)
+    storage = _create_storage(config)
+    snap = SnapshotManager(config, storage)
+
+    eff_keep_last    = keep_last    if keep_last    is not None else config.keep_last
+    eff_keep_daily   = keep_daily   if keep_daily   is not None else config.keep_daily
+    eff_keep_monthly = keep_monthly if keep_monthly is not None else config.keep_monthly
+    eff_keep_yearly  = keep_yearly  if keep_yearly  is not None else config.keep_yearly
+
+    if not any((eff_keep_last, eff_keep_daily, eff_keep_monthly, eff_keep_yearly)):
+        console.print(
+            "[yellow]No retention policy set.[/] All four keep_* fields are 0 "
+            "in your config and no override was passed.\n"
+            "Either set [bold]keep_last[/] / [bold]keep_daily[/] / [bold]keep_monthly[/] / [bold]keep_yearly[/] "
+            "in the project YAML, or pass one or more [bold]--keep-*[/] flags."
+        )
+        sys.exit(1)
+
+    if not do_delete:
+        console.print(
+            "[bold yellow]🔍 DRY-RUN mode[/] — scanning for snapshots outside "
+            "the retention keep-set; no deletions will be performed."
+        )
+
+    preview = snap.prune_per_retention(
+        keep_last=eff_keep_last,
+        keep_daily=eff_keep_daily,
+        keep_monthly=eff_keep_monthly,
+        keep_yearly=eff_keep_yearly,
+        dry_run=True,
+    )
+
+    if not do_delete:
+        selected = preview.get("selected", 0)
+        if selected > 0:
+            console.print(
+                f"\n[bold yellow]Dry-run complete.[/] No deletions were performed.\n"
+                f"To actually delete the {selected} snapshot(s) outside the keep-set:\n"
+                f"  [bold cyan]claude-mirror prune --delete[/]\n"
+                f"[dim](you'll be asked to type YES to confirm before anything is deleted)[/]"
+            )
+        else:
+            console.print(
+                "\n[bold yellow]Dry-run complete.[/] Every snapshot is inside "
+                "the retention keep-set — nothing to delete."
+            )
+        return
+
+    if preview.get("selected", 0) == 0:
+        return
+
+    if not skip_confirm:
+        confirmation = click.prompt(
+            f"\nThis will permanently delete {preview['selected']} snapshot(s) "
+            f"from remote storage.\n"
+            f"This cannot be undone via claude-mirror.\n"
+            f"Type YES (uppercase, exact) to confirm",
+            default="",
+            show_default=False,
+        )
+        if confirmation != "YES":
+            console.print(
+                "[yellow]Aborted — you typed something other than 'YES'.[/]"
+            )
+            sys.exit(1)
+
+    snap.prune_per_retention(
+        keep_last=eff_keep_last,
+        keep_daily=eff_keep_daily,
+        keep_monthly=eff_keep_monthly,
+        keep_yearly=eff_keep_yearly,
+        dry_run=False,
+    )
 
 
 @cli.command("migrate-snapshots")

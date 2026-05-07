@@ -18,7 +18,7 @@ Built originally for Claude Code projects (where most context lives in markdown)
 
 **Supported backends:** Google Drive, Dropbox, Microsoft OneDrive, and any WebDAV server (Nextcloud, OwnCloud, Apache mod_dav, Synology/QNAP NAS, Box.com, etc.). Each project picks its own primary backend independently — different projects on the same machine can use different backends.
 
-**Quality gates:** Every commit and pull request runs **214 automated tests** on Python 3.11, 3.12, and 3.13 in parallel via GitHub Actions — covering the 3-way diff sync core, both snapshot formats, path-traversal safety, conflict resolution, auth flows, all four backends (with HTTP-level mocking), the notifier inbox under concurrent writers, and the watcher daemon's SIGHUP hot-reload. CI must be green before any PR can merge. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the test conventions and how to run them locally.
+**Quality gates:** Every commit and pull request runs **302 automated tests** on Python 3.11, 3.12, 3.13, and 3.14 in parallel via GitHub Actions — covering the 3-way diff sync core, both snapshot formats, path-traversal safety, conflict resolution, auth flows, all four backends (with HTTP-level mocking), the notifier inbox under concurrent writers, and the watcher daemon's SIGHUP hot-reload. CI must be green before any PR can merge. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the test conventions and how to run them locally.
 
 ---
 
@@ -1589,6 +1589,7 @@ claude-mirror status --pending                  [--config PATH]
 claude-mirror sync        [--config PATH]
 claude-mirror push        [FILES...] [--force-local] [--config PATH]
 claude-mirror pull        [FILES...] [--output PATH] [--config PATH]
+claude-mirror diff        PATH [--context N] [--config PATH]
 claude-mirror delete      FILES... [--local] [--config PATH]
 claude-mirror watch       [--config PATH]
 claude-mirror watch-all   [--config PATH ...]   (default: all configs in ~/.config/claude_mirror/)
@@ -1600,6 +1601,8 @@ claude-mirror retry             [--backend NAME] [--dry-run] [--config PATH]
 claude-mirror restore           TIMESTAMP [PATH ...] [--backend NAME] [--output PATH] [--config PATH]
 claude-mirror forget            TIMESTAMP... | --before DATE/DURATION | --keep-last N | --keep-days N
                               [--delete] [--yes] [--config PATH]   # dry-run by default; --delete to actually delete
+claude-mirror prune             [--keep-last N] [--keep-daily N] [--keep-monthly N] [--keep-yearly N]
+                              [--delete] [--yes] [--config PATH]   # dry-run by default; reads keep_* from config
 claude-mirror gc                [--delete] [--yes] [--config PATH]   # dry-run by default; --delete to actually delete
 claude-mirror migrate-snapshots --to {blobs|full} [--dry-run] [--keep-source] [--no-update-config] [--config PATH]
 claude-mirror log               [--limit N] [--config PATH]

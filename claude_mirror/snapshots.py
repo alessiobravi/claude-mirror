@@ -1918,6 +1918,156 @@ class SnapshotManager:
             )
         return {"selected": len(targets), "deleted": deleted, "errors": errors}
 
+    def prune_per_retention(
+        self,
+        *,
+        keep_last: int = 0,
+        keep_daily: int = 0,
+        keep_monthly: int = 0,
+        keep_yearly: int = 0,
+        dry_run: bool = True,
+    ) -> dict:
+        """Apply a multi-bucket retention policy to the snapshot set.
+
+        Each non-zero parameter contributes timestamps to a "keep" set;
+        the union is retained, the rest is deleted. With every parameter
+        at 0 the policy is disabled and the call is a no-op (returns
+        zero deletions).
+
+        Returns a dict with `selected`, `deleted`, `errors`, plus
+        `to_keep` and `to_delete` lists of timestamp strings — handy for
+        callers like `claude-mirror push` that want to log a one-line
+        prune summary after running.
+        """
+        if not any((keep_last, keep_daily, keep_monthly, keep_yearly)):
+            return {
+                "selected": 0, "deleted": 0, "errors": 0,
+                "to_keep": [], "to_delete": [],
+            }
+
+        all_snapshots = self.list()
+        if not all_snapshots:
+            return {
+                "selected": 0, "deleted": 0, "errors": 0,
+                "to_keep": [], "to_delete": [],
+            }
+
+        keep_set = self._compute_retention_keep_set(
+            all_snapshots,
+            keep_last=keep_last,
+            keep_daily=keep_daily,
+            keep_monthly=keep_monthly,
+            keep_yearly=keep_yearly,
+        )
+        to_delete = [s for s in all_snapshots if s["timestamp"] not in keep_set]
+        to_keep_ts = [s["timestamp"] for s in all_snapshots if s["timestamp"] in keep_set]
+
+        if not to_delete:
+            return {
+                "selected": 0, "deleted": 0, "errors": 0,
+                "to_keep": to_keep_ts, "to_delete": [],
+            }
+
+        policy_summary = ", ".join(
+            f"{name}={val}"
+            for name, val in (
+                ("keep_last", keep_last),
+                ("keep_daily", keep_daily),
+                ("keep_monthly", keep_monthly),
+                ("keep_yearly", keep_yearly),
+            )
+            if val
+        )
+        console.print(
+            f"[bold]prune[/]  [dim]({policy_summary})[/]\n"
+            f"  total snapshots:  {len(all_snapshots)}\n"
+            f"  to delete:        {len(to_delete)}\n"
+            f"  to keep:          {len(to_keep_ts)}"
+            + ("\n  [dim](dry run — no writes)[/]" if dry_run else "")
+        )
+        for s in to_delete:
+            console.print(
+                f"  [yellow]→[/] {s['timestamp']}  ({s.get('format', '?')}, "
+                f"{s.get('total_files', '?')} file(s))"
+            )
+
+        if dry_run:
+            return {
+                "selected": len(to_delete), "deleted": 0, "errors": 0,
+                "to_keep": to_keep_ts,
+                "to_delete": [s["timestamp"] for s in to_delete],
+            }
+
+        deleted = 0
+        errors = 0
+        for snap in to_delete:
+            try:
+                self._forget_one(snap)
+                deleted += 1
+                console.print(
+                    f"  [green]✓[/] {snap['timestamp']}  "
+                    f"({snap.get('format', '?')})"
+                )
+            except Exception as e:
+                errors += 1
+                console.print(f"  [red]✗[/] {snap['timestamp']}: {e}")
+
+        console.print(
+            f"[bold]prune complete:[/] deleted {deleted}, errors {errors}"
+        )
+        if deleted and any(s.get("format") == "blobs" for s in to_delete):
+            console.print(
+                "[dim]Tip: run [bold]claude-mirror gc[/] to reclaim blob space "
+                "from blobs no longer referenced by any remaining manifest.[/]"
+            )
+        return {
+            "selected": len(to_delete), "deleted": deleted, "errors": errors,
+            "to_keep": to_keep_ts,
+            "to_delete": [s["timestamp"] for s in to_delete],
+        }
+
+    def _compute_retention_keep_set(
+        self,
+        snapshots: list[dict],
+        *,
+        keep_last: int,
+        keep_daily: int,
+        keep_monthly: int,
+        keep_yearly: int,
+    ) -> set[str]:
+        """Compute the union of timestamps to retain across four buckets.
+
+        snapshots is newest-first (matches `list()` ordering). For each
+        time-bucket selector, walk newest-first and pick the first
+        snapshot whose bucket-key hasn't been seen yet — that's the
+        "newest in the bucket". Stop once the configured count is reached.
+        """
+        keep: set[str] = set()
+
+        if keep_last > 0:
+            for s in snapshots[:keep_last]:
+                keep.add(s["timestamp"])
+
+        def _bucket_pick(key_fn, n: int) -> None:
+            seen: set = set()
+            for s in snapshots:
+                k = key_fn(self._parse_snapshot_ts(s["timestamp"]))
+                if k in seen:
+                    continue
+                seen.add(k)
+                keep.add(s["timestamp"])
+                if len(seen) >= n:
+                    return
+
+        if keep_daily > 0:
+            _bucket_pick(lambda dt: (dt.year, dt.month, dt.day), keep_daily)
+        if keep_monthly > 0:
+            _bucket_pick(lambda dt: (dt.year, dt.month), keep_monthly)
+        if keep_yearly > 0:
+            _bucket_pick(lambda dt: dt.year, keep_yearly)
+
+        return keep
+
     def _select_to_forget(
         self,
         snapshots: list[dict],

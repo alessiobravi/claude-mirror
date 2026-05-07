@@ -4,6 +4,18 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.20] — 2026-05-07
+
+### Tests
+- **Per-backend round-trip coverage** using HTTP-level mocking. All tests are offline (no real network calls); each runs in <100ms. Part of a coordinated multi-agent push (versions 0.5.17–0.5.19 reserved for parallel work on adjacent test surfaces).
+  - `tests/test_googledrive_backend.py` (12 tests, deeper coverage — Drive is the actively-used backend). Stubs the `googleapiclient.discovery.build` return value with `MagicMock` chains shaped like `service.files().<verb>().execute()`. Covers: token-file write on `authenticate()`; `get_credentials()` load + missing-token RuntimeError; `get_or_create_folder` create-vs-existing dispatch; `resolve_path` walking `a/b/c/file.md` into 3 folder lookups; `upload_file` simple-create vs `update`-with-id branch; `download_file` bytes round-trip via stubbed `MediaIoBaseDownload`; `get_file_hash` md5Checksum extraction; `classify_error` for `RefreshError("invalid_grant")` → AUTH and `HttpError(503)` → TRANSIENT.
+  - `tests/test_dropbox_backend.py` (5 smoke tests, skipped if `dropbox` SDK absent via `pytest.importorskip`). Monkeypatches `dropbox.Dropbox` constructor + `DropboxOAuth2FlowNoRedirect`. Covers: PKCE flow → token file with `app_key` + `refresh_token`; `get_credentials()` round-trips refresh_token into the Dropbox client kwargs; `upload_file` calls `files_upload` exactly once; `download_file` extracts bytes from `(metadata, response)` tuple; `AuthError` → AUTH classification.
+  - `tests/test_onedrive_backend.py` (5 smoke tests, skipped if `msal` absent). Uses `responses` for the `requests.Session` HTTP layer; uses `mock_oauth_msal` fixture for device-code flow. Covers: device-flow → token file with `client_id` + `token_cache`; cached-token load → session with Bearer header; `<4MB` simple PUT to `/me/drive/root:/path:/content`; `>=4MB` chunked upload via `createUploadSession` + `Content-Range` PUT (locks in v0.4.x large-file path); GET-content round-trip.
+  - `tests/test_webdav_backend.py` (5 smoke tests). Uses `responses` to stub PROPFIND/PUT directly. Covers: 207 PROPFIND → token file with username + password; 401 PROPFIND → RuntimeError("Authentication failed"); v0.5.6 https-required guard rejects `http://` URLs unless `webdav_insecure_http=True`; the explicit opt-in flag re-enables `http://`; `upload_file` issues a single PUT to the encoded target URL.
+- **Coverage approach.** Drive is mocked at the discovery-service layer (`unittest.mock.patch` on the build chain) since it uses `httplib2` underneath, not `requests` — too deep to mock at HTTP level. Dropbox is mocked at SDK constructor level. OneDrive + WebDAV use `responses` library at the `requests` transport layer. Total new tests: **27** (12 Drive + 5 Dropbox + 5 OneDrive + 5 WebDAV). Suite goes 74 → 101 tests, runtime stays under 0.3s.
+
+---
+
 ## [0.5.16] — 2026-05-07
 
 ### Fixed

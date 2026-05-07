@@ -1832,38 +1832,121 @@ def _build_status_renderable(
 
 def _build_pending_renderable(engine: SyncEngine) -> RenderableType:
     """Tier 2: render files with any non-OK mirror state — pending_retry,
-    failed_perm, OR unseeded (no recorded state at all on a configured
-    mirror, typically because the mirror was added after files already
-    existed on the primary). Helps users spot every file × mirror pair
-    that needs attention without doing a full status pass."""
+    failed_perm, unseeded (no recorded state AND not present on the live
+    mirror), or deleted-on-mirror (manifest claims ok but the mirror's
+    live listing disagrees).
+
+    Live-verifies every configured mirror by walking it once, then
+    cross-references with the manifest. This is slower than a manifest-
+    only check (one list_files_recursive call per mirror) but reflects
+    actual remote state — important in multi-user setups where one
+    machine's manifest doesn't see what another machine pushed.
+    """
+    from .snapshots import SNAPSHOTS_FOLDER, BLOBS_FOLDER
+
     if not engine._mirrors:
         return Text.from_markup(
             "[dim]No mirrors configured for this project; "
             "no pending state to report.[/]"
         )
-    pending_by_path: dict[str, list[tuple[str, str, str]]] = {}
-    unseeded_by_backend: dict[str, int] = {}
+
+    # Live walk every mirror so we can distinguish "not in manifest +
+    # not on mirror" (truly unseeded) from "not in manifest + present
+    # on mirror" (another machine pushed it; not really unseeded).
+    excluded = {SNAPSHOTS_FOLDER, BLOBS_FOLDER, LOGS_FOLDER}
     mirror_names = [
         getattr(b, "backend_name", "") for b in engine._mirrors
         if getattr(b, "backend_name", "")
     ]
-    for path, fs in engine.manifest.all().items():
+    live_files: dict[str, set[str]] = {}
+    walk_errors: dict[str, str] = {}
+
+    from rich.progress import Progress, SpinnerColumn, TextColumn
+    from ._progress import _SharedElapsedColumn
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold]{task.description:<14}"),
+        TextColumn("{task.fields[detail]}", style="dim"),
+        _SharedElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        for idx, (backend, name) in enumerate(zip(engine._mirrors, mirror_names)):
+            task = progress.add_task(name, total=None,
+                                     detail="listing", show_time=(idx == 0))
+            try:
+                folder_id = (
+                    getattr(backend, "config", None)
+                    and backend.config.root_folder
+                )
+                entries = backend.list_files_recursive(
+                    folder_id, exclude_folder_names=excluded,
+                )
+                seen = {
+                    f["relative_path"] for f in entries
+                    if (f.get("relative_path", "")
+                        and not f["relative_path"].startswith("_")
+                        and not f["relative_path"].startswith(f"{SNAPSHOTS_FOLDER}/")
+                        and not f["relative_path"].startswith(f"{BLOBS_FOLDER}/")
+                        and not f["relative_path"].startswith(f"{LOGS_FOLDER}/"))
+                }
+                live_files[name] = seen
+                progress.update(task, detail=f"{len(seen)} file(s)")
+            except Exception as e:
+                walk_errors[name] = redact_error(str(e))
+                live_files[name] = set()
+                progress.update(task, detail=f"[red]error: {walk_errors[name]}[/]")
+
+    pending_by_path: dict[str, list[tuple[str, str, str]]] = {}
+    unseeded_by_backend: dict[str, int] = {}
+    deleted_by_backend: dict[str, list[str]] = {}
+
+    files = engine.manifest.all()
+    # Universe of paths to consider: union of manifest entries + every
+    # file actually present on any mirror. Files seen on a mirror but
+    # not in our manifest are NOT pending/unseeded (another machine
+    # uploaded them and we just haven't pulled yet) — silently skipped.
+    for path in set(files.keys()):
+        fs = files[path]
         for backend_name in mirror_names:
             rs = fs.remotes.get(backend_name)
-            if rs is None:
-                # Unseeded — no state at all on this mirror. Aggregate by
-                # backend rather than listing every file (project may
-                # have thousands).
+            present = path in live_files.get(backend_name, set())
+            if rs is None and not present:
+                # No manifest entry AND not on mirror → truly unseeded.
                 unseeded_by_backend[backend_name] = (
                     unseeded_by_backend.get(backend_name, 0) + 1
                 )
                 continue
-            if rs.state in ("pending_retry", "failed_perm"):
+            if rs is None and present:
+                # Another machine uploaded — fine, nothing to do here.
+                continue
+            if rs is not None and rs.state in ("pending_retry", "failed_perm"):
                 pending_by_path.setdefault(path, []).append(
                     (backend_name, rs.state, rs.last_error)
                 )
+                continue
+            if rs is not None and rs.state == "ok" and not present:
+                # Manifest claims ok but mirror's live listing disagrees:
+                # someone removed the file out of band (SSH, web UI, etc.).
+                deleted_by_backend.setdefault(backend_name, []).append(path)
+                continue
+            # rs.state == "ok" and present, OR state == "absent" — nothing to surface
 
     parts: list[RenderableType] = []
+
+    if walk_errors:
+        # Surface listing failures up-front so the user knows the rest of
+        # the report is incomplete for those mirrors.
+        err_lines = [
+            f"  [red]✗[/] {name}: {err}"
+            for name, err in walk_errors.items()
+        ]
+        parts.append(Text.from_markup(
+            "[red]Could not list these mirrors — pending/unseeded state "
+            "below may be incomplete:[/]\n" + "\n".join(err_lines)
+        ))
+        parts.append(Text(""))
 
     if pending_by_path:
         table = Table(show_header=True, header_style="bold",
@@ -1884,6 +1967,27 @@ def _build_pending_renderable(engine: SyncEngine) -> RenderableType:
         parts.append(Text.from_markup(
             "[dim]Run [bold]claude-mirror retry[/] to re-attempt "
             "the pending entries.[/]"
+        ))
+
+    if deleted_by_backend:
+        if parts:
+            parts.append(Text(""))
+        del_table = Table(show_header=True, header_style="bold",
+                          title="Deleted out-of-band on mirror")
+        del_table.add_column("Backend")
+        del_table.add_column("Files missing", justify="right")
+        del_table.add_column("Sample", style="dim")
+        for name in sorted(deleted_by_backend.keys()):
+            paths = deleted_by_backend[name]
+            sample = paths[0] + (f" (+{len(paths)-1} more)" if len(paths) > 1 else "")
+            del_table.add_row(name, str(len(paths)), sample)
+        parts.append(del_table)
+        parts.append(Text.from_markup(
+            "[dim]Manifest says these files were uploaded but the "
+            "mirror's live listing disagrees — someone removed them via "
+            "SSH / web UI / a different tool. Re-push to restore, or "
+            "[bold]claude-mirror delete[/dim][dim] them locally if the "
+            "removal was intentional.[/]"
         ))
 
     if unseeded_by_backend:
@@ -1921,80 +2025,175 @@ def _build_pending_renderable(engine: SyncEngine) -> RenderableType:
 def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
     """Tier 2: render the per-file table with one column per configured
     backend (primary first, mirrors in mirror_config_paths order). Each
-    cell shows that backend's recorded state for the file.
+    cell reflects LIVE remote state + the manifest's recorded state.
 
-    Cell rendering matrix (driven by FileState.remotes[backend_name]):
-      • RemoteState present, state="ok"            → green ✓ ok
-      • RemoteState present, state="pending_retry" → yellow ⚠ pending
-      • RemoteState present, state="failed_perm"   → red ✗ failed
-      • RemoteState present, state="absent"        → dim · absent
-      • RemoteState absent (no entry):
-          - on PRIMARY when synced_hash is set     → green ✓ ok
-            (legacy v1/v2 manifest entries — primary state was tracked
-             via flat fields rather than remotes; treat as in-sync)
-          - on a MIRROR                            → yellow ⊘ unseeded
-            (mirror was added after files already existed on primary;
-             run `claude-mirror seed-mirror --backend NAME` to populate)
+    This view actively queries every backend (one `list_files_recursive`
+    call per backend) so it catches divergence from the manifest — e.g.
+    a file deleted directly on SFTP via SSH, or a mirror folder wiped by
+    hand. Slower than `--pending` (which is manifest-only) but reflects
+    actual reality.
+
+    Cell rendering matrix:
+      File present on backend:
+        • manifest state="ok"            → green ✓ ok
+        • manifest state="pending_retry" → yellow ⚠ pending  (last attempt failed transiently)
+        • manifest state="failed_perm"   → red ✗ failed       (last attempt failed permanently)
+        • no manifest entry              → green ✓ ok         (file is there; state will be recorded on next push)
+      File absent on backend:
+        • manifest state="ok"            → red ✗ deleted      (vanished outside claude-mirror — investigate)
+        • manifest state="absent"        → dim · absent       (claude-mirror knows it was deleted)
+        • manifest state="pending_retry" → yellow ⚠ pending   (upload was queued, still missing on remote)
+        • manifest state="failed_perm"   → red ✗ failed
+        • no manifest entry              → yellow ⊘ unseeded  (mirror added after files existed on primary)
     """
+    from .snapshots import SNAPSHOTS_FOLDER, BLOBS_FOLDER
+
     primary_name = getattr(engine.storage, "backend_name", "") or "primary"
+    mirrors = list(engine._mirrors)
     mirror_names = [
-        getattr(b, "backend_name", "") or "mirror"
-        for b in engine._mirrors
+        getattr(b, "backend_name", "") or "mirror" for b in mirrors
     ]
     backend_names = [primary_name] + mirror_names
+    backend_objects = {primary_name: engine.storage}
+    for b, name in zip(mirrors, mirror_names):
+        backend_objects[name] = b
+
+    # Live walk every backend in a multi-row Progress so the user sees
+    # which backend is the bottleneck. Each backend gets its own row.
+    from rich.progress import Progress, SpinnerColumn, TextColumn
+    from ._progress import _SharedElapsedColumn
+
+    excluded = {SNAPSHOTS_FOLDER, BLOBS_FOLDER, LOGS_FOLDER}
+    live_files: dict[str, set[str]] = {}        # backend_name -> set of rel_paths
+    walk_errors: dict[str, str] = {}            # backend_name -> error string
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold]{task.description:<14}"),
+        TextColumn("{task.fields[detail]}", style="dim"),
+        _SharedElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        for idx, name in enumerate(backend_names):
+            backend = backend_objects[name]
+            label = f"{name} (primary)" if name == primary_name else name
+            task = progress.add_task(label, total=None,
+                                     detail="listing", show_time=(idx == 0))
+            try:
+                folder_id = (
+                    engine._folder_id if name == primary_name
+                    else getattr(backend, "config", None) and backend.config.root_folder
+                )
+                if not folder_id and folder_id != "":
+                    raise RuntimeError("backend has no root_folder configured")
+                entries = backend.list_files_recursive(
+                    folder_id, exclude_folder_names=excluded,
+                )
+                seen: set[str] = set()
+                for f in entries:
+                    rel = f.get("relative_path", "")
+                    if not rel:
+                        continue
+                    # Match the engine's filtering convention from sync.py
+                    # so the by-backend listing matches the user's mental
+                    # model of "the files claude-mirror is responsible for".
+                    if rel.startswith("_"):
+                        continue
+                    if (rel.startswith(f"{SNAPSHOTS_FOLDER}/")
+                        or rel.startswith(f"{BLOBS_FOLDER}/")
+                        or rel.startswith(f"{LOGS_FOLDER}/")):
+                        continue
+                    seen.add(rel)
+                live_files[name] = seen
+                progress.update(task, detail=f"{len(seen)} file(s)")
+            except Exception as e:
+                walk_errors[name] = redact_error(str(e))
+                live_files[name] = set()
+                progress.update(task, detail=f"[red]error: {walk_errors[name]}[/]")
 
     # Per-backend tally for the footer.
     tallies: dict[str, dict[str, int]] = {
-        name: {"ok": 0, "pending": 0, "failed": 0, "unseeded": 0, "absent": 0}
+        name: {
+            "ok": 0, "pending": 0, "failed": 0,
+            "unseeded": 0, "absent": 0, "deleted": 0,
+        }
         for name in backend_names
     }
 
-    def _cell_for(name: str, fs, *, is_primary: bool) -> tuple[str, str]:
-        """Return (rendered_cell_markup, tally_key) for one (file, backend)."""
+    def _cell_for(name: str, fs, rel_path: str, *, is_primary: bool) -> tuple[str, str]:
+        """Render one (file, backend) cell from live presence + manifest state."""
+        present_on_remote = rel_path in live_files.get(name, set())
         rs = fs.remotes.get(name) if fs else None
-        if rs is None:
-            if is_primary and fs and fs.synced_hash:
-                # Legacy manifest — primary state implicit via flat fields.
-                return ("[green]✓ ok[/]", "ok")
-            if is_primary:
-                # No state at all on primary AND no synced_hash — file
-                # has been seen but never confirmed synced. Rare; show
-                # as unseeded so it surfaces.
-                return ("[yellow]⊘ unseeded[/]", "unseeded")
-            return ("[yellow]⊘ unseeded[/]", "unseeded")
-        if rs.state == "ok":
+        manifest_state = rs.state if rs else None
+
+        if present_on_remote:
+            # File IS on the backend. Manifest state nuances how we describe it.
+            if manifest_state == "pending_retry":
+                return ("[yellow]⚠ pending[/]", "pending")
+            if manifest_state == "failed_perm":
+                return ("[red]✗ failed[/]", "failed")
+            # ok / absent / None all collapse to "✓ ok" because the file
+            # is verifiably there right now, regardless of what the
+            # manifest thought (e.g. legacy v1/v2 entries with no remotes).
             return ("[green]✓ ok[/]", "ok")
-        if rs.state == "pending_retry":
-            return ("[yellow]⚠ pending[/]", "pending")
-        if rs.state == "failed_perm":
-            return ("[red]✗ failed[/]", "failed")
-        if rs.state == "absent":
+
+        # File is NOT on the backend right now.
+        if manifest_state == "ok":
+            # Manifest says we successfully uploaded but the backend
+            # disagrees — out-of-band deletion. Surface loudly.
+            return ("[red]✗ deleted[/]", "deleted")
+        if manifest_state == "absent":
             return ("[dim]· absent[/]", "absent")
-        return (f"[dim]{rs.state}[/]", "ok")  # forward-compat unknown states
+        if manifest_state == "pending_retry":
+            return ("[yellow]⚠ pending[/]", "pending")
+        if manifest_state == "failed_perm":
+            return ("[red]✗ failed[/]", "failed")
+        # No manifest entry AND not present remotely.
+        if is_primary and fs and fs.synced_hash:
+            # Edge: legacy manifest with synced_hash but no live presence
+            # — primary deleted the file outside claude-mirror's view.
+            return ("[red]✗ deleted[/]", "deleted")
+        return ("[yellow]⊘ unseeded[/]", "unseeded")
 
     table = Table(
         show_header=True, header_style="bold",
-        title=f"Sync Status (per backend)",
+        title="Sync Status (per backend, live-verified)",
     )
     table.add_column("File", style="white", overflow="fold")
     for name in backend_names:
-        is_primary = (name == primary_name)
-        suffix = " [dim](primary)[/]" if is_primary else ""
+        suffix = " [dim](primary)[/]" if name == primary_name else ""
         table.add_column(f"{name}{suffix}", justify="left")
 
+    # Universe of paths to render: union of manifest entries + every
+    # file actually present on any backend. Catches files that exist
+    # on a mirror but not in the manifest (rare — typically means a
+    # restore was done out of band — but worth surfacing).
     files = engine.manifest.all()
-    if not files:
+    all_paths: set[str] = set(files.keys())
+    for seen in live_files.values():
+        all_paths |= seen
+
+    if not all_paths:
+        if walk_errors:
+            error_lines = "\n".join(
+                f"  [red]✗[/] {name}: {err}"
+                for name, err in walk_errors.items()
+            )
+            return Text.from_markup(
+                "[yellow]Could not list any backend.[/]\n" + error_lines
+            )
         return Text.from_markup(
-            "[dim]No files tracked in the manifest yet — push something "
-            "first.[/]"
+            "[dim]No files tracked in the manifest yet and nothing on "
+            "any backend — push something first.[/]"
         )
 
-    for path in sorted(files.keys()):
-        fs = files[path]
+    for path in sorted(all_paths):
+        fs = files.get(path)
         row_cells: list[str] = [path]
         for name in backend_names:
             cell, tally_key = _cell_for(
-                name, fs, is_primary=(name == primary_name),
+                name, fs, path, is_primary=(name == primary_name),
             )
             row_cells.append(cell)
             tallies[name][tally_key] += 1
@@ -2004,15 +2203,22 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
     # of each state and an emoji summarizing overall health.
     summary_lines: list[str] = []
     for name in backend_names:
+        if name in walk_errors:
+            suffix = " [dim](primary)[/]" if name == primary_name else ""
+            summary_lines.append(
+                f"  [red]✗[/] [bold]{name}[/]{suffix} · "
+                f"[red]listing failed: {walk_errors[name]}[/]"
+            )
+            continue
         t = tallies[name]
         bits: list[str] = []
         if t["ok"]:        bits.append(f"[green]{t['ok']} ok[/]")
         if t["pending"]:   bits.append(f"[yellow]{t['pending']} pending[/]")
         if t["failed"]:    bits.append(f"[red]{t['failed']} failed[/]")
+        if t["deleted"]:   bits.append(f"[red]{t['deleted']} deleted[/]")
         if t["unseeded"]:  bits.append(f"[yellow]{t['unseeded']} unseeded[/]")
         if t["absent"]:    bits.append(f"[dim]{t['absent']} absent[/]")
-        # Health emoji: only ok = ✓; any pending/unseeded = ⚠; any failed = ✗.
-        if t["failed"]:
+        if t["failed"] or t["deleted"]:
             health = "[red]✗[/]"
         elif t["pending"] or t["unseeded"]:
             health = "[yellow]⚠[/]"
@@ -2020,7 +2226,8 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
             health = "[green]✓[/]"
         suffix = " [dim](primary)[/]" if name == primary_name else ""
         summary_lines.append(
-            f"  {health} [bold]{name}[/]{suffix} · " + " · ".join(bits or ["[dim]empty[/]"])
+            f"  {health} [bold]{name}[/]{suffix} · "
+            + " · ".join(bits or ["[dim]empty[/]"])
         )
 
     summary = Text.from_markup("\n".join(summary_lines))

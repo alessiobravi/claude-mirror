@@ -83,12 +83,19 @@ def _build_engine_with_mirror(make_config, fake_backend, project_dir, mirror_bac
 def mirror_backend(make_config):
     """A second FakeStorageBackend masquerading as the SFTP mirror.
 
-    Carries its own Config (with `root_folder` resolving to the mirror's
-    root folder ID) because the engine reads `target.config.root_folder`
-    when uploading — same convention real backends follow.
+    Carries its own Config (with `root_folder` resolving to "sftp-root")
+    because the engine reads `target.config.root_folder` when uploading
+    AND when listing — same convention real backends follow.
+
+    `sftp_folder` is set so Config.root_folder returns the right value
+    for backend="sftp" (root_folder switches on backend type).
     """
     from tests.conftest import FakeStorageBackend
-    cfg = make_config(backend="sftp", drive_folder_id="sftp-root")
+    cfg = make_config(
+        backend="sftp",
+        drive_folder_id="sftp-root",
+        sftp_folder="sftp-root",
+    )
     m = FakeStorageBackend(root_folder_id="sftp-root")
     m.backend_name = "sftp"
     m.config = cfg
@@ -264,7 +271,40 @@ def test_status_pending_surfaces_unseeded_files(patch_load_engine_with_mirror):
     assert "All mirrors are caught up" not in result.output
 
 
+def test_status_pending_surfaces_out_of_band_deletion(monkeypatch, make_config, fake_backend, mirror_backend, project_dir, write_files):
+    """Live verification catches the multi-user / direct-SSH-deletion
+    scenario: manifest claims state=ok on the mirror, but the mirror's
+    live list_files_recursive shows the file is missing. Pre-v0.5.34
+    this was silently invisible (manifest-only check); post v0.5.34 it
+    surfaces in a 'Deleted out-of-band on mirror' table."""
+    write_files({"a.md": "alpha\n"})
+    cfg = make_config()
+    engine = SyncEngine(
+        config=cfg, storage=fake_backend, manifest=Manifest(cfg.project_path),
+        merge=MergeHandler(), notifier=None, snapshots=None, mirrors=[mirror_backend],
+    )
+    h = Manifest.hash_file(str(project_dir / "a.md"))
+    engine.manifest.update_remote("a.md", "googledrive", remote_file_id="g-a", synced_remote_hash=h, state="ok")
+    # Manifest claims sftp has it…
+    engine.manifest.update_remote("a.md", "sftp", remote_file_id="/srv/a.md", synced_remote_hash=h, state="ok")
+    # …but mirror_backend was NOT seeded — live listing says it's missing.
+
+    monkeypatch.setattr(cli_module, "_load_engine",
+                        lambda config_path, with_pubsub=True: (engine, cfg, fake_backend))
+    monkeypatch.setattr(cli_module, "_resolve_config", lambda p: p or "fake-config")
+
+    result = CliRunner().invoke(cli, ["status", "--pending"])
+    assert result.exit_code == 0, result.output
+    assert "Deleted out-of-band" in result.output
+    assert "sftp" in result.output
+
+
 def test_status_pending_clean_when_everything_seeded(monkeypatch, make_config, fake_backend, mirror_backend, project_dir, write_files):
+    """Happy-path: file present on local + manifest + every mirror's
+    live listing → status --pending says nothing is pending. With live
+    verification (post-v0.5.34), the mirror MUST actually have the file
+    on it for this to render clean — manifest claiming state=ok alone
+    is no longer sufficient if the live listing disagrees."""
     write_files({"a.md": "alpha\n"})
     cfg = make_config()
     engine = SyncEngine(
@@ -274,6 +314,11 @@ def test_status_pending_clean_when_everything_seeded(monkeypatch, make_config, f
     h = Manifest.hash_file(str(project_dir / "a.md"))
     engine.manifest.update_remote("a.md", "googledrive", remote_file_id="g-a", synced_remote_hash=h, state="ok")
     engine.manifest.update_remote("a.md", "sftp", remote_file_id="/srv/a.md", synced_remote_hash=h, state="ok")
+    # Live verify also requires the file to be present on the mirror's
+    # in-memory store, otherwise it would correctly surface as deleted-
+    # on-mirror rather than caught up.
+    parent_id, basename = mirror_backend.resolve_path("a.md", mirror_backend.root_folder_id)
+    mirror_backend.upload_bytes(b"alpha\n", basename, parent_id)
 
     monkeypatch.setattr(cli_module, "_load_engine",
                         lambda config_path, with_pubsub=True: (engine, cfg, fake_backend))

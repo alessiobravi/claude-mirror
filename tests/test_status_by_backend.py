@@ -58,10 +58,19 @@ def patch_load_engine(monkeypatch, make_config, fake_backend, mirror_backend, pr
 
 # ─── Header / column structure ─────────────────────────────────────────────────
 
-def test_by_backend_renders_one_column_per_configured_backend(patch_load_engine):
+def _seed_on_backend(backend, rel_path: str, content: bytes = b"x"):
+    """Upload a file directly to a FakeStorageBackend so its
+    list_files_recursive picks it up — required now that --by-backend
+    live-verifies remote presence rather than reading the manifest only."""
+    parent_id, basename = backend.resolve_path(rel_path, backend.root_folder_id)
+    return backend.upload_bytes(content, basename, parent_id)
+
+
+def test_by_backend_renders_one_column_per_configured_backend(patch_load_engine, fake_backend):
     """Header row should include both the primary and every mirror name,
     with the primary marked '(primary)' so users can tell which side
     drives pull/status."""
+    _seed_on_backend(fake_backend, "a.md")
     patch_load_engine.manifest.update_remote(
         "a.md", "fake", remote_file_id="f-a", synced_remote_hash="ha", state="ok",
     )
@@ -76,19 +85,29 @@ def test_by_backend_renders_one_column_per_configured_backend(patch_load_engine)
 
 # ─── Cell rendering across each state ──────────────────────────────────────────
 
-def test_by_backend_cell_renders_ok_when_state_is_ok(patch_load_engine):
+def test_by_backend_cell_renders_ok_when_state_is_ok(patch_load_engine, fake_backend, mirror_backend):
+    """File present on BOTH backends (live-verified) AND manifest says
+    ok → renders as ✓ ok in both columns."""
+    _seed_on_backend(fake_backend, "a.md")
+    _seed_on_backend(mirror_backend, "a.md")
     patch_load_engine.manifest.update_remote("a.md", "fake", remote_file_id="f-a",
                                              synced_remote_hash="ha", state="ok")
     patch_load_engine.manifest.update_remote("a.md", "sftp", remote_file_id="/srv/a",
                                              synced_remote_hash="ha", state="ok")
     result = CliRunner().invoke(cli, ["status", "--by-backend"])
     assert result.exit_code == 0, result.output
-    # ok cells render the ✓ ok marker for both backends — there should
-    # be at least 2 occurrences (one per backend cell on the row).
+    # ok cells render the ✓ ok marker for both backends — at least 2
+    # occurrences (one per backend cell on the row).
     assert result.output.count("ok") >= 2
 
 
-def test_by_backend_cell_renders_pending(patch_load_engine):
+def test_by_backend_cell_renders_pending(patch_load_engine, fake_backend, mirror_backend):
+    """File present on backends BUT manifest says pending_retry — the
+    pending marker wins over ok because the manifest's recorded state
+    captures intent that live presence alone can't (we tried, last
+    attempt failed transiently, retry queued)."""
+    _seed_on_backend(fake_backend, "a.md")
+    _seed_on_backend(mirror_backend, "a.md")
     patch_load_engine.manifest.update_remote("a.md", "fake", remote_file_id="f-a",
                                              synced_remote_hash="ha", state="ok")
     patch_load_engine.manifest.update_remote("a.md", "sftp", remote_file_id="/srv/a",
@@ -99,7 +118,11 @@ def test_by_backend_cell_renders_pending(patch_load_engine):
     assert "pending" in result.output
 
 
-def test_by_backend_cell_renders_failed(patch_load_engine):
+def test_by_backend_cell_renders_failed(patch_load_engine, fake_backend, mirror_backend):
+    """File present on backends BUT manifest says failed_perm — failed
+    marker wins."""
+    _seed_on_backend(fake_backend, "a.md")
+    _seed_on_backend(mirror_backend, "a.md")
     patch_load_engine.manifest.update_remote("a.md", "fake", remote_file_id="f-a",
                                              synced_remote_hash="ha", state="ok")
     patch_load_engine.manifest.update_remote("a.md", "sftp", remote_file_id="/srv/a",
@@ -110,18 +133,26 @@ def test_by_backend_cell_renders_failed(patch_load_engine):
     assert "failed" in result.output
 
 
-def test_by_backend_cell_renders_unseeded_for_mirror_with_no_state(patch_load_engine):
-    """The whole point of --by-backend: a file with primary state but
-    no recorded state on a mirror renders as 'unseeded' on that mirror."""
+def test_by_backend_cell_renders_unseeded_for_mirror_with_no_state(patch_load_engine, fake_backend):
+    """The whole point of --by-backend with live verification: a file
+    that's on the primary AND in the manifest BUT not on the mirror
+    AND with no manifest entry for the mirror → 'unseeded' on the mirror.
+    Note: mirror_backend is intentionally NOT seeded."""
+    _seed_on_backend(fake_backend, "a.md")
     patch_load_engine.manifest.update_remote("a.md", "fake", remote_file_id="f-a",
                                              synced_remote_hash="ha", state="ok")
-    # Note: NO update_remote for "sftp"
+    # Note: NO update_remote for "sftp" AND no upload to mirror_backend
     result = CliRunner().invoke(cli, ["status", "--by-backend"])
     assert result.exit_code == 0, result.output
     assert "unseeded" in result.output
 
 
-def test_by_backend_cell_renders_absent(patch_load_engine):
+def test_by_backend_cell_renders_absent(patch_load_engine, fake_backend):
+    """Manifest says state=absent on the mirror (claude-mirror knows the
+    file was deliberately deleted there). The mirror's live listing
+    confirms it isn't present. → '· absent' (not 'deleted', because we
+    intended the absence)."""
+    _seed_on_backend(fake_backend, "a.md")
     patch_load_engine.manifest.update_remote("a.md", "fake", remote_file_id="f-a",
                                              synced_remote_hash="ha", state="ok")
     patch_load_engine.manifest.update_remote("a.md", "sftp", remote_file_id="/srv/a",
@@ -131,19 +162,35 @@ def test_by_backend_cell_renders_absent(patch_load_engine):
     assert "absent" in result.output
 
 
-def test_by_backend_legacy_manifest_no_remotes_dict_renders_primary_as_ok(patch_load_engine):
+def test_by_backend_cell_renders_deleted_for_out_of_band_removal(patch_load_engine, fake_backend):
+    """NEW STATE in the live-verified renderer: manifest says state=ok
+    on the mirror, but the mirror's live listing shows the file is
+    missing. Surfaced as '✗ deleted' to flag the divergence — this
+    catches "someone removed the file directly via SSH/web-UI"."""
+    _seed_on_backend(fake_backend, "a.md")
+    # mirror_backend NOT seeded (file is "missing" on it)
+    patch_load_engine.manifest.update_remote("a.md", "fake", remote_file_id="f-a",
+                                             synced_remote_hash="ha", state="ok")
+    # But manifest insists the file IS on sftp:
+    patch_load_engine.manifest.update_remote("a.md", "sftp", remote_file_id="/srv/a",
+                                             synced_remote_hash="ha", state="ok")
+    result = CliRunner().invoke(cli, ["status", "--by-backend"])
+    assert result.exit_code == 0, result.output
+    assert "deleted" in result.output
+
+
+def test_by_backend_legacy_manifest_no_remotes_dict_renders_primary_as_ok(patch_load_engine, fake_backend):
     """v1/v2 manifest entries had `synced_hash` set but no `remotes`
-    dict. The renderer should still mark the primary as ok rather than
-    reporting it as unseeded — the file IS present, just tracked via
-    the legacy flat fields."""
-    # Set synced_hash directly without going through update_remote (the
-    # manifest helper would populate remotes for us).
+    dict. With live verification, the primary cell renders as ✓ ok
+    when the file is actually present on the backend, regardless of
+    whether the manifest has per-backend remotes recorded for it."""
+    _seed_on_backend(fake_backend, "a.md")
     fs = patch_load_engine.manifest.get("a.md")
     if fs is None:
         from claude_mirror.manifest import FileState
         fs = FileState()
     fs.synced_hash = "deadbeef"
-    fs.remotes = {}  # explicitly no per-backend entries
+    fs.remotes = {}  # explicitly no per-backend entries (legacy v1/v2 shape)
     patch_load_engine.manifest._data["a.md"] = fs
     result = CliRunner().invoke(cli, ["status", "--by-backend"])
     assert result.exit_code == 0, result.output
@@ -152,23 +199,26 @@ def test_by_backend_legacy_manifest_no_remotes_dict_renders_primary_as_ok(patch_
 
 # ─── Footer per-backend health summary ─────────────────────────────────────────
 
-def test_by_backend_footer_shows_per_backend_counts(patch_load_engine):
-    """Footer should show one summary line per backend with state counts."""
-    # 2 files, both ok on primary, one ok and one unseeded on sftp.
-    fs1_hash = "ha"
-    fs2_hash = "hb"
+def test_by_backend_footer_shows_per_backend_counts(patch_load_engine, fake_backend, mirror_backend):
+    """Footer shows one summary line per backend with state counts.
+    With live verification: fake primary has both files (live + manifest),
+    sftp has a.md (live + manifest=ok) but not b.md (no manifest, no live)
+    → primary 2 ok, sftp 1 ok + 1 unseeded."""
     from pathlib import Path
     (Path(patch_load_engine.config.project_path) / "b.md").write_text("beta\n")
+    _seed_on_backend(fake_backend, "a.md")
+    _seed_on_backend(fake_backend, "b.md")
+    _seed_on_backend(mirror_backend, "a.md")
+    # b.md NOT uploaded to mirror_backend → live shows missing
     patch_load_engine.manifest.update_remote("a.md", "fake", remote_file_id="f-a",
-                                             synced_remote_hash=fs1_hash, state="ok")
+                                             synced_remote_hash="ha", state="ok")
     patch_load_engine.manifest.update_remote("b.md", "fake", remote_file_id="f-b",
-                                             synced_remote_hash=fs2_hash, state="ok")
+                                             synced_remote_hash="hb", state="ok")
     patch_load_engine.manifest.update_remote("a.md", "sftp", remote_file_id="/srv/a",
-                                             synced_remote_hash=fs1_hash, state="ok")
-    # b.md NOT seeded on sftp
+                                             synced_remote_hash="ha", state="ok")
+    # b.md has NO manifest entry for sftp AND no live presence → unseeded
     result = CliRunner().invoke(cli, ["status", "--by-backend"])
     assert result.exit_code == 0, result.output
-    # The fake primary should report 2 ok; sftp should report 1 ok + 1 unseeded.
     assert "2 ok" in result.output
     assert "1 unseeded" in result.output
 

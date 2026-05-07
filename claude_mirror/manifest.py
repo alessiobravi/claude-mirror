@@ -384,6 +384,26 @@ class Manifest:
                 and s.remotes[backend_name].state == "pending_retry"
             }
 
+    def unseeded_for_backend(self, backend_name: str) -> dict[str, FileState]:
+        """Return rel_path -> FileState for every file that has NO recorded
+        state at all for the named backend.
+
+        This is the case when a mirror is added to a project after files
+        already exist on the primary: the manifest carries each file's
+        sync state for the primary but has nothing for the new mirror,
+        so push has nothing to do (local hash already matches manifest)
+        and the mirror folder stays empty. `claude-mirror seed-mirror
+        --backend NAME` walks this set and uploads each file to the
+        named mirror once, recording state="ok" so subsequent pushes
+        track it normally.
+        """
+        with self._lock:
+            return {
+                p: s
+                for p, s in self._data.items()
+                if backend_name not in s.remotes
+            }
+
     def prune_unknown_backends(self, active_backend_names: set[str]) -> int:
         """Drop entries from each FileState's `remotes` map whose
         backend_name is not in `active_backend_names` (i.e. mirrors the

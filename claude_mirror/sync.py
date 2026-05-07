@@ -1474,6 +1474,190 @@ class SyncEngine:
         self.manifest.save()
         return result
 
+    def seed_mirror(
+        self,
+        backend_name: str,
+        dry_run: bool = False,
+    ) -> dict:
+        """Upload every manifest-tracked file to a newly-added mirror that
+        has no recorded state for them yet.
+
+        This closes the "fresh mirror seeding gap": when a user adds a
+        mirror to `mirror_config_paths` for a project where files already
+        exist on the primary, push has nothing to do (local hashes match
+        the manifest's primary-side hashes) and the mirror folder stays
+        empty forever. seed_mirror walks `manifest.unseeded_for_backend
+        (backend_name)` and uploads each file to the named mirror only —
+        the primary is never touched.
+
+        For each file in the unseeded set:
+          * Local file is hashed.
+          * If the local hash differs from the manifest's `synced_hash`,
+            the file is SKIPPED with a warning. Drift means the local
+            content has diverged from what was last pushed; the user
+            should resolve via a normal push (which will fan-out to the
+            mirror at the same time) before seeding. Blindly uploading
+            mismatched content here would silently desync local from
+            primary on the seeded mirror.
+          * Otherwise: upload to the named mirror, record state="ok"
+            via `manifest.update_remote(...)`.
+
+        backend_name: must match one of the configured mirror backends'
+            `backend_name` attribute (typically "sftp", "dropbox",
+            "onedrive", "webdav", "googledrive"). Raises ValueError if
+            no mirror with that name is configured.
+        dry_run: list what would be seeded without uploading.
+
+        Returns a summary dict:
+          { "total_unseeded": N, "seeded": N, "skipped_drift": N,
+            "failed": N }
+        """
+        from .backends import BackendError
+
+        if not self._mirrors:
+            console.print(
+                "[yellow]No mirrors configured for this project; "
+                "seed-mirror has nothing to do.[/]"
+            )
+            return {"total_unseeded": 0, "seeded": 0, "skipped_drift": 0, "failed": 0}
+
+        target = next(
+            (b for b in self._mirrors
+             if (getattr(b, "backend_name", "") or "") == backend_name),
+            None,
+        )
+        if target is None:
+            available = ", ".join(
+                (getattr(b, "backend_name", "?") or "?") for b in self._mirrors
+            )
+            raise ValueError(
+                f"No mirror named {backend_name!r} configured for this "
+                f"project. Available mirrors: {available}"
+            )
+
+        unseeded = self.manifest.unseeded_for_backend(backend_name)
+        result = {
+            "total_unseeded": len(unseeded),
+            "seeded": 0,
+            "skipped_drift": 0,
+            "failed": 0,
+        }
+
+        if not unseeded:
+            console.print(
+                f"[green]✓ Mirror {backend_name!r} is already seeded — "
+                "every manifest-tracked file has recorded state on it.[/]"
+            )
+            return result
+
+        if dry_run:
+            console.print(
+                f"[bold]Would seed {len(unseeded)} file(s) to mirror "
+                f"{backend_name!r}:[/]"
+            )
+            for rel_path in sorted(unseeded.keys()):
+                console.print(f"  [yellow]→[/] {rel_path}")
+            return result
+
+        console.print(
+            f"[bold]Seeding {len(unseeded)} file(s) to mirror {backend_name!r}…[/]"
+        )
+
+        with self._make_phase_progress() as progress:
+            task = progress.add_task(
+                "Seed", total=len(unseeded),
+                detail=f"0/{len(unseeded)} uploaded", show_time=True,
+            )
+            for rel_path in sorted(unseeded.keys()):
+                try:
+                    local_path = str(_safe_join(self._project, rel_path))
+                except ValueError as e:
+                    result["failed"] += 1
+                    console.print(
+                        f"  [red]✗[/] {rel_path}: refusing unsafe path ({e})"
+                    )
+                    progress.update(task, advance=1)
+                    continue
+
+                try:
+                    local_hash = Manifest.hash_file(local_path)
+                except OSError as e:
+                    result["failed"] += 1
+                    console.print(
+                        f"  [red]✗[/] {rel_path}: cannot read local file ({e})"
+                    )
+                    progress.update(task, advance=1)
+                    continue
+
+                # Drift sanity check — refuse to seed mismatched content.
+                # The manifest's synced_hash records what the primary has;
+                # if local has diverged, a normal push must reconcile
+                # primary first (and will fan-out to the mirror at the
+                # same time, so seed-mirror still completes correctly).
+                manifest_hash = unseeded[rel_path].synced_hash
+                if manifest_hash and local_hash != manifest_hash:
+                    result["skipped_drift"] += 1
+                    console.print(
+                        f"  [yellow]⚠[/] {rel_path}: local hash differs "
+                        "from manifest — run [bold]claude-mirror push[/] "
+                        "to reconcile, then re-run seed-mirror."
+                    )
+                    progress.update(task, advance=1)
+                    continue
+
+                try:
+                    upload_fn = getattr(target, "_upload_with_retry", None)
+                    if upload_fn:
+                        new_id = upload_fn(
+                            local_path=local_path,
+                            rel_path=rel_path,
+                            root_folder_id=target.config.root_folder,
+                            file_id=None,
+                        )
+                    else:
+                        new_id = target.upload_file(
+                            local_path=local_path,
+                            rel_path=rel_path,
+                            root_folder_id=target.config.root_folder,
+                            file_id=None,
+                        )
+                    try:
+                        remote_hash = target.get_file_hash(new_id) or local_hash
+                    except Exception:
+                        remote_hash = local_hash
+                    self.manifest.update_remote(
+                        rel_path, backend_name,
+                        remote_file_id=new_id,
+                        synced_remote_hash=remote_hash,
+                        state="ok",
+                    )
+                    result["seeded"] += 1
+                except (BackendError, Exception) as exc:
+                    result["failed"] += 1
+                    console.print(
+                        f"  [red]✗[/] {rel_path}: {redact_error(str(exc))}"
+                    )
+                progress.update(
+                    task, advance=1,
+                    detail=f"{result['seeded']}/{len(unseeded)} uploaded",
+                )
+
+        self.manifest.save()
+        console.print(
+            f"[bold]seed-mirror complete:[/] "
+            f"seeded {result['seeded']}, "
+            f"skipped (drift) {result['skipped_drift']}, "
+            f"failed {result['failed']}."
+        )
+        if result["failed"]:
+            console.print(
+                "[dim]Failed entries: their next normal push will retry "
+                "transient failures automatically; permanent failures need "
+                "user action via [bold]claude-mirror doctor --backend "
+                f"{backend_name}[/].[/]"
+            )
+        return result
+
     def _retry_pending_for_mirrors(self, cap: Optional[int] = None) -> list[str]:
         """Scan the manifest for files marked `pending_retry` on any mirror
         and return their relative paths. Called at the start of every push;

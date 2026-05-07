@@ -4,6 +4,30 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.34] — 2026-05-08
+
+Two bug fixes for the v0.5.33 SFTP / Tier 2 surface, both surfaced by real-world use the day after release.
+
+### Fixed — `init --wizard --backend X` now respects the `--backend` flag
+- **Bug**: `claude-mirror init --wizard --backend sftp` displayed `Storage backend [googledrive]:` regardless of what was passed to `--backend`. Pre-fix the wizard ignored the CLI flag entirely; users had to re-type the backend name into the prompt.
+- **Cause**: `_run_wizard()` was a no-arg function with `default="googledrive"` hardcoded into its first `click.prompt`. The CLI's `--backend` value populated `backend_opt` in the `init` callback, but `init` then called `_run_wizard()` without forwarding it, so the wizard's prompt never saw the user's intent. After the wizard returned, the value collected from the prompt overwrote whatever `backend_opt` carried.
+- **Fix**: `_run_wizard(backend_default: str = "googledrive")` now accepts the desired default. `init` passes `backend_default=backend_opt`. Running with `--backend sftp` now shows `Storage backend [sftp]:`; pressing Enter accepts.
+- 2 regression tests in `tests/test_init_wizard.py` pin the contract so this can't silently regress.
+
+### Added — `claude-mirror seed-mirror --backend NAME` (closes the fresh-mirror seeding gap)
+- **Bug**: When a mirror is added to `mirror_config_paths` for a project where files already exist on the primary, regular `push` has nothing to do — every local hash matches its manifest record, so push uploads zero files and the new mirror's folder stays empty forever. `status --pending` reported "All mirrors are caught up" even when the mirror was completely empty, because `--pending` only counted files in `pending_retry` / `failed_perm` state. There was no built-in command for "upload everything that's already on the primary to this newly-added mirror."
+- **Fix**: New `claude-mirror seed-mirror --backend NAME [--dry-run]` command. Walks the manifest, finds every file with no recorded state on the named mirror (`get_remote(name) is None`), and uploads each one to that mirror only — the primary is never touched. State is recorded as `state="ok"` per file × backend, so subsequent pushes track normally.
+- **Drift safety**: a file whose local hash differs from the manifest's recorded `synced_hash` is SKIPPED with a yellow warning. The user must run a normal `push` first to reconcile primary (which fans out to the mirror simultaneously), then re-run `seed-mirror` for any leftovers. Blindly seeding mismatched content would silently desync local from primary on the seeded mirror.
+- **Idempotent**: running twice in a row is safe — the second invocation finds zero unseeded files and exits with a "✓ already seeded" message.
+- New `Manifest.unseeded_for_backend(backend_name)` helper — symmetric with the existing `pending_for_backend` — returns the unseeded set without iterating the dict at every call site.
+- 10 new tests in `tests/test_seed_mirror.py` cover happy-path upload, idempotent re-run, drift detection skip, dry-run no-op, unknown-backend ValueError, no-mirrors-configured early exit, and the `status --pending` integration.
+
+### Fixed — `status --pending` now surfaces unseeded mirrors
+- Pre-fix `status --pending` only listed files in `pending_retry` / `failed_perm` state. Files that had **no recorded state at all** for a configured mirror (the bug above) were silently invisible — the user saw "✓ All mirrors are caught up" while a mirror folder was empty.
+- Post-fix `status --pending` adds an "Unseeded mirrors" table when any configured mirror has files with no recorded state, with the suggested fix command (`claude-mirror seed-mirror --backend NAME`) inline. The pre-fix happy-path message only shows when both pending state AND unseeded state are clean.
+
+---
+
 ## [0.5.33] — 2026-05-07
 
 ### Added — SFTP storage backend (`backend: sftp`)

@@ -133,6 +133,7 @@ claude-mirror restore  <timestamp> <path> [<path> ...]   --config <config-path> 
 claude-mirror restore  <timestamp> [<path> ...] --backend NAME --config <config-path>   # force restore from a specific backend (skip primary-first fallback)
 claude-mirror retry                                      --config <config-path>   # re-attempt failed mirror pushes
 claude-mirror retry    --backend NAME [--dry-run]        --config <config-path>   # retry one backend only / preview without sending
+claude-mirror seed-mirror --backend NAME                 --config <config-path>   # one-shot: populate a freshly-added mirror with files already on primary
 claude-mirror status   --pending                         --config <config-path>   # show files with non-ok mirror state
 claude-mirror forget   <timestamp> [<timestamp> ...]     --config <config-path>   # delete specific snapshots
 claude-mirror forget   --keep-last 50                    --config <config-path>   # retention pruning (single-selector form)

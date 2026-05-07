@@ -98,6 +98,9 @@ _NO_WATCHER_CHECK_CMDS = {
     # `prune` and `diff` are read-mostly housekeeping — the watcher hint
     # is unrelated and just adds noise to the rendered output.
     "prune", "diff",
+    # `seed-mirror` is one-shot mirror initialization; the watcher hint
+    # is unrelated and would distract from the seed summary.
+    "seed-mirror",
 }
 
 
@@ -605,8 +608,14 @@ def _derive_config_path(project_path: str) -> str:
     return str(CONFIG_DIR / f"{project_name}.yaml")
 
 
-def _run_wizard() -> dict:
-    """Interactive wizard that collects all init parameters. Returns a dict of values."""
+def _run_wizard(backend_default: str = "googledrive") -> dict:
+    """Interactive wizard that collects all init parameters. Returns a dict of values.
+
+    `backend_default` is the storage backend pre-filled in the first prompt.
+    The caller passes the value of the `--backend` CLI flag so that
+    `claude-mirror init --wizard --backend sftp` shows `[sftp]` as the
+    default rather than the unconditional `[googledrive]`.
+    """
     console.print("\n[bold cyan]claude-mirror setup wizard[/]\n")
     console.print("Press Enter to accept the [dim]default[/] shown in brackets.\n")
 
@@ -616,7 +625,7 @@ def _run_wizard() -> dict:
     console.print(
         f"[dim]Storage backend: {' | '.join(_SUPPORTED_BACKENDS)}[/]"
     )
-    backend = click.prompt("Storage backend", default="googledrive")
+    backend = click.prompt("Storage backend", default=backend_default)
     if backend not in _SUPPORTED_BACKENDS:
         console.print(f"[red]Backend '{backend}' is not supported.[/]")
         sys.exit(1)
@@ -1124,7 +1133,7 @@ def init(
     backend = backend_opt
 
     if wizard:
-        values = _run_wizard()
+        values = _run_wizard(backend_default=backend_opt)
         backend          = values["backend"]
         project_path     = values["project_path"]
         drive_folder_id  = values["drive_folder_id"]
@@ -1798,45 +1807,91 @@ def _build_status_renderable(
 
 
 def _build_pending_renderable(engine: SyncEngine) -> RenderableType:
-    """Tier 2: render only files with non-ok mirror state. Helps users
-    see what's queued for retry without doing a full status pass."""
+    """Tier 2: render files with any non-OK mirror state — pending_retry,
+    failed_perm, OR unseeded (no recorded state at all on a configured
+    mirror, typically because the mirror was added after files already
+    existed on the primary). Helps users spot every file × mirror pair
+    that needs attention without doing a full status pass."""
     if not engine._mirrors:
         return Text.from_markup(
             "[dim]No mirrors configured for this project; "
             "no pending state to report.[/]"
         )
     pending_by_path: dict[str, list[tuple[str, str, str]]] = {}
+    unseeded_by_backend: dict[str, int] = {}
+    mirror_names = [
+        getattr(b, "backend_name", "") for b in engine._mirrors
+        if getattr(b, "backend_name", "")
+    ]
     for path, fs in engine.manifest.all().items():
-        for backend_name, rs in fs.remotes.items():
+        for backend_name in mirror_names:
+            rs = fs.remotes.get(backend_name)
+            if rs is None:
+                # Unseeded — no state at all on this mirror. Aggregate by
+                # backend rather than listing every file (project may
+                # have thousands).
+                unseeded_by_backend[backend_name] = (
+                    unseeded_by_backend.get(backend_name, 0) + 1
+                )
+                continue
             if rs.state in ("pending_retry", "failed_perm"):
                 pending_by_path.setdefault(path, []).append(
                     (backend_name, rs.state, rs.last_error)
                 )
-    if not pending_by_path:
-        return Text.from_markup(
-            "[green]✓ All mirrors are caught up — nothing pending.[/]"
-        )
-    table = Table(show_header=True, header_style="bold",
-                  title=f"Pending mirror state ({len(pending_by_path)} file(s))")
-    table.add_column("File", style="white")
-    table.add_column("Backend")
-    table.add_column("State")
-    table.add_column("Last error", style="dim")
-    for path in sorted(pending_by_path.keys()):
-        for backend_name, state, last_error in pending_by_path[path]:
-            color = "yellow" if state == "pending_retry" else "red"
-            table.add_row(
-                path, backend_name,
-                f"[{color}]{state}[/]",
-                (last_error or "")[:80],
-            )
-    return Group(
-        table,
-        Text.from_markup(
-            "\n[dim]Run [bold]claude-mirror retry[/] to re-attempt "
+
+    parts: list[RenderableType] = []
+
+    if pending_by_path:
+        table = Table(show_header=True, header_style="bold",
+                      title=f"Pending mirror state ({len(pending_by_path)} file(s))")
+        table.add_column("File", style="white")
+        table.add_column("Backend")
+        table.add_column("State")
+        table.add_column("Last error", style="dim")
+        for path in sorted(pending_by_path.keys()):
+            for backend_name, state, last_error in pending_by_path[path]:
+                color = "yellow" if state == "pending_retry" else "red"
+                table.add_row(
+                    path, backend_name,
+                    f"[{color}]{state}[/]",
+                    (last_error or "")[:80],
+                )
+        parts.append(table)
+        parts.append(Text.from_markup(
+            "[dim]Run [bold]claude-mirror retry[/] to re-attempt "
             "the pending entries.[/]"
-        ),
-    )
+        ))
+
+    if unseeded_by_backend:
+        if parts:
+            parts.append(Text(""))  # blank line spacer
+        seed_table = Table(show_header=True, header_style="bold",
+                           title="Unseeded mirrors")
+        seed_table.add_column("Backend")
+        seed_table.add_column("Unseeded files", justify="right")
+        seed_table.add_column("Fix", style="dim")
+        for backend_name in sorted(unseeded_by_backend.keys()):
+            count = unseeded_by_backend[backend_name]
+            seed_table.add_row(
+                backend_name,
+                str(count),
+                f"claude-mirror seed-mirror --backend {backend_name}",
+            )
+        parts.append(seed_table)
+        parts.append(Text.from_markup(
+            "[dim]A mirror is "
+            "[yellow]unseeded[/dim][dim] when files exist on the primary "
+            "but were never uploaded to that mirror — typically because "
+            "the mirror was added to `mirror_config_paths` after the "
+            "files were first pushed. Run the suggested command to "
+            "upload them to the mirror only (primary is not touched).[/]"
+        ))
+
+    if not parts:
+        return Text.from_markup(
+            "[green]✓ All mirrors are caught up — nothing pending or unseeded.[/]"
+        )
+    return Group(*parts)
 
 
 @cli.command()
@@ -2728,6 +2783,70 @@ def retry(backend_filter: str, dry_run: bool, config_path: str) -> None:
             "[red]Some files have permanent failures (auth / quota / "
             "permission). Run `claude-mirror status --pending` to see "
             "which backends need attention.[/]"
+        )
+
+
+@cli.command("seed-mirror")
+@click.option("--backend", "backend_name", required=True,
+              help="Mirror backend to seed (e.g. 'sftp'). Must match a "
+                   "configured mirror's `backend` field. Required.")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="List which files would be seeded without uploading anything.")
+@click.option("--config", "config_path", default="",
+              help="Config file path. Auto-detected from cwd if omitted.")
+def seed_mirror(backend_name: str, dry_run: bool, config_path: str) -> None:
+    """Seed a newly-added mirror with files that already exist on the primary.
+
+    \b
+    Why this exists: when you add a backend to `mirror_config_paths` for
+    a project where files already exist on the primary, regular `push`
+    has nothing to do — every local hash matches its manifest record, so
+    push uploads zero files and the new mirror's folder stays empty.
+    `seed-mirror` walks the manifest, finds every file with no recorded
+    state on the named mirror, and uploads each one to that mirror only.
+    The primary is never touched.
+
+    \b
+    Examples:
+      claude-mirror seed-mirror --backend sftp
+      claude-mirror seed-mirror --backend sftp --dry-run
+      claude-mirror seed-mirror --backend dropbox --config ~/.config/claude_mirror/work.yaml
+
+    Drift safety: a file whose local content has diverged from the
+    manifest's recorded `synced_hash` is SKIPPED with a yellow warning
+    (it would be wrong to seed mismatched content — the user should run
+    `claude-mirror push` first to reconcile primary, which fans out to
+    the mirror at the same time, then re-run seed-mirror to catch any
+    leftovers).
+
+    Idempotent: running twice in a row is safe — the second invocation
+    finds zero unseeded files (everything has `state="ok"` from the
+    first run) and exits with a "✓ already seeded" message.
+    """
+    engine, _, _ = _load_engine(_resolve_config(config_path), with_pubsub=False)
+    if not engine._mirrors:
+        console.print(
+            "[yellow]No mirrors configured for this project.[/] Tier 2 "
+            "multi-backend is opt-in via `mirror_config_paths` in the "
+            "project YAML."
+        )
+        sys.exit(1)
+    try:
+        summary = engine.seed_mirror(
+            backend_name=backend_name,
+            dry_run=dry_run,
+        )
+    except ValueError as e:
+        console.print(f"[red]{e}[/]")
+        sys.exit(1)
+    if dry_run or summary["total_unseeded"] == 0:
+        return
+    if summary["failed"]:
+        console.print(
+            f"\n[yellow]{summary['failed']} file(s) failed to seed.[/] "
+            f"Re-run [bold]claude-mirror seed-mirror --backend {backend_name}[/] "
+            "to retry transient failures, or [bold]claude-mirror doctor "
+            f"--backend {backend_name}[/] to diagnose persistent ones."
         )
 
 

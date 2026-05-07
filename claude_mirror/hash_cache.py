@@ -38,7 +38,11 @@ class HashCache:
             return
         try:
             self._data = json.loads(self._path.read_text())
-        except Exception:
+        except (json.JSONDecodeError, OSError):
+            # Corrupt or unreadable cache → safe to start over with an
+            # empty dict; this is a pure performance cache. Programming
+            # bugs (AttributeError, TypeError) are NOT swallowed — they
+            # propagate so the underlying defect is visible.
             self._data = {}
 
     def get(self, rel_path: str, size: int, mtime_ns: int) -> str | None:

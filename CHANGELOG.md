@@ -4,6 +4,29 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.16] — 2026-05-07
+
+### Fixed
+- **Narrowed broad `except Exception` clauses on six load/best-effort paths.** Catching the bare `Exception` base class hides real coding bugs (`AttributeError`, `TypeError`, `NameError`) as "feature silently does nothing" — by far the hardest class of bug to track down because there's no traceback, no log line, just a behaviour that quietly stops working. Each site now narrows to exactly the exception types its legitimate failure modes can raise; programming bugs propagate normally so they're caught in development instead of in production.
+  - `claude_mirror/hash_cache.py:_load` — narrowed to `(json.JSONDecodeError, OSError)`. Corrupt or unreadable hash cache → start with empty dict (the cache is purely a performance optimisation).
+  - `claude_mirror/manifest.py:_is_safe_relpath` — narrowed to `(ValueError,)`. `Path()` raises `ValueError` on embedded NUL on some platforms; nothing else is expected here.
+  - `claude_mirror/_update_check.py:_resolve_repo_root` — narrowed to `(ImportError, OSError)`. `ImportError` if the package isn't installed; `OSError` if `Path.resolve()` fails (broken symlink, missing dir).
+  - `claude_mirror/_update_check.py:suggested_update_command` — narrowed to `(ImportError, OSError)`. Same shape as `_resolve_repo_root`.
+  - `claude_mirror/_update_check.py:_get_current_version` — narrowed to `(ImportError, LookupError)`. `LookupError` is the parent of `importlib.metadata.PackageNotFoundError`.
+  - `claude_mirror/_update_check.py:_load_cache` — narrowed to `(json.JSONDecodeError, OSError, ValueError)`. JSON parse / file-read / generic decode failure modes only.
+  - `claude_mirror/_update_check.py:_save_cache` — narrowed to `OSError`. mkdir/write_text/os.replace all surface filesystem errors as `OSError`; non-serialisable cache data is a coding bug, not a runtime failure.
+
+### Tests
+- Added `tests/test_load_paths_narrow.py` (6 regression tests pinning the new behaviour):
+  - `test_hash_cache_returns_empty_on_corrupt_json` — malformed cache file is treated as 'no cache yet' (legitimate failure mode still no-ops).
+  - `test_hash_cache_propagates_attribute_error` — a coding bug in `json.loads` is NOT swallowed (the original regression test).
+  - `test_manifest_load_propagates_programming_bugs` — `TypeError` raised inside `_is_safe_relpath` propagates rather than being misread as 'unsafe path'.
+  - `test_update_check_silent_on_network_error` — `URLError` from urllib results in a clean no-op (the foreground command still works offline).
+  - `test_update_check_load_cache_propagates_attribute_error` — coding bug in cache parse propagates out of `_load_cache`.
+  - `test_update_check_load_cache_silent_on_corrupt_json` — `JSONDecodeError` on a corrupt cache file yields `{}` silently.
+
+---
+
 ## [0.5.15] — 2026-05-07
 
 ### Refactored

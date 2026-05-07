@@ -157,7 +157,10 @@ class Manifest:
         # Normalise once and reject if any component is ".."
         try:
             parts = Path(rel_path).parts
-        except Exception:
+        except ValueError:
+            # Path() can raise ValueError on embedded NUL on some platforms
+            # (already filtered above, but keep a defensive narrow catch).
+            # Programming bugs (TypeError, AttributeError) propagate.
             return False
         for part in parts:
             if part in ("..", "\\..", "/.."):

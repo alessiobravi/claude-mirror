@@ -90,7 +90,9 @@ def _resolve_repo_root() -> Optional[Path]:
         if not (repo_root / "pyproject.toml").exists():
             return None
         return repo_root
-    except Exception:
+    except (ImportError, OSError):
+        # ImportError: package not findable; OSError: resolve() failed
+        # (broken symlink, missing dir). Coding bugs propagate.
         return None
 
 
@@ -133,7 +135,9 @@ def suggested_update_command() -> str:
         return (
             f"cd {repo_quoted} && git pull && pipx install -e . --force"
         )
-    except Exception:
+    except (ImportError, OSError):
+        # ImportError: package not findable; OSError: resolve() failed.
+        # Coding bugs propagate.
         return "pipx install -e . --force from your repo dir"
 
 
@@ -143,7 +147,10 @@ def _get_current_version() -> str:
     try:
         from importlib.metadata import version
         return version("claude-mirror")
-    except Exception:
+    except (ImportError, LookupError):
+        # ImportError: importlib.metadata missing (shouldn't on 3.8+);
+        # LookupError: PackageNotFoundError subclass — package not
+        # installed via metadata. Coding bugs propagate.
         return "0.0.0"
 
 
@@ -152,7 +159,10 @@ def _load_cache() -> dict:
     corrupted JSON, permission error, etc.)."""
     try:
         return json.loads(_CACHE_FILE.read_text())
-    except Exception:
+    except (json.JSONDecodeError, OSError, ValueError):
+        # JSONDecodeError: malformed cache; OSError: missing/unreadable
+        # (FileNotFoundError, PermissionError); ValueError: defensive
+        # catch for unusual decode paths. Coding bugs propagate.
         return {}
 
 
@@ -164,7 +174,11 @@ def _save_cache(data: dict) -> None:
         tmp = _CACHE_FILE.with_suffix(_CACHE_FILE.suffix + ".tmp")
         tmp.write_text(json.dumps(data))
         os.replace(tmp, _CACHE_FILE)
-    except Exception:
+    except OSError:
+        # mkdir/write_text/os.replace all raise OSError on filesystem
+        # failure (permission, disk full, missing parent). Best-effort
+        # cache; programming bugs (TypeError from non-serialisable data,
+        # AttributeError) propagate so they're visible.
         pass
 
 

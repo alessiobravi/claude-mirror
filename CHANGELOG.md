@@ -4,6 +4,23 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.23] — 2026-05-07
+
+### Docs
+- **README now leads with status badges** for CI test runs, PyPI version, supported Python versions, and license — gives drive-by visitors immediate signal that the project is maintained, tested, and on a known cadence.
+- **README explicitly advertises the test suite** in a new "Quality gates" paragraph at the top: 214 tests on Python 3.11/3.12/3.13 in parallel, what surfaces are covered, the merge-blocking guarantee, and a pointer to `CONTRIBUTING.md` for run-it-yourself instructions. Closes the gap where readers had no way to gauge code-quality posture without scrolling to the changelog.
+
+### Tests
+- **`test_redact_error_strips_bearer_token` now uses an unambiguously-fake token fixture.** The previous fixture (`Bearer ya29.a0AfH6SMB...`) used the real-world Google access-token prefix `ya29.`, which would trip automated secret scanners (PyPI / GitHub Advanced Security / TruffleHog) into flagging the test file as a leaked credential — even though the suffix was nonsense. New fixture is `Bearer FAKE_TOKEN_NOT_A_REAL_CREDENTIAL_xxx...` which exercises the same redactor regex code path without resembling a real token shape. Test logic is unchanged.
+
+### Privacy audit (no findings)
+- Full repo grep ran across all tracked files for: real Mac/Linux paths (`/Users/<name>`, `/home/<name>`), personal aliases (`claude-aa`), other-project codenames (`Cortex/`, `cortex.yaml`), real `user@machine` slack-style examples, personal email addresses, real-format Drive folder IDs (excluding the well-known Google sample), real internal hostnames, and token-shaped strings. Zero hits remained after the bearer-token fixture rewrite.
+
+### Infrastructure
+- **CI workflow bumped to action versions that support Node.js 24.** GitHub deprecates Node.js 20 from runners on 2026-09-16; from 2026-06-02 actions running on Node 20 emit warnings until forced onto Node 24. Bumped `actions/checkout@v4 → v5` and `actions/setup-python@v5 → v6`. Both new majors are drop-in compatible (same `with:` keys); the only behavioural change is the runtime Node version, which we never depend on directly. Eliminates the warning banner on every CI run.
+
+---
+
 ## [0.5.22] — 2026-05-07
 
 ### Fixed

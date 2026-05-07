@@ -39,11 +39,20 @@ def test_redact_error_strips_home_path():
 
 
 def test_redact_error_strips_bearer_token():
-    """The error redactor strips Bearer tokens."""
+    """The error redactor strips Bearer tokens.
+
+    The fixture below uses a deliberately-non-real string so automated
+    secret scanners (PyPI / GitHub Advanced Security / TruffleHog) don't
+    mis-flag this test file as containing a leaked credential. The
+    redactor's regex only cares about the `Bearer ` prefix + any
+    [A-Za-z0-9._-]+ suffix, so any non-empty alphanumeric tail exercises
+    the same code path that a real ya29.* token would.
+    """
     from claude_mirror.backends import redact_error
-    msg = "401 Unauthorized: Bearer ya29.a0AfH6SMBabc123def456ghi"
+    fake_token = "FAKE_TOKEN_NOT_A_REAL_CREDENTIAL_xxxxxxxxxxxxxxxxxxx"
+    msg = f"401 Unauthorized: Bearer {fake_token}"
     out = redact_error(msg)
-    assert "ya29" not in out
+    assert fake_token not in out
     assert "redacted" in out.lower()
 
 

@@ -1,8 +1,15 @@
 # claude-mirror
 
+[![Tests](https://github.com/alessiobravi/claude-mirror/actions/workflows/test.yml/badge.svg)](https://github.com/alessiobravi/claude-mirror/actions/workflows/test.yml)
+[![PyPI](https://img.shields.io/pypi/v/claude-mirror)](https://pypi.org/project/claude-mirror/)
+[![Python](https://img.shields.io/pypi/pyversions/claude-mirror)](https://pypi.org/project/claude-mirror/)
+[![License](https://img.shields.io/pypi/l/claude-mirror)](https://github.com/alessiobravi/claude-mirror/blob/main/LICENSE)
+
 Sync Claude project MD files across machines via cloud storage, with real-time notifications and snapshot-based disaster recovery.
 
 **Supported backends:** Google Drive, Dropbox, Microsoft OneDrive, and any WebDAV server (Nextcloud, OwnCloud, Apache mod_dav, Synology/QNAP NAS, Box.com, etc.). Each project chooses its own backend independently — different projects on the same machine can use different backends.
+
+**Quality gates:** Every commit and pull request runs **214 automated tests** on Python 3.11, 3.12, and 3.13 in parallel via GitHub Actions — covering the 3-way diff sync core, both snapshot formats, path-traversal safety, conflict resolution, auth flows, all four backends (with HTTP-level mocking), the notifier inbox under concurrent writers, and the watcher daemon's SIGHUP hot-reload. CI must be green before any PR can merge. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the test conventions and how to run them locally.
 
 ---
 

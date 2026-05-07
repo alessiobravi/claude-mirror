@@ -4,15 +4,33 @@ All notable changes to claude-mirror.
 
 ---
 
-## [0.5.20] — 2026-05-07
+## [0.5.21] — 2026-05-07
 
-### Tests
-- **Per-backend round-trip coverage** using HTTP-level mocking. All tests are offline (no real network calls); each runs in <100ms. Part of a coordinated multi-agent push (versions 0.5.17–0.5.19 reserved for parallel work on adjacent test surfaces).
-  - `tests/test_googledrive_backend.py` (12 tests, deeper coverage — Drive is the actively-used backend). Stubs the `googleapiclient.discovery.build` return value with `MagicMock` chains shaped like `service.files().<verb>().execute()`. Covers: token-file write on `authenticate()`; `get_credentials()` load + missing-token RuntimeError; `get_or_create_folder` create-vs-existing dispatch; `resolve_path` walking `a/b/c/file.md` into 3 folder lookups; `upload_file` simple-create vs `update`-with-id branch; `download_file` bytes round-trip via stubbed `MediaIoBaseDownload`; `get_file_hash` md5Checksum extraction; `classify_error` for `RefreshError("invalid_grant")` → AUTH and `HttpError(503)` → TRANSIENT.
-  - `tests/test_dropbox_backend.py` (5 smoke tests, skipped if `dropbox` SDK absent via `pytest.importorskip`). Monkeypatches `dropbox.Dropbox` constructor + `DropboxOAuth2FlowNoRedirect`. Covers: PKCE flow → token file with `app_key` + `refresh_token`; `get_credentials()` round-trips refresh_token into the Dropbox client kwargs; `upload_file` calls `files_upload` exactly once; `download_file` extracts bytes from `(metadata, response)` tuple; `AuthError` → AUTH classification.
-  - `tests/test_onedrive_backend.py` (5 smoke tests, skipped if `msal` absent). Uses `responses` for the `requests.Session` HTTP layer; uses `mock_oauth_msal` fixture for device-code flow. Covers: device-flow → token file with `client_id` + `token_cache`; cached-token load → session with Bearer header; `<4MB` simple PUT to `/me/drive/root:/path:/content`; `>=4MB` chunked upload via `createUploadSession` + `Content-Range` PUT (locks in v0.4.x large-file path); GET-content round-trip.
-  - `tests/test_webdav_backend.py` (5 smoke tests). Uses `responses` to stub PROPFIND/PUT directly. Covers: 207 PROPFIND → token file with username + password; 401 PROPFIND → RuntimeError("Authentication failed"); v0.5.6 https-required guard rejects `http://` URLs unless `webdav_insecure_http=True`; the explicit opt-in flag re-enables `http://`; `upload_file` issues a single PUT to the encoded target URL.
-- **Coverage approach.** Drive is mocked at the discovery-service layer (`unittest.mock.patch` on the build chain) since it uses `httplib2` underneath, not `requests` — too deep to mock at HTTP level. Dropbox is mocked at SDK constructor level. OneDrive + WebDAV use `responses` library at the `requests` transport layer. Total new tests: **27** (12 Drive + 5 Dropbox + 5 OneDrive + 5 WebDAV). Suite goes 74 → 101 tests, runtime stays under 0.3s.
+This release is a coordinated multi-agent test-coverage push. **210 tests** now pass in <1 s; coverage of every major feature surface jumped from ~10% to ~70%. No runtime behaviour change beyond a single import fix in `snapshots.py`.
+
+### Tests added
+- **SyncEngine 3-way diff** (`tests/test_sync_engine.py`, **29 tests**) — full state matrix: no-manifest cells, in-sync, one-side-changed, both-changed/conflict, deletes. push / pull / sync / `_delete_drive_file` end-to-end against an in-memory backend. `force_local=True` skip-resolver pinned with hard-failing monkeypatch.
+- **SnapshotManager** (`tests/test_snapshots.py`, **25 tests**) — both formats (`full` + `blobs`): create / list / restore (incl. `output_path` and per-backend fallback) / forget (specific timestamps, `--keep-last`, `--keep-days`, `--before`) / gc (orphan list + dry-run + apply) / migrate (full↔blobs, idempotent) / history (path-grouped-by-SHA) / inspect (`--paths` filter).
+- **Path-traversal guard** (`tests/test_safe_join.py`, **23 tests**) — security-critical, parametrized over safe paths and traversal attacks (`..` segments at every depth, absolute paths, NUL bytes).
+- **Conflict resolver** (`tests/test_merge_resolver.py`, **13 tests**) — `[L]ocal / [D]rive / [E]ditor / [S]kip` choices, conflict-marker file with `claude_mirror_merge_` prefix, editor invocation via subprocess.
+- **Auth backup-and-restore** (`tests/test_auth_backup_restore.py`, **6 tests**) — regression test for the v0.5.11 fix: token moved to `<token>.pre-reauth.bak`, deleted on success, restored on failure, `--keep-existing` opt-out.
+- **Per-backend round-trip** (`tests/test_googledrive_backend.py` + `test_dropbox_backend.py` + `test_onedrive_backend.py` + `test_webdav_backend.py`, **27 tests**). Drive (12) — `googleapiclient.discovery.build` mocked, covers auth/folders/path-resolve/upload/download/hash/error-classification incl. `RefreshError("invalid_grant")` → AUTH and `HttpError(503)` → TRANSIENT. Dropbox / OneDrive / WebDAV (5 each) — smoke coverage via `mock_oauth_*` fixtures + `responses` HTTP mocking. WebDAV explicitly tests the v0.5.6 https-required guard.
+- **Notifier inbox** (`tests/test_notifier_inbox.py`, **7 tests**) — concurrency-critical. Includes the **TOCTOU regression test** (writer thread + drain loops asserting strict equality, would fail immediately if `read_and_clear_inbox` regressed away from `LOCK_EX`), plus round-trip / multi-write / corrupt-line / unicode / filename invariant.
+- **Watcher daemon** (`tests/test_watcher.py`, **6 tests**) — smoke: one-thread-per-config, dedup, SIGHUP handler registration, `claude-mirror reload` sends SIGHUP via subprocess.
+
+### Fixed
+- **`snapshots.py` was missing a `timedelta` import** (uncovered by `test_forget_keep_days_n`). Any `forget --keep-days=N` or relative `--before=30d` invocation would have raised `NameError`. One-line fix; new test pins it.
+
+### Infrastructure
+- **`.github/workflows/test.yml`** runs the full suite on push and pull request, against Python 3.11 / 3.12 / 3.13 in parallel. CI now blocks merging a PR that fails tests.
+- **`CONTRIBUTING.md`** — layout, fixture conventions, local-run commands, what's expected of PRs.
+- **`pyproject.toml`** dev extras now include `responses>=0.25` for HTTP-level backend mocking.
+- **`tests/conftest.py`** — full `StorageBackend` ABC fake (`FakeStorageBackend`), `NotificationBackend` fake (`FakeNotificationBackend`), and OAuth-flow mock fixtures for all four backends.
+
+### Notes
+- Test files are intentionally NOT shipped to PyPI. The Hatchling wheel build only includes `packages = ["claude_mirror"]`.
+- Two test files (`test_sync_engine.py`, `test_snapshots.py`) build their own `InMemoryBackend` rather than reusing `conftest.FakeStorageBackend` because each needs slightly different semantics. Both work, both pass.
+- Click 8.3 emits a `DeprecationWarning` for `Context.protected_args`; auth + watcher tests use module-level `filterwarnings("ignore::DeprecationWarning")` to coexist with the project-wide `filterwarnings = "error"` setting.
 
 ---
 

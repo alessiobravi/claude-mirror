@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import Enum
@@ -100,24 +101,66 @@ class SyncEngine:
         # Pub/Sub publish futures collected during a command and resolved at the end —
         # avoids inline blocking on broker ack for each event we publish.
         self._pending_publish_futures: list = []
+        # Pre-compile exclude patterns into a single regex + a directory-prefix
+        # tuple. _is_excluded is a hot path: status/push/pull each invoke it
+        # once per local file, so on a 5K-file project with 10 exclude patterns
+        # the old per-pattern fnmatch.fnmatch loop translated into ~150K regex
+        # compilations per command. Doing the compile once here keeps the
+        # per-call cost down to one regex.match plus a startswith-tuple check.
+        # Behaviour matches the legacy three-form match (bare pattern,
+        # pattern + "/*", and rel_path.startswith(pattern + "/")).
+        if config.exclude_patterns:
+            parts: list[str] = []
+            for pattern in config.exclude_patterns:
+                parts.append(fnmatch.translate(pattern))
+                parts.append(fnmatch.translate(f"{pattern}/*"))
+            self._exclude_re: Optional[re.Pattern[str]] = re.compile(
+                "(?:" + "|".join(parts) + ")"
+            )
+            self._exclude_prefixes: tuple[str, ...] = tuple(
+                f"{p}/" for p in config.exclude_patterns
+            )
+        else:
+            self._exclude_re = None
+            self._exclude_prefixes = ()
 
     # ------------------------------------------------------------------
     # File discovery
     # ------------------------------------------------------------------
 
     def _is_excluded(self, rel_path: str) -> bool:
-        """Return True if rel_path matches any exclude pattern."""
-        for pattern in self.config.exclude_patterns:
-            if fnmatch.fnmatch(rel_path, pattern):
-                return True
-            # Also match against each path component so directory patterns work.
-            # e.g. "archive/**" or "archive/*" should exclude "archive/foo.md"
-            if fnmatch.fnmatch(rel_path, f"{pattern}/*") or rel_path.startswith(f"{pattern}/"):
-                return True
-        return False
+        """Return True if rel_path matches any exclude pattern.
+
+        Uses pre-compiled state built in __init__:
+          * self._exclude_re — a single regex union of every exclude pattern
+            in both `pattern` and `pattern/*` forms (matches the first two
+            checks of the legacy implementation).
+          * self._exclude_prefixes — `tuple(f"{p}/" for p in patterns)`, used
+            with str.startswith to mirror the legacy `rel_path.startswith
+            (f"{pattern}/")` check (preserves directory-prefix exclusion for
+            patterns whose own glob form would not otherwise match a nested
+            child path).
+        """
+        if self._exclude_re is None:
+            return False
+        if self._exclude_re.match(rel_path):
+            return True
+        return rel_path.startswith(self._exclude_prefixes)
 
     def _local_files(self) -> list[str]:
-        """Return relative paths of all local files matching configured patterns."""
+        """Return relative paths of all local files matching configured patterns.
+
+        Symlink policy (current behaviour, intentional — do not change here):
+        ``Path.glob()`` follows symbolic links transparently. A symlinked file
+        therefore shows up in the discovery set under its symlink path, and
+        a symlinked directory has its contents traversed exactly like any
+        other directory. Cycles are not detected; pathological symlink loops
+        inside the project tree will deadlock this loop. If we ever switch
+        to non-following semantics (e.g. via ``os.walk(..., followlinks=False)``
+        or an explicit `Path.is_symlink` check), that's a behaviour change
+        and must ship in its own version with a clear migration note —
+        existing users may rely on symlinks resolving today.
+        """
         found = set()
         for pattern in self.config.file_patterns:
             for path in self._project.glob(pattern):

@@ -4,6 +4,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -13,8 +14,10 @@ os.environ.setdefault("GRPC_TRACE", "")
 
 import click
 import google.auth.exceptions
-from rich.console import Console
+from rich.console import Console, Group, RenderableType
+from rich.live import Live
 from rich.table import Table
+from rich.text import Text
 
 from .backends import StorageBackend
 from .backends.googledrive import GoogleDriveBackend
@@ -25,8 +28,8 @@ from .merge import MergeHandler
 from .notifications import NotificationBackend
 from .notifications.pubsub import PubSubNotifier
 from .notifier import Notifier, read_and_clear_inbox
-from .snapshots import SnapshotManager
-from .sync import SyncEngine
+from .snapshots import SnapshotManager, _human_size
+from .sync import Status, STATUS_LABELS, SyncEngine
 
 
 def _get_version() -> str:
@@ -1349,27 +1352,170 @@ def _auth_check(config: Config) -> None:
 
 @cli.command()
 @click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
-@click.option("--short", is_flag=True, default=False, help="Show summary line only, no file table.")
-@click.option("--pending", "pending_only", is_flag=True, default=False,
-              help="Tier 2: show only files that have a non-ok state on any "
-                   "configured mirror backend (pending_retry or failed_perm). "
-                   "Useful for quickly seeing what claude-mirror retry would attempt.")
-def status(config_path: str, short: bool, pending_only: bool) -> None:
-    """Show sync status for all project files."""
+@click.option("--short", is_flag=True, default=False,
+              help="Compact one-line summary instead of the full per-file table.")
+@click.option("--pending", "pending", is_flag=True, default=False,
+              help="Show files with non-ok mirror state (Tier 2 only). Lists "
+                   "entries that are pending_retry or failed_perm on any "
+                   "configured mirror backend — i.e. what `claude-mirror retry` "
+                   "would attempt.")
+@click.option("--watch", "watch_interval", type=click.IntRange(min=1, max=3600), default=None,
+              help="Live-update the status display, refreshing every WATCH "
+                   "seconds (1-3600). Press Ctrl+C to exit. Suggested interval: "
+                   "5 to 30 seconds.")
+def status(config_path: str, short: bool, pending: bool, watch_interval: Optional[int]) -> None:
+    """Show sync status of all configured project files.
+
+    By default, prints a single snapshot of sync state and exits. With
+    --watch N, refreshes the display every N seconds in place using
+    rich.live.Live until the user presses Ctrl+C. Each refresh re-runs
+    the full status computation (local hashing + remote listing), so
+    pick an interval that's high enough to keep that work cheap — 5 to
+    30 seconds is the sweet spot.
+    """
     engine, _, _ = _load_engine(_resolve_config(config_path), with_pubsub=False)
-    if pending_only:
-        _show_pending_status(engine)
+
+    if watch_interval is None:
+        # Snapshot path: render once and exit. Behaviourally identical to
+        # pre-watch versions — the heavy work happens inside the helper.
+        console.print(_build_status_renderable(engine, short=short, pending=pending))
         return
-    engine.show_status(short=short)
+
+    # Watch mode: refresh in place every watch_interval seconds. Each
+    # iteration re-runs engine.get_status() (local hashing + remote listing),
+    # so the user pays N-seconds of compute per cycle for "live" output.
+    # Exit cleanly on Ctrl+C with a friendly message instead of a stack trace.
+    try:
+        with Live(console=console, refresh_per_second=4, screen=False) as live:
+            while True:
+                renderable = _build_status_renderable(engine, short=short, pending=pending)
+                live.update(renderable)
+                time.sleep(watch_interval)
+    except KeyboardInterrupt:
+        console.print("\n[dim]watch stopped[/]")
 
 
-def _show_pending_status(engine) -> None:
+def _build_status_renderable(
+    engine: SyncEngine,
+    *,
+    short: bool,
+    pending: bool,
+) -> RenderableType:
+    """Build a Rich renderable describing the engine's current sync state.
+
+    Used by both the snapshot path of `claude-mirror status` and the
+    watch-mode loop. Heavy work (filesystem walk, remote listing, hash
+    computation) runs once per call; the watch loop pays this cost on
+    every refresh interval, which is the intended trade-off for "live"
+    output.
+
+    Returns a Rich object (Group / Table / Text) that callers can either
+    `console.print(...)` or pass to `Live.update(...)`.
+    """
+    if pending:
+        return _build_pending_renderable(engine)
+
+    states = engine.get_status()
+
+    # Per-file table (omitted in --short mode).
+    parts: list[RenderableType] = []
+    if not short:
+        table = Table(title="Sync Status", show_header=True)
+        table.add_column("File", style="white")
+        table.add_column("Status")
+        table.add_column("Action", style="dim")
+        for s in states:
+            label, action = STATUS_LABELS[s.status]
+            table.add_row(s.rel_path, label, action)
+        parts.append(table)
+
+    # Summary counts line.
+    counts: dict[Status, int] = {}
+    for s in states:
+        counts[s.status] = counts.get(s.status, 0) + 1
+
+    order = [
+        Status.CONFLICT, Status.LOCAL_AHEAD, Status.DRIVE_AHEAD,
+        Status.NEW_LOCAL, Status.NEW_DRIVE, Status.DELETED_LOCAL, Status.IN_SYNC,
+    ]
+    colors = {
+        Status.CONFLICT:      "red",
+        Status.LOCAL_AHEAD:   "cyan",
+        Status.DRIVE_AHEAD:   "blue",
+        Status.NEW_LOCAL:     "cyan",
+        Status.NEW_DRIVE:     "blue",
+        Status.DELETED_LOCAL: "yellow",
+        Status.IN_SYNC:       "green",
+    }
+    labels = {
+        Status.CONFLICT:      "conflict",
+        Status.LOCAL_AHEAD:   "local ahead",
+        Status.DRIVE_AHEAD:   "drive ahead",
+        Status.NEW_LOCAL:     "new local",
+        Status.NEW_DRIVE:     "new on drive",
+        Status.DELETED_LOCAL: "deleted local",
+        Status.IN_SYNC:       "in sync",
+    }
+
+    if not counts:
+        parts.append(Text.from_markup("[dim]No files found.[/]"))
+    elif all(s == Status.IN_SYNC for s in counts):
+        parts.append(Text.from_markup(
+            f"[green]✓ All {counts[Status.IN_SYNC]} file(s) in sync.[/]"
+        ))
+    else:
+        summary_parts = []
+        for status in order:
+            if status in counts:
+                summary_parts.append(
+                    f"[{colors[status]}]{counts[status]} {labels[status]}[/]"
+                )
+        parts.append(Text.from_markup("  " + "  ·  ".join(summary_parts)))
+
+    # Size report — total project size + per-action byte breakdowns.
+    # Pushes count local bytes (what's about to upload), pulls count drive
+    # bytes (what's about to download), and conflicts use whichever side
+    # is bigger so the user sees the largest cost.
+    total_local_bytes = sum(s.local_size or 0 for s in states if s.local_size)
+    total_local_files = sum(1 for s in states if s.local_size is not None)
+    push_bytes = sum(
+        (s.local_size or 0) for s in states
+        if s.status in (Status.LOCAL_AHEAD, Status.NEW_LOCAL)
+    )
+    pull_bytes = sum(
+        (s.drive_size or 0) for s in states
+        if s.status in (Status.DRIVE_AHEAD, Status.NEW_DRIVE)
+    )
+    conflict_bytes = sum(
+        max(s.local_size or 0, s.drive_size or 0)
+        for s in states if s.status == Status.CONFLICT
+    )
+    size_parts: list[str] = []
+    if total_local_files:
+        size_parts.append(
+            f"[dim]project: {total_local_files} file(s), "
+            f"{_human_size(total_local_bytes)}[/]"
+        )
+    if push_bytes:
+        size_parts.append(f"[cyan]↑ {_human_size(push_bytes)}[/]")
+    if pull_bytes:
+        size_parts.append(f"[blue]↓ {_human_size(pull_bytes)}[/]")
+    if conflict_bytes:
+        size_parts.append(f"[red]⚠ {_human_size(conflict_bytes)} (conflict)[/]")
+    if size_parts:
+        parts.append(Text.from_markup("  " + "  ·  ".join(size_parts)))
+
+    return Group(*parts)
+
+
+def _build_pending_renderable(engine: SyncEngine) -> RenderableType:
     """Tier 2: render only files with non-ok mirror state. Helps users
     see what's queued for retry without doing a full status pass."""
     if not engine._mirrors:
-        console.print("[dim]No mirrors configured for this project; "
-                      "no pending state to report.[/]")
-        return
+        return Text.from_markup(
+            "[dim]No mirrors configured for this project; "
+            "no pending state to report.[/]"
+        )
     pending_by_path: dict[str, list[tuple[str, str, str]]] = {}
     for path, fs in engine.manifest.all().items():
         for backend_name, rs in fs.remotes.items():
@@ -1378,8 +1524,9 @@ def _show_pending_status(engine) -> None:
                     (backend_name, rs.state, rs.last_error)
                 )
     if not pending_by_path:
-        console.print("[green]✓ All mirrors are caught up — nothing pending.[/]")
-        return
+        return Text.from_markup(
+            "[green]✓ All mirrors are caught up — nothing pending.[/]"
+        )
     table = Table(show_header=True, header_style="bold",
                   title=f"Pending mirror state ({len(pending_by_path)} file(s))")
     table.add_column("File", style="white")
@@ -1394,9 +1541,12 @@ def _show_pending_status(engine) -> None:
                 f"[{color}]{state}[/]",
                 (last_error or "")[:80],
             )
-    console.print(table)
-    console.print(
-        "\n[dim]Run [bold]claude-mirror retry[/] to re-attempt the pending entries.[/]"
+    return Group(
+        table,
+        Text.from_markup(
+            "\n[dim]Run [bold]claude-mirror retry[/] to re-attempt "
+            "the pending entries.[/]"
+        ),
     )
 
 

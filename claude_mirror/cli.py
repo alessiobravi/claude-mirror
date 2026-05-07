@@ -2029,26 +2029,36 @@ def _build_pending_renderable(engine: SyncEngine) -> RenderableType:
 def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
     """Tier 2: render the per-file table with one column per configured
     backend (primary first, mirrors in mirror_config_paths order). Each
-    cell reflects LIVE remote state + the manifest's recorded state.
+    cell reflects the file's actual sync state on that backend, derived
+    from `engine.get_status()` (which does local hashing + primary remote
+    listing + 3-way diff) PLUS a separate live walk of every mirror.
 
-    This view actively queries every backend (one `list_files_recursive`
-    call per backend) so it catches divergence from the manifest — e.g.
-    a file deleted directly on SFTP via SSH, or a mirror folder wiped by
-    hand. Slower than `--pending` (which is manifest-only) but reflects
-    actual reality.
+    Why use get_status() for the universe instead of `manifest ∪ live`:
+    plain `claude-mirror status` is the gold standard for sync state —
+    it catches local-only files, locally-modified files, drive-ahead
+    files, and conflicts via hash comparison. By-backend MUST give the
+    same answer for the same files; otherwise users see "✓ ok" on a
+    file they know they just edited locally.
 
-    Cell rendering matrix:
-      File present on backend:
-        • manifest state="ok"            → green ✓ ok
-        • manifest state="pending_retry" → yellow ⚠ pending  (last attempt failed transiently)
-        • manifest state="failed_perm"   → red ✗ failed       (last attempt failed permanently)
-        • no manifest entry              → green ✓ ok         (file is there; state will be recorded on next push)
-      File absent on backend:
-        • manifest state="ok"            → red ✗ deleted      (vanished outside claude-mirror — investigate)
-        • manifest state="absent"        → dim · absent       (claude-mirror knows it was deleted)
-        • manifest state="pending_retry" → yellow ⚠ pending   (upload was queued, still missing on remote)
-        • manifest state="failed_perm"   → red ✗ failed
-        • no manifest entry              → yellow ⊘ unseeded  (mirror added after files existed on primary)
+    Cell rendering per backend column:
+      Primary cell — derived from FileSyncState.status (Status enum):
+        IN_SYNC        → green ✓ ok
+        LOCAL_AHEAD    → cyan  ↑ local ahead   (local has unpushed changes)
+        DRIVE_AHEAD    → blue  ↓ drive ahead   (need to pull)
+        NEW_LOCAL      → cyan  + new local      (never pushed)
+        NEW_DRIVE      → blue  + new drive      (only on primary, not local)
+        DELETED_LOCAL  → yellow ✗ deleted local (was synced; gone locally)
+        CONFLICT       → red   ⚠ conflict       (both sides changed)
+
+      Mirror cells — derived from live presence + manifest state, but
+      ALSO consider the primary's status: when the primary is non-IN_SYNC
+      because LOCAL has unpushed/conflicting/new content (LOCAL_AHEAD,
+      NEW_LOCAL, CONFLICT), the mirror inherits the same problem because
+      mirrors are write-replicas of primary — propagate the primary's
+      cell to the mirror so the user sees the issue uniformly across
+      backends. When the primary status is IN_SYNC, fall back to per-
+      mirror live+manifest logic for ok / pending / failed / unseeded /
+      deleted-out-of-band / absent.
     """
     from .snapshots import SNAPSHOTS_FOLDER, BLOBS_FOLDER
 
@@ -2058,18 +2068,17 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
         getattr(b, "backend_name", "") or "mirror" for b in mirrors
     ]
     backend_names = [primary_name] + mirror_names
-    backend_objects = {primary_name: engine.storage}
-    for b, name in zip(mirrors, mirror_names):
-        backend_objects[name] = b
 
-    # Live walk every backend in a multi-row Progress so the user sees
-    # which backend is the bottleneck. Each backend gets its own row.
+    # Phase 1: get authoritative local + primary state via get_status,
+    # PLUS list each mirror in its own progress row so the user can see
+    # which backend is the bottleneck (especially SFTP, which can be
+    # slower than Drive's batched listing).
+    excluded = {SNAPSHOTS_FOLDER, BLOBS_FOLDER, LOGS_FOLDER}
+    live_files: dict[str, set[str]] = {}
+    walk_errors: dict[str, str] = {}
+
     from rich.progress import Progress, SpinnerColumn, TextColumn
     from ._progress import _SharedElapsedColumn
-
-    excluded = {SNAPSHOTS_FOLDER, BLOBS_FOLDER, LOGS_FOLDER}
-    live_files: dict[str, set[str]] = {}        # backend_name -> set of rel_paths
-    walk_errors: dict[str, str] = {}            # backend_name -> error string
 
     with Progress(
         SpinnerColumn(),
@@ -2079,19 +2088,28 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
         console=console,
         transient=True,
     ) as progress:
-        for idx, name in enumerate(backend_names):
-            backend = backend_objects[name]
-            label = f"{name} (primary)" if name == primary_name else name
-            task = progress.add_task(label, total=None,
+        local_task = progress.add_task("Local", total=None,
+                                       detail="starting…", show_time=True)
+        primary_task = progress.add_task(f"{primary_name} (primary)",
+                                         total=None, detail="starting…",
+                                         show_time=False)
+
+        states = engine.get_status(
+            on_local=lambda msg: progress.update(local_task, detail=msg),
+            on_remote=lambda msg: progress.update(primary_task, detail=msg),
+        )
+        progress.remove_task(local_task)
+        progress.remove_task(primary_task)
+
+        for idx, (mirror, name) in enumerate(zip(mirrors, mirror_names)):
+            task = progress.add_task(name, total=None,
                                      detail="listing", show_time=(idx == 0))
             try:
                 folder_id = (
-                    engine._folder_id if name == primary_name
-                    else getattr(backend, "config", None) and backend.config.root_folder
+                    getattr(mirror, "config", None)
+                    and mirror.config.root_folder
                 )
-                if not folder_id and folder_id != "":
-                    raise RuntimeError("backend has no root_folder configured")
-                entries = backend.list_files_recursive(
+                entries = mirror.list_files_recursive(
                     folder_id, exclude_folder_names=excluded,
                 )
                 seen: set[str] = set()
@@ -2099,18 +2117,12 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
                     rel = f.get("relative_path", "")
                     if not rel:
                         continue
-                    # Match the engine's filtering convention from sync.py
-                    # so the by-backend listing matches the user's mental
-                    # model of "the files claude-mirror is responsible for".
                     if rel.startswith("_"):
                         continue
                     if (rel.startswith(f"{SNAPSHOTS_FOLDER}/")
                         or rel.startswith(f"{BLOBS_FOLDER}/")
                         or rel.startswith(f"{LOGS_FOLDER}/")):
                         continue
-                    # Apply exclude_patterns the same way engine.get_status()
-                    # does — otherwise files the user has explicitly excluded
-                    # show up as orphans/unseeded, which is wrong.
                     if engine._is_excluded(rel):
                         continue
                     seen.add(rel)
@@ -2121,36 +2133,44 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
                 live_files[name] = set()
                 progress.update(task, detail=f"[red]error: {walk_errors[name]}[/]")
 
-    # Per-backend tally for the footer.
-    tallies: dict[str, dict[str, int]] = {
-        name: {
-            "ok": 0, "pending": 0, "failed": 0,
-            "unseeded": 0, "absent": 0, "deleted": 0,
-        }
-        for name in backend_names
+    # Map FileSyncState's Status enum to (cell markup, tally key, propagates_to_mirror).
+    # When propagates_to_mirror is True, the mirror cell shows the same
+    # status because the mirror is necessarily in the same boat as the
+    # primary (write-replica). When False, mirrors get their own per-
+    # backend cell from live presence + manifest state.
+    primary_cell_for_status: dict[Status, tuple[str, str, bool]] = {
+        Status.IN_SYNC:        ("[green]✓ ok[/]",            "ok",            False),
+        Status.LOCAL_AHEAD:    ("[cyan]↑ local ahead[/]",    "local_ahead",   True),
+        Status.DRIVE_AHEAD:    ("[blue]↓ drive ahead[/]",    "drive_ahead",   True),
+        Status.NEW_LOCAL:      ("[cyan]+ new local[/]",      "new_local",     True),
+        Status.NEW_DRIVE:      ("[blue]+ new drive[/]",      "new_drive",     True),
+        Status.DELETED_LOCAL:  ("[yellow]✗ deleted local[/]","deleted_local", True),
+        Status.CONFLICT:       ("[red]⚠ conflict[/]",        "conflict",      True),
     }
 
-    def _cell_for(name: str, fs, rel_path: str, *, is_primary: bool) -> tuple[str, str]:
-        """Render one (file, backend) cell from live presence + manifest state."""
-        present_on_remote = rel_path in live_files.get(name, set())
+    # Per-backend tally for the footer.
+    tallies: dict[str, dict[str, int]] = {
+        name: {} for name in backend_names
+    }
+
+    def _bump(name: str, key: str) -> None:
+        tallies[name][key] = tallies[name].get(key, 0) + 1
+
+    def _mirror_cell_when_primary_in_sync(name: str, fs, rel_path: str) -> tuple[str, str]:
+        """Per-mirror cell when the primary says the file is in sync —
+        the mirror's outcome depends on its own live presence + manifest
+        recorded state."""
+        present = rel_path in live_files.get(name, set())
         rs = fs.remotes.get(name) if fs else None
         manifest_state = rs.state if rs else None
-
-        if present_on_remote:
-            # File IS on the backend. Manifest state nuances how we describe it.
+        if present:
             if manifest_state == "pending_retry":
                 return ("[yellow]⚠ pending[/]", "pending")
             if manifest_state == "failed_perm":
                 return ("[red]✗ failed[/]", "failed")
-            # ok / absent / None all collapse to "✓ ok" because the file
-            # is verifiably there right now, regardless of what the
-            # manifest thought (e.g. legacy v1/v2 entries with no remotes).
             return ("[green]✓ ok[/]", "ok")
-
-        # File is NOT on the backend right now.
+        # Not present on mirror.
         if manifest_state == "ok":
-            # Manifest says we successfully uploaded but the backend
-            # disagrees — out-of-band deletion. Surface loudly.
             return ("[red]✗ deleted[/]", "deleted")
         if manifest_state == "absent":
             return ("[dim]· absent[/]", "absent")
@@ -2158,11 +2178,6 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
             return ("[yellow]⚠ pending[/]", "pending")
         if manifest_state == "failed_perm":
             return ("[red]✗ failed[/]", "failed")
-        # No manifest entry AND not present remotely.
-        if is_primary and fs and fs.synced_hash:
-            # Edge: legacy manifest with synced_hash but no live presence
-            # — primary deleted the file outside claude-mirror's view.
-            return ("[red]✗ deleted[/]", "deleted")
         return ("[yellow]⊘ unseeded[/]", "unseeded")
 
     table = Table(
@@ -2174,16 +2189,7 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
         suffix = " [dim](primary)[/]" if name == primary_name else ""
         table.add_column(f"{name}{suffix}", justify="left")
 
-    # Universe of paths to render: union of manifest entries + every
-    # file actually present on any backend. Catches files that exist
-    # on a mirror but not in the manifest (rare — typically means a
-    # restore was done out of band — but worth surfacing).
-    files = engine.manifest.all()
-    all_paths: set[str] = set(files.keys())
-    for seen in live_files.values():
-        all_paths |= seen
-
-    if not all_paths:
+    if not states and not any(live_files.values()):
         if walk_errors:
             error_lines = "\n".join(
                 f"  [red]✗[/] {name}: {err}"
@@ -2193,23 +2199,85 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
                 "[yellow]Could not list any backend.[/]\n" + error_lines
             )
         return Text.from_markup(
-            "[dim]No files tracked in the manifest yet and nothing on "
-            "any backend — push something first.[/]"
+            "[dim]No files tracked yet — push something first.[/]"
         )
 
-    for path in sorted(all_paths):
-        fs = files.get(path)
-        row_cells: list[str] = [path]
-        for name in backend_names:
-            cell, tally_key = _cell_for(
-                name, fs, path, is_primary=(name == primary_name),
-            )
-            row_cells.append(cell)
-            tallies[name][tally_key] += 1
+    manifest_files = engine.manifest.all()
+    # Universe is the FileSyncState list (covers local + primary). Mirror-
+    # only files (rare — would be a file present on mirror but missing
+    # from primary AND from local) are tracked separately so they don't
+    # get lost. We add them as extra rows below the get_status set.
+    state_paths: set[str] = {s.rel_path for s in states}
+    mirror_only: set[str] = set()
+    for name in mirror_names:
+        for path in live_files.get(name, set()):
+            if path not in state_paths:
+                mirror_only.add(path)
+
+    for s in sorted(states, key=lambda x: x.rel_path):
+        fs = manifest_files.get(s.rel_path)
+        primary_cell, primary_key, propagates = primary_cell_for_status.get(
+            s.status, (f"[dim]{s.status.name}[/]", "ok", False),
+        )
+        row_cells: list[str] = [s.rel_path, primary_cell]
+        _bump(primary_name, primary_key)
+        for name in mirror_names:
+            if propagates:
+                # Primary is non-IN_SYNC due to local divergence — the
+                # mirror is necessarily in the same state because mirrors
+                # follow the primary's content.
+                row_cells.append(primary_cell)
+                _bump(name, primary_key)
+            else:
+                cell, key = _mirror_cell_when_primary_in_sync(
+                    name, fs, s.rel_path,
+                )
+                row_cells.append(cell)
+                _bump(name, key)
         table.add_row(*row_cells)
 
-    # Per-backend health footer — one line per backend, showing counts
-    # of each state and an emoji summarizing overall health.
+    # Mirror-only orphan files: present on a mirror, not on primary, not
+    # local. Render them as "✗ orphan" on each backend that has them.
+    # These typically come from old restores or out-of-band uploads.
+    for path in sorted(mirror_only):
+        row_cells = [f"{path} [dim](mirror-only)[/]", "[dim]· absent[/]"]
+        _bump(primary_name, "absent")
+        for name in mirror_names:
+            if path in live_files.get(name, set()):
+                row_cells.append("[red]✗ orphan[/]")
+                _bump(name, "orphan")
+            else:
+                row_cells.append("[dim]· absent[/]")
+                _bump(name, "absent")
+        table.add_row(*row_cells)
+
+    # Per-backend health footer.
+    health_priority = ("conflict", "failed", "deleted", "orphan",
+                       "pending", "local_ahead", "drive_ahead",
+                       "new_local", "new_drive", "deleted_local",
+                       "unseeded", "absent", "ok")
+    color_for_key = {
+        "ok":            "green",
+        "pending":       "yellow",
+        "failed":        "red",
+        "deleted":       "red",
+        "orphan":        "red",
+        "unseeded":      "yellow",
+        "absent":        "dim",
+        "local_ahead":   "cyan",
+        "drive_ahead":   "blue",
+        "new_local":     "cyan",
+        "new_drive":     "blue",
+        "deleted_local": "yellow",
+        "conflict":      "red",
+    }
+    label_for_key = {
+        "local_ahead":   "local ahead",
+        "drive_ahead":   "drive ahead",
+        "new_local":     "new local",
+        "new_drive":     "new drive",
+        "deleted_local": "deleted local",
+    }
     summary_lines: list[str] = []
     for name in backend_names:
         if name in walk_errors:
@@ -2221,15 +2289,19 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
             continue
         t = tallies[name]
         bits: list[str] = []
-        if t["ok"]:        bits.append(f"[green]{t['ok']} ok[/]")
-        if t["pending"]:   bits.append(f"[yellow]{t['pending']} pending[/]")
-        if t["failed"]:    bits.append(f"[red]{t['failed']} failed[/]")
-        if t["deleted"]:   bits.append(f"[red]{t['deleted']} deleted[/]")
-        if t["unseeded"]:  bits.append(f"[yellow]{t['unseeded']} unseeded[/]")
-        if t["absent"]:    bits.append(f"[dim]{t['absent']} absent[/]")
-        if t["failed"] or t["deleted"]:
+        for key in health_priority:
+            n = t.get(key, 0)
+            if not n:
+                continue
+            color = color_for_key.get(key, "white")
+            label = label_for_key.get(key, key)
+            bits.append(f"[{color}]{n} {label}[/]")
+        # Health emoji.
+        if any(t.get(k) for k in ("conflict", "failed", "deleted", "orphan")):
             health = "[red]✗[/]"
-        elif t["pending"] or t["unseeded"]:
+        elif any(t.get(k) for k in ("pending", "unseeded", "local_ahead",
+                                    "drive_ahead", "new_local", "new_drive",
+                                    "deleted_local")):
             health = "[yellow]⚠[/]"
         else:
             health = "[green]✓[/]"

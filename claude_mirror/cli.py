@@ -439,15 +439,43 @@ class _CLIGroup(click.Group):
                 check_for_update(notify_desktop=False)
             except Exception:
                 pass  # never let update-check break a command
+        # When the user explicitly invokes `auth`, every "fix: run claude-mirror auth"
+        # message below would be a logical infinite-loop ("you ran auth; to fix it,
+        # run auth"). Detect that case once and route to a different diagnostic.
+        is_auth_cmd = (sub_cmd == "auth")
+
+        def _auth_fix_hint() -> str:
+            return (
+                "[yellow]Fix:[/] run [bold]claude-mirror auth[/] to reauthenticate."
+                if not is_auth_cmd
+                else "[yellow]The OAuth flow itself failed.[/] Things to check:\n"
+                     "  • Network reachability of accounts.google.com / oauth2.googleapis.com\n"
+                     "  • That your [bold]credentials_file[/] (OAuth client JSON) is valid and unrevoked\n"
+                     "  • That the local OAuth callback can bind to a free port\n"
+                     "  • Re-run with [bold]CLAUDE_MIRROR_AUTH_VERBOSE=1[/] for refresh-attempt logs\n"
+                     "  • If running on a headless machine, set up a port-forwarded OAuth flow"
+            )
+
         try:
             return super().invoke(ctx)
         except google.auth.exceptions.RefreshError as e:
-            console.print(
-                "\n[red bold]Authentication error:[/] your Google token has "
-                "expired or been revoked.\n"
-                f"[dim]{_sanitise_auth_msg(str(e))}[/]\n\n"
-                "[yellow]Fix:[/] run [bold]claude-mirror auth[/] to reauthenticate."
-            )
+            if is_auth_cmd:
+                # User is already running `auth`. The auth command moves the old
+                # token aside before calling authenticate(), so a RefreshError
+                # here means the OAuth flow itself triggered a refresh somehow —
+                # genuinely unusual. Surface the raw error.
+                console.print(
+                    "\n[red bold]OAuth flow failed during a refresh step:[/]\n"
+                    f"[dim]{_sanitise_auth_msg(str(e))}[/]\n\n"
+                    + _auth_fix_hint()
+                )
+            else:
+                console.print(
+                    "\n[red bold]Authentication error:[/] your Google token has "
+                    "expired or been revoked.\n"
+                    f"[dim]{_sanitise_auth_msg(str(e))}[/]\n\n"
+                    + _auth_fix_hint()
+                )
             sys.exit(1)
         except google.auth.exceptions.TransportError as e:
             console.print(
@@ -465,27 +493,40 @@ class _CLIGroup(click.Group):
             console.print(
                 "\n[red bold]Authentication setup is missing or stale.[/]\n"
                 f"[dim]{_sanitise_auth_msg(str(e))}[/]\n\n"
-                "[yellow]Fix:[/] run [bold]claude-mirror auth[/] to set up or "
-                "refresh authentication for this project."
+                + (
+                    "[yellow]Fix:[/] run [bold]claude-mirror auth[/] to set up or "
+                    "refresh authentication for this project."
+                    if not is_auth_cmd
+                    else _auth_fix_hint()
+                )
             )
             sys.exit(1)
         except google.auth.exceptions.GoogleAuthError as e:
             # Catch-all for any other google.auth subclass not handled above
-            # (UserAccessTokenError, ReauthFailError, etc.). Same advice
-            # always applies for claude-mirror: re-run `claude-mirror auth`.
+            # (UserAccessTokenError, ReauthFailError, etc.).
             console.print(
                 "\n[red bold]Authentication error:[/]\n"
                 f"[dim]{_sanitise_auth_msg(str(e))}[/]\n\n"
-                "[yellow]Fix:[/] run [bold]claude-mirror auth[/] to reauthenticate."
+                + _auth_fix_hint()
             )
             sys.exit(1)
         except RuntimeError as e:
             msg = str(e)
             if any(kw in msg.lower() for kw in _AUTH_KEYWORDS):
-                console.print(
-                    f"\n[red bold]Authentication error:[/] {_sanitise_auth_msg(msg)}\n\n"
-                    "[yellow]Fix:[/] run [bold]claude-mirror auth[/] to reauthenticate."
-                )
+                if is_auth_cmd:
+                    # Auth command itself raised an auth-keyword RuntimeError —
+                    # likely an OAuth flow error (Dropbox flow.finish, OneDrive
+                    # device flow, WebDAV 401 on test connection). Surface it
+                    # verbatim with diagnostic hints, NOT the run-auth loop.
+                    console.print(
+                        f"\n[red bold]OAuth flow failed:[/] {_sanitise_auth_msg(msg)}\n\n"
+                        + _auth_fix_hint()
+                    )
+                else:
+                    console.print(
+                        f"\n[red bold]Authentication error:[/] {_sanitise_auth_msg(msg)}\n\n"
+                        + _auth_fix_hint()
+                    )
                 sys.exit(1)
             raise
         except FileNotFoundError as e:
@@ -505,7 +546,13 @@ class _CLIGroup(click.Group):
             if any(kw in msg.lower() for kw in ("credentials", "token")):
                 console.print(
                     f"\n[red bold]Credentials file not found:[/] {msg}\n\n"
-                    "[yellow]Fix:[/] run [bold]claude-mirror auth[/] to set up authentication."
+                    + (
+                        "[yellow]Fix:[/] run [bold]claude-mirror auth[/] to set up authentication."
+                        if not is_auth_cmd
+                        else "[yellow]Cause:[/] the [bold]credentials_file[/] in your config "
+                             "points at a path that doesn't exist on disk. Verify the path "
+                             "and re-run [bold]claude-mirror auth[/]."
+                    )
                 )
                 sys.exit(1)
             raise
@@ -1104,19 +1151,59 @@ def init(
               help="Diagnostic mode: don't re-auth, just inspect the saved token "
                    "and try a refresh, reporting expiry / scopes / refresh result. "
                    "Useful for diagnosing why tokens 'expire' more often than expected.")
-def auth(config_path: str, check: bool) -> None:
-    """Authenticate with the configured storage backend via OAuth2.
+@click.option("--keep-existing", is_flag=True, default=False,
+              help="Try to refresh the existing token first; only run a fresh "
+                   "OAuth flow if refresh fails. Default behaviour is to replace "
+                   "any existing token with a brand-new OAuth flow — running "
+                   "`claude-mirror auth` should always end with a working token, "
+                   "regardless of the prior state.")
+def auth(config_path: str, check: bool, keep_existing: bool) -> None:
+    """Authenticate with the configured storage backend.
 
-    With --check, runs a non-destructive diagnostic on the existing token
-    instead of starting a new browser flow.
+    Default behaviour (since 0.5.11): the existing token file is moved aside
+    BEFORE the OAuth flow runs, so a stale / partially-revoked / corrupted
+    token can never short-circuit a re-auth attempt. If the OAuth flow fails
+    for any reason, the original token is restored and the error surfaces
+    cleanly — running `claude-mirror auth` is therefore always a safe action.
+
+    --check runs a non-destructive diagnostic on the existing token without
+    starting a new flow.
+    --keep-existing skips the move-aside step (refresh-then-fallback semantics
+    of older versions) — useful for diagnosing whether refresh works.
     """
+    import shutil as _shutil
     config = Config.load(_resolve_config(config_path))
     if check:
         _auth_check(config)
         return
 
-    storage = _create_storage(config)
-    creds = storage.authenticate()
+    # Move existing token aside so the backend's authenticate() sees no
+    # cached credential and goes straight to the interactive OAuth flow.
+    # Restore on any failure — never leave the user worse off than before.
+    token_path = Path(config.token_file)
+    backup_path: Optional[Path] = None
+    if token_path.exists() and not keep_existing:
+        backup_path = token_path.with_suffix(token_path.suffix + ".pre-reauth.bak")
+        _shutil.move(str(token_path), str(backup_path))
+
+    try:
+        storage = _create_storage(config)
+        creds = storage.authenticate()
+    except BaseException:
+        # OAuth flow failed (Ctrl-C, network, browser error, bad credentials_file).
+        # Restore the prior token state so the user can retry without losing
+        # whatever (possibly broken but at least known) state they had.
+        if backup_path and backup_path.exists() and not token_path.exists():
+            _shutil.move(str(backup_path), str(token_path))
+        raise
+
+    # OAuth succeeded — backup is no longer needed.
+    if backup_path and backup_path.exists():
+        try:
+            backup_path.unlink()
+        except OSError:
+            pass  # leave it; harmless
+
     console.print("[green]Authentication successful.[/]")
 
     # Set up notification backend

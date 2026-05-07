@@ -768,6 +768,33 @@ claude-mirror pull memory/notes.md --output ~/.local/tmp/claude-mirror/preview
 
 Files are written to `<output-dir>/<relative-path>`. Your local project is untouched and the manifest is not updated. The Claude Code skill uses this automatically when merging remote and session changes.
 
+### Compare local vs remote for a single file
+
+Before deciding to push, pull, or merge, you can see exactly what differs:
+
+```bash
+claude-mirror diff memory/CLAUDE.md
+```
+
+`diff` prints a colorized unified diff (remote → local). Green `+` lines are what would be pushed; red `-` lines are what would be pulled. Hunk headers (`@@`) and `--- remote` / `+++ local` headers match standard `git diff` style, so the output is usable with any tool that consumes unified diffs.
+
+The path argument accepts either a project-relative path (`memory/CLAUDE.md`) or an absolute path inside the project root (`/Users/me/work/proj/memory/CLAUDE.md`); absolute paths outside the project are rejected up-front. Adjust context with `--context N` (default 3, max 200):
+
+```bash
+claude-mirror diff memory/CLAUDE.md --context 8
+```
+
+`diff` handles every state combination cleanly:
+
+- **both sides differ** — full unified diff with `@@` hunk headers
+- **only on local** — every line shown as added (would be pushed)
+- **only on remote** — every line shown as deleted (would be pulled)
+- **identical** — single "in sync" message, exit 0
+- **binary file** — refused with a one-line note rather than rendering garbage
+- **missing on both sides** — clear error, exit 1
+
+`diff` is read-only — it never modifies local or remote state.
+
 ### Full bidirectional sync
 
 ```bash
@@ -983,6 +1010,44 @@ claude-mirror gc --delete
 ```
 
 to reclaim the orphaned blob space.
+
+### Auto-pruning by retention policy
+
+`forget` is the precise, single-selector tool. For ongoing housekeeping you can declare a **retention policy** in the project YAML and let `claude-mirror push` keep the snapshot set trimmed automatically:
+
+```yaml
+# in your project YAML — every field defaults to 0 (= disabled)
+keep_last:    7          # always keep the 7 newest snapshots
+keep_daily:   14         # plus one snapshot per day for the last 14 days
+keep_monthly: 12         # plus one snapshot per month for the last 12 months
+keep_yearly:  5          # plus one snapshot per year for the last 5 years
+```
+
+Each field is independent — the **union** of every selector's keep-set is retained. The example above keeps "newest 7 + one per day for 2 weeks + one per month for a year + one per year for 5 years"; everything outside that union is pruned. Within each bucket the **newest** snapshot wins (e.g. with three snapshots on 2026-05-07, only the latest counts toward `keep_daily`).
+
+Behaviour with retention enabled:
+
+- After every successful `claude-mirror push`, the engine runs the prune automatically and prints a deletion summary.
+- Setting the YAML field IS the consent — no extra confirmation prompt fires for the auto-prune path. (Each field is opt-in and defaults to 0.)
+- For `blobs`-format snapshots, follow up with `claude-mirror gc --delete` to reclaim the orphaned blob space (the auto-prune doesn't run gc itself; see "Delete old snapshots" above for why).
+
+You can also run the same policy by hand without waiting for a push, or one-off without changing the YAML:
+
+```bash
+# dry-run with the YAML's policy — shows what would be deleted
+claude-mirror prune
+
+# apply the YAML's policy
+claude-mirror prune --delete
+
+# non-interactive — for cron / CI
+claude-mirror prune --delete --yes
+
+# one-off override — does NOT modify the YAML
+claude-mirror prune --keep-last 5 --keep-monthly 12 --delete --yes
+```
+
+`prune` is dry-run by default and requires both `--delete` AND a typed `YES` confirmation (or `--yes` for non-interactive use) — same safety contract as `forget` and `gc`. Any `--keep-*` flag overrides the corresponding config field for that one run only.
 
 ### Search the archive for a file's version history
 
@@ -1524,8 +1589,10 @@ You can ask Claude to run any operation in natural language:
 | "push my changes" | `claude-mirror push --config ...` |
 | "pull the latest" | preview via `pull --output ~/.local/tmp/claude-mirror/preview`, merge, then push |
 | "sync everything" | `claude-mirror sync --config ...` |
+| "what's different in this file?" | `claude-mirror diff <path> --config ...` |
 | "show me the snapshots" | `claude-mirror snapshots --config ...` |
 | "restore to 10:30 this morning" | `claude-mirror restore 2026-03-05T10-30-00Z --output ~/.local/tmp/claude-mirror/review --config ...` |
+| "clean up old snapshots" | `claude-mirror prune --config ...` (dry-run, then `--delete --yes` to apply) |
 | "what changed recently" | `claude-mirror log --config ...` |
 | "check for notifications" | `claude-mirror inbox --config ...` |
 
@@ -1635,6 +1702,13 @@ file_patterns:
   - "**/*.md"
 machine_name: workstation
 user: alice
+# Optional: snapshot retention policy. Each field defaults to 0 (= disabled).
+# Union of every selector's keep-set is retained; everything else is pruned
+# automatically after each successful `claude-mirror push`.
+keep_last:    7      # always keep the 7 newest snapshots
+keep_daily:   14     # plus one snapshot per day for the last 14 days
+keep_monthly: 12     # plus one snapshot per month for the last 12 months
+keep_yearly:  5      # plus one snapshot per year for the last 5 years
 ```
 
 ### Dropbox

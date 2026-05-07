@@ -39,6 +39,21 @@ class Config:
     # closed LAN test setups; never set this on a config that talks to
     # a public server.
     webdav_insecure_http: bool = False
+    # SFTP-specific (v0.5.33+)
+    sftp_host: str = ""
+    sftp_port: int = 22
+    sftp_username: str = ""
+    # Authentication: prefer sftp_key_file (path to private key, ~ expanded);
+    # sftp_password is fallback only and should be reserved for closed LAN
+    # test setups — claude-mirror doctor warns when it's set in YAML.
+    sftp_key_file: str = ""
+    sftp_password: str = ""
+    sftp_known_hosts_file: str = "~/.ssh/known_hosts"
+    # Set False only for one-shot test setups; leaving this True (default)
+    # means an unrecognised host fingerprint aborts the connection with
+    # ErrorClass.AUTH rather than silently trusting a possible MITM.
+    sftp_strict_host_check: bool = True
+    sftp_folder: str = ""  # absolute path on server, e.g. "/home/alice/claude-mirror/myproject"
     poll_interval: int = 30    # seconds between polling checks (WebDAV, OneDrive)
     # Slack notifications (optional, per-project)
     slack_enabled: bool = False
@@ -176,6 +191,8 @@ class Config:
             return ""  # OneDrive uses path-based Graph API; paths are relative to onedrive_folder
         if self.backend == "webdav":
             return ""  # WebDAV uses the base URL directly; paths are relative
+        if self.backend == "sftp":
+            return self.sftp_folder
         return self.drive_folder_id
 
     @property

@@ -47,6 +47,7 @@ dependencies = [
     "google-api-python-client>=2.100",
     "google-cloud-pubsub>=2.18",
     "plyer>=2.1",
+    "paramiko>=3.0",   # SFTP backend (always installed — see [project.optional-dependencies] for back-compat aliases)
     "dropbox>=12.0",   # Dropbox backend (always installed — see [project.optional-dependencies] for back-compat aliases)
     "msal>=1.24",      # OneDrive backend (always installed — see [project.optional-dependencies] for back-compat aliases)
 ]

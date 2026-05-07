@@ -148,6 +148,9 @@ def _create_storage(config: Config) -> StorageBackend:
     if backend == "webdav":
         from .backends.webdav import WebDAVBackend
         return WebDAVBackend(config)
+    if backend == "sftp":
+        from .backends.sftp import SFTPBackend
+        return SFTPBackend(config)
     raise ValueError(f"Unknown storage backend: {backend}")
 
 

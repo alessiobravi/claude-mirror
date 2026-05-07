@@ -1599,11 +1599,18 @@ def _auth_check(config: Config) -> None:
                    "entries that are pending_retry or failed_perm on any "
                    "configured mirror backend — i.e. what `claude-mirror retry` "
                    "would attempt.")
+@click.option("--by-backend", "by_backend", is_flag=True, default=False,
+              help="Tier 2: render the per-file table with one column "
+                   "per configured backend (primary first, mirrors in "
+                   "mirror_config_paths order). Each cell shows that "
+                   "backend's recorded state for the file: ok, pending, "
+                   "failed, unseeded, or absent. The 'is everything in "
+                   "sync on every mirror?' view at a glance.")
 @click.option("--watch", "watch_interval", type=click.IntRange(min=1, max=3600), default=None,
               help="Live-update the status display, refreshing every WATCH "
                    "seconds (1-3600). Press Ctrl+C to exit. Suggested interval: "
                    "5 to 30 seconds.")
-def status(config_path: str, short: bool, pending: bool, watch_interval: Optional[int]) -> None:
+def status(config_path: str, short: bool, pending: bool, by_backend: bool, watch_interval: Optional[int]) -> None:
     """Show sync status of all configured project files.
 
     By default, prints a single snapshot of sync state and exits. With
@@ -1612,7 +1619,18 @@ def status(config_path: str, short: bool, pending: bool, watch_interval: Optiona
     the full status computation (local hashing + remote listing), so
     pick an interval that's high enough to keep that work cheap — 5 to
     30 seconds is the sweet spot.
+
+    --pending and --by-backend are mutually exclusive views; passing
+    both at once errors out cleanly.
     """
+    if pending and by_backend:
+        console.print(
+            "[red]--pending and --by-backend are mutually exclusive.[/] "
+            "Pick one: --pending shows ONLY non-OK / unseeded entries; "
+            "--by-backend shows the FULL per-file table with one column "
+            "per backend."
+        )
+        sys.exit(1)
     engine, _, _ = _load_engine(_resolve_config(config_path), with_pubsub=False)
 
     if watch_interval is None:
@@ -1622,7 +1640,8 @@ def status(config_path: str, short: bool, pending: bool, watch_interval: Optiona
         # folder(s), 312 file(s)" updating live during the scan, rather
         # than a silent pause followed by a finished table.
         console.print(_build_status_renderable(
-            engine, short=short, pending=pending, with_progress=True,
+            engine, short=short, pending=pending,
+            by_backend=by_backend, with_progress=True,
         ))
         return
 
@@ -1637,7 +1656,8 @@ def status(config_path: str, short: bool, pending: bool, watch_interval: Optiona
         with Live(console=console, refresh_per_second=4, screen=False) as live:
             while True:
                 renderable = _build_status_renderable(
-                    engine, short=short, pending=pending, with_progress=False,
+                    engine, short=short, pending=pending,
+                    by_backend=by_backend, with_progress=False,
                 )
                 live.update(renderable)
                 _status_watch_sleep(watch_interval)
@@ -1663,6 +1683,7 @@ def _build_status_renderable(
     *,
     short: bool,
     pending: bool,
+    by_backend: bool = False,
     with_progress: bool = False,
 ) -> RenderableType:
     """Build a Rich renderable describing the engine's current sync state.
@@ -1684,6 +1705,9 @@ def _build_status_renderable(
     """
     if pending:
         return _build_pending_renderable(engine)
+
+    if by_backend:
+        return _build_status_by_backend_renderable(engine)
 
     if with_progress:
         # Mirrors the original engine.show_status() phase progress: two
@@ -1892,6 +1916,115 @@ def _build_pending_renderable(engine: SyncEngine) -> RenderableType:
             "[green]✓ All mirrors are caught up — nothing pending or unseeded.[/]"
         )
     return Group(*parts)
+
+
+def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
+    """Tier 2: render the per-file table with one column per configured
+    backend (primary first, mirrors in mirror_config_paths order). Each
+    cell shows that backend's recorded state for the file.
+
+    Cell rendering matrix (driven by FileState.remotes[backend_name]):
+      • RemoteState present, state="ok"            → green ✓ ok
+      • RemoteState present, state="pending_retry" → yellow ⚠ pending
+      • RemoteState present, state="failed_perm"   → red ✗ failed
+      • RemoteState present, state="absent"        → dim · absent
+      • RemoteState absent (no entry):
+          - on PRIMARY when synced_hash is set     → green ✓ ok
+            (legacy v1/v2 manifest entries — primary state was tracked
+             via flat fields rather than remotes; treat as in-sync)
+          - on a MIRROR                            → yellow ⊘ unseeded
+            (mirror was added after files already existed on primary;
+             run `claude-mirror seed-mirror --backend NAME` to populate)
+    """
+    primary_name = getattr(engine.storage, "backend_name", "") or "primary"
+    mirror_names = [
+        getattr(b, "backend_name", "") or "mirror"
+        for b in engine._mirrors
+    ]
+    backend_names = [primary_name] + mirror_names
+
+    # Per-backend tally for the footer.
+    tallies: dict[str, dict[str, int]] = {
+        name: {"ok": 0, "pending": 0, "failed": 0, "unseeded": 0, "absent": 0}
+        for name in backend_names
+    }
+
+    def _cell_for(name: str, fs, *, is_primary: bool) -> tuple[str, str]:
+        """Return (rendered_cell_markup, tally_key) for one (file, backend)."""
+        rs = fs.remotes.get(name) if fs else None
+        if rs is None:
+            if is_primary and fs and fs.synced_hash:
+                # Legacy manifest — primary state implicit via flat fields.
+                return ("[green]✓ ok[/]", "ok")
+            if is_primary:
+                # No state at all on primary AND no synced_hash — file
+                # has been seen but never confirmed synced. Rare; show
+                # as unseeded so it surfaces.
+                return ("[yellow]⊘ unseeded[/]", "unseeded")
+            return ("[yellow]⊘ unseeded[/]", "unseeded")
+        if rs.state == "ok":
+            return ("[green]✓ ok[/]", "ok")
+        if rs.state == "pending_retry":
+            return ("[yellow]⚠ pending[/]", "pending")
+        if rs.state == "failed_perm":
+            return ("[red]✗ failed[/]", "failed")
+        if rs.state == "absent":
+            return ("[dim]· absent[/]", "absent")
+        return (f"[dim]{rs.state}[/]", "ok")  # forward-compat unknown states
+
+    table = Table(
+        show_header=True, header_style="bold",
+        title=f"Sync Status (per backend)",
+    )
+    table.add_column("File", style="white", overflow="fold")
+    for name in backend_names:
+        is_primary = (name == primary_name)
+        suffix = " [dim](primary)[/]" if is_primary else ""
+        table.add_column(f"{name}{suffix}", justify="left")
+
+    files = engine.manifest.all()
+    if not files:
+        return Text.from_markup(
+            "[dim]No files tracked in the manifest yet — push something "
+            "first.[/]"
+        )
+
+    for path in sorted(files.keys()):
+        fs = files[path]
+        row_cells: list[str] = [path]
+        for name in backend_names:
+            cell, tally_key = _cell_for(
+                name, fs, is_primary=(name == primary_name),
+            )
+            row_cells.append(cell)
+            tallies[name][tally_key] += 1
+        table.add_row(*row_cells)
+
+    # Per-backend health footer — one line per backend, showing counts
+    # of each state and an emoji summarizing overall health.
+    summary_lines: list[str] = []
+    for name in backend_names:
+        t = tallies[name]
+        bits: list[str] = []
+        if t["ok"]:        bits.append(f"[green]{t['ok']} ok[/]")
+        if t["pending"]:   bits.append(f"[yellow]{t['pending']} pending[/]")
+        if t["failed"]:    bits.append(f"[red]{t['failed']} failed[/]")
+        if t["unseeded"]:  bits.append(f"[yellow]{t['unseeded']} unseeded[/]")
+        if t["absent"]:    bits.append(f"[dim]{t['absent']} absent[/]")
+        # Health emoji: only ok = ✓; any pending/unseeded = ⚠; any failed = ✗.
+        if t["failed"]:
+            health = "[red]✗[/]"
+        elif t["pending"] or t["unseeded"]:
+            health = "[yellow]⚠[/]"
+        else:
+            health = "[green]✓[/]"
+        suffix = " [dim](primary)[/]" if name == primary_name else ""
+        summary_lines.append(
+            f"  {health} [bold]{name}[/]{suffix} · " + " · ".join(bits or ["[dim]empty[/]"])
+        )
+
+    summary = Text.from_markup("\n".join(summary_lines))
+    return Group(table, Text(""), summary)
 
 
 @cli.command()

@@ -22,6 +22,12 @@ Two bug fixes for the v0.5.33 SFTP / Tier 2 surface, both surfaced by real-world
 - New `Manifest.unseeded_for_backend(backend_name)` helper — symmetric with the existing `pending_for_backend` — returns the unseeded set without iterating the dict at every call site.
 - 10 new tests in `tests/test_seed_mirror.py` cover happy-path upload, idempotent re-run, drift detection skip, dry-run no-op, unknown-backend ValueError, no-mirrors-configured early exit, and the `status --pending` integration.
 
+### Added — `claude-mirror status --by-backend` (positive per-backend visibility)
+- New flag on the `status` command: render the per-file table with one column per configured backend (primary first, mirrors in `mirror_config_paths` order). Each cell shows that backend's recorded state for the file: green `✓ ok`, yellow `⚠ pending`, red `✗ failed`, yellow `⊘ unseeded`, dim `· absent`. Footer adds a per-backend health summary line — e.g. `✓ googledrive (primary) · 1251 ok` / `✓ sftp · 1251 ok`.
+- Closes the visibility gap that the rest of v0.5.34 only patches negatively: `status` alone is primary-centric (one Status column), `status --pending` is filter-only (shows non-OK / unseeded only). `status --by-backend` is the **positive** view — "is everything in sync on every mirror?" answered at a glance.
+- `--by-backend` and `--pending` are mutually exclusive (errors out cleanly with a one-line explanation if both passed).
+- 10 new tests in `tests/test_status_by_backend.py` cover header structure, every state's cell rendering, the legacy v1/v2-manifest fallback (entries without a `remotes` dict still render primary as ok), the per-backend footer counts, and the mutually-exclusive-flags contract.
+
 ### Fixed — `status --pending` now surfaces unseeded mirrors
 - Pre-fix `status --pending` only listed files in `pending_retry` / `failed_perm` state. Files that had **no recorded state at all** for a configured mirror (the bug above) were silently invisible — the user saw "✓ All mirrors are caught up" while a mirror folder was empty.
 - Post-fix `status --pending` adds an "Unseeded mirrors" table when any configured mirror has files with no recorded state, with the suggested fix command (`claude-mirror seed-mirror --backend NAME`) inline. The pre-fix happy-path message only shows when both pending state AND unseeded state are clean.

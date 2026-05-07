@@ -135,6 +135,7 @@ claude-mirror retry                                      --config <config-path> 
 claude-mirror retry    --backend NAME [--dry-run]        --config <config-path>   # retry one backend only / preview without sending
 claude-mirror seed-mirror --backend NAME                 --config <config-path>   # one-shot: populate a freshly-added mirror with files already on primary
 claude-mirror status   --pending                         --config <config-path>   # show files with non-ok mirror state
+claude-mirror status   --by-backend                      --config <config-path>   # full per-file table with one column per backend (Tier 2)
 claude-mirror forget   <timestamp> [<timestamp> ...]     --config <config-path>   # delete specific snapshots
 claude-mirror forget   --keep-last 50                    --config <config-path>   # retention pruning (single-selector form)
 claude-mirror prune                                      --config <config-path>   # apply YAML's keep_last/keep_daily/keep_monthly/keep_yearly policy (dry-run by default)

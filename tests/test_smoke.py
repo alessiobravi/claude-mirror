@@ -62,4 +62,28 @@ def test_fake_backend_fixture(fake_backend, project_dir, write_files):
         str(project_dir / "a.md"), "a.md", folder_id
     )
     assert file_id
-    assert len(fake_backend.upload_calls) == 1
+    upload_calls = [c for c in fake_backend.calls if c[0] == "upload_file"]
+    assert len(upload_calls) == 1
+    # Round-trip verification: download returns the same bytes we uploaded
+    assert fake_backend.download_file(file_id) == b"hello"
+
+
+def test_fake_notifier_fixture(fake_notifier):
+    """The fake_notifier fixture supports the NotificationBackend shape
+    and lets tests inject events into registered watch callbacks."""
+    from claude_mirror.events import SyncEvent
+    received = []
+    import threading
+    stop = threading.Event()
+    stop.set()  # release immediately
+    fake_notifier.watch(received.append, stop)
+    fake_notifier.deliver(SyncEvent(
+        timestamp="2026-05-07T10:00:00",
+        user="u",
+        machine="m",
+        action="push",
+        files=["a.md"],
+        project="testproject",
+    ))
+    assert len(received) == 1
+    assert received[0].files == ["a.md"]

@@ -4,6 +4,20 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.26] — 2026-05-07
+
+### Added
+- **`PRIVACY.md`** — full privacy policy at the repo root. Plain-language description of what data claude-mirror handles, where it goes, and what the maintainer has access to. Sections cover: what data flows where (3 explicit categories: stays local / user↔cloud / user↔GitHub-version-check), what the maintainer CAN see (aggregate count + PyPI download stats; no identities, no files, no metadata), token security (chmod 0600, double-write guard, where to revoke per backend), the bring-your-own-app advanced option, and source-code transparency (the `grep -rn 'https://' claude_mirror/` audit trail anyone can run).
+- **`PRIVACY.md` is shipped now (pre-v0.6.0) so it has a stable GitHub URL** before the upcoming v0.6.0 Dropbox + Azure AD app registrations need to point at it (both providers require a privacy-policy URL during app registration).
+
+### Infrastructure
+- **`.gitignore`** adds `ROADMAP_*.md` glob so future internal planning docs (e.g. `ROADMAP_v060.md`) follow the same local-only convention as `ROADMAP.md` without needing per-file additions.
+
+### Notes
+- No code change; no behaviour change. Wheel rebuilt because `PRIVACY.md` is part of the sdist (Hatchling's default sdist policy includes tracked files), and so PyPI's project page has the latest list of bundled files.
+
+---
+
 ## [0.5.25] — 2026-05-07
 
 ### Infrastructure

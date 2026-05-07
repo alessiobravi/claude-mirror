@@ -23,6 +23,7 @@ token.json
 # macOS
 .DS_Store
 ROADMAP.md
+ROADMAP_*.md
 
 # Editor / IDE / agent state (never relevant to this project)
 .idea/

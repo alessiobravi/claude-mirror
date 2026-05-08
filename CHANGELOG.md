@@ -4,6 +4,20 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.41] — 2026-05-08
+
+Follow-up to the v0.5.40 hotfix for v0.5.39's `--json` mode: the `click.echo` switch was correct but not sufficient. The deeper root cause was Rich Live's stdout redirection.
+
+### Fixed — Rich Live restoration of `sys.stdout` on Linux
+- After v0.5.40 swapped `sys.stdout.write` → `click.echo`, 13 of the 21 `tests/test_json_output.py` cases still failed on the CI Linux matrix with the same symptom: `result.stdout` empty, JSON envelope nowhere to be found. Inbox still passed.
+- Inbox is the only `--json` command whose `with _JsonMode():` block does NOT call any code that opens a Rich `Progress` region. Status / snapshots / history / log all do (via `engine.get_status()`, `SnapshotManager.list_snapshots()`, etc.).
+- Root cause: Rich's `Progress(transient=True)` uses `Live` with `redirect_stdout=True` by default. `Live.__enter__` replaces `sys.stdout`; `Live.__exit__` restores it. Under Click's `CliRunner` on Linux, the restore does not always put back the same object the runner installed as `sys.stdout` — leaving subsequent `click.echo` writes going to a void rather than to the runner's captured buffer.
+- Fix: `_JsonMode.__enter__` now snapshots `sys.stdout` / `sys.stderr` alongside the module-level Rich consoles, and `__exit__` forcibly restores them. Whatever Rich Live did to `sys.stdout` during the `with` block, it gets pinned back to the runner's captured buffer before `_emit_json_success` runs.
+- 505 tests pass locally on macOS; CI re-run on push will validate the Linux matrix.
+- Neither v0.5.39 nor v0.5.40 was tagged or published to PyPI, so no end users received a broken `--json` path.
+
+---
+
 ## [0.5.40] — 2026-05-08
 
 Hotfix for v0.5.39 — `--json` emit path was Linux-broken under Click 8.3's `CliRunner`.

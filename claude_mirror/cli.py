@@ -91,6 +91,8 @@ class _JsonMode:
         self._saved_snap: Optional[Console] = None
         self._saved_sync: Optional[Console] = None
         self._sink: Optional[io.StringIO] = None
+        self._saved_stdout: Optional[Any] = None
+        self._saved_stderr: Optional[Any] = None
 
     def __enter__(self) -> "_JsonMode":
         import claude_mirror.cli as _cli_mod
@@ -99,6 +101,18 @@ class _JsonMode:
         self._saved = _cli_mod.console
         self._saved_snap = _snap_mod.console
         self._saved_sync = getattr(_sync_mod, "console", None)
+        # Snapshot sys.stdout/stderr so we can forcibly restore them on
+        # exit. Rich Live (used by transient=True Progress regions inside
+        # engine.get_status, SnapshotManager.list_snapshots, etc.) does
+        # `redirect_stdout=True` by default — it replaces sys.stdout
+        # during its lifetime and restores on exit. Under Click's
+        # CliRunner on Linux, that restore can leave sys.stdout pointing
+        # at a void instead of the runner's captured buffer, so
+        # subsequent click.echo writes never reach result.stdout. Forcing
+        # the restore here pins sys.stdout/stderr back to what they were
+        # at __enter__, which IS the runner's captured stream.
+        self._saved_stdout = sys.stdout
+        self._saved_stderr = sys.stderr
         self._sink = io.StringIO()
         quiet = Console(file=self._sink, force_terminal=False, no_color=True, quiet=True)
         _cli_mod.console = quiet
@@ -117,6 +131,13 @@ class _JsonMode:
             _snap_mod.console = self._saved_snap
         if self._saved_sync is not None:
             _sync_mod.console = self._saved_sync
+        # Forcibly restore sys.stdout/stderr in case Rich Live (or any
+        # other context manager opened during the with block) failed to
+        # put them back. See note in __enter__.
+        if self._saved_stdout is not None:
+            sys.stdout = self._saved_stdout
+        if self._saved_stderr is not None:
+            sys.stderr = self._saved_stderr
         if self._sink is not None:
             try:
                 self._sink.close()

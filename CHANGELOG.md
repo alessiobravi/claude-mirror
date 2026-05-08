@@ -4,6 +4,48 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.47] — 2026-05-08
+
+Two independent additions: three new notification backends (Discord / Teams / Generic webhook) plus the Drive Pub/Sub auto-setup that v0.5.46's deep `doctor` only diagnosed.
+
+### Added — Discord / Microsoft Teams / Generic webhook notification backends
+- **Discord** webhooks: payloads are formatted as Discord embeds with action-coloured borders (green push / blue pull / blue sync / red delete), action title + activitySubtitle, fields for User / Machine / Project, and a Files-changed list capped at 10 with "and N more". URL pattern: `https://discord.com/api/webhooks/{id}/{token}`.
+- **Microsoft Teams** webhooks: payloads use the **MessageCard** schema (`@type: "MessageCard"`, `themeColor`, `summary`, `sections[]`). Both legacy `outlook.office.com/webhook/...` and modern `{tenant}.webhook.office.com/...` (Workflows-based) URLs work — same MessageCard payload accepted by both.
+- **Generic** webhook: schema-stable v1 envelope `{"version": 1, "event": "push|pull|sync|delete", "user", "machine", "project", "files", "timestamp"}` POSTed to any URL with optional custom headers (`webhook_extra_headers` for Bearer tokens, n8n / Make / Zapier endpoints, internal Slack-replacement servers).
+- All three share a new `WebhookNotifier` base class in `claude_mirror/notifications/webhooks.py` (~250 lines, single module). Best-effort delivery: any notifier failure is logged at DEBUG and silently swallowed — never blocks a sync.
+- Each backend is opt-in via its own YAML field (`discord_enabled` / `teams_enabled` / `webhook_enabled` and the matching `*_webhook_url`). Multiple can be enabled at once; they fire sequentially after the existing Slack hook. Slack code path **untouched**.
+- Stdlib-only — uses `urllib.request`, no new transitive dependency.
+- 27 new tests in `tests/test_webhooks.py` cover payload format per backend, file-list cap, network-failure swallow, 4xx response handling, YAML round-trip with `webhook_extra_headers` dict, multi-backend independence, Slack regression guard.
+
+### Added — `claude-mirror init --auto-pubsub-setup` (Drive BYO #4)
+- New opt-in flag on `init` for Google Drive setups. After OAuth completes, idempotently creates the Pub/Sub topic, the per-machine subscription, and the IAM grant on the topic (`apps-storage-noreply@google.com` → `roles/pubsub.publisher`). The IAM grant is the silent failure most users miss — v0.5.46's `doctor --backend googledrive` diagnosed it; v0.5.47 fixes it in one step.
+- Detects whether the Pub/Sub OAuth scope was granted at auth time. If not, prints a yellow info line and skips Pub/Sub steps without aborting the wizard. Re-running `claude-mirror auth` and adding the Pub/Sub scope unblocks.
+- Each step handled idempotently: `AlreadyExists` treated as success; `PermissionDenied` surfaced with a clear message but doesn't block YAML write; etag-conflict on `set_iam_policy` retries once before surfacing.
+- Lives in `claude_mirror/_byo_wizard.py` (existing module from v0.5.46) as `auto_setup_pubsub(creds, gcp_project_id, pubsub_topic_id, machine_name) -> AutoSetupResult`. Lazy-imports `pubsub_v1` so users not passing the flag pay no extra import cost. Re-uses the `_DRIVE_PUBSUB_PUBLISHER_SA` constant from v0.5.46's doctor (single source of truth) and the existing `Config.subscription_id` pattern (no invented names).
+- Renders a Rich table after the auto-setup runs (✓ Topic exists / ✓ Subscription created / ✓ IAM grant added).
+- 11 new tests in `tests/test_auto_pubsub_setup.py` cover all-fresh, all-already-exists, mixed, scope-not-granted skip (no SDK ctors called), topic PermissionDenied (subsequent steps skipped), etag-conflict retry, machine-name normalisation, plus three CLI flag-wiring tests.
+
+### Documented
+- `docs/admin.md` — new `## Notifications` section covering all four backends (Slack + Discord + Teams + Generic) with config-field summary and sample YAML; new "Fixing a missing topic / subscription / IAM grant" subsection under Drive deep checks pointing at `--auto-pubsub-setup`.
+- `docs/cli-reference.md` — new "Notification webhook fields" table; `--auto-pubsub-setup` added to the `init` synopsis.
+- `docs/backends/google-drive.md` — new H3 documenting `--auto-pubsub-setup` with sample fresh / re-run output and edge cases.
+- `README.md` — Quality gates count `584 → 622` and two new coverage labels named explicitly: "Discord / Teams / Generic webhook notifiers" and "Drive Pub/Sub auto-setup logic".
+
+### Updated docs/files
+- `claude_mirror/notifications/webhooks.py` (NEW).
+- `claude_mirror/_byo_wizard.py` (extended with `AutoSetupResult` + `auto_setup_pubsub` + helpers).
+- `claude_mirror/cli.py` (`--auto-pubsub-setup` Click option + chained smoke→auto-setup flow).
+- `claude_mirror/sync.py` (new `_dispatch_extra_webhooks` after Slack).
+- `claude_mirror/config.py` (7 new fields: discord/teams/webhook *_enabled, *_url, plus `webhook_extra_headers`).
+- `tests/test_webhooks.py`, `tests/test_auto_pubsub_setup.py` (NEW, 38 tests total).
+- `docs/admin.md`, `docs/cli-reference.md`, `docs/backends/google-drive.md`, `README.md`.
+- `pyproject.toml` (version 0.5.46 → 0.5.47).
+
+### Tests
+- `pytest tests/` — **622 passed in ~2.5s** (= 584 baseline + 27 webhooks + 11 Pub/Sub auto-setup). All offline.
+
+---
+
 ## [0.5.46] — 2026-05-08
 
 Three independent improvements landed together — all additive, all on the 0.5.x line, no minor bump required. Drive BYO wizard polish (the most painful backend setup just got smoother), a deep Drive diagnostic to surface the silent IAM-grant failure most users never know they hit, and a small `seed-mirror` ergonomics fix.

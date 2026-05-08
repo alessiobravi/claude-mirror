@@ -157,6 +157,22 @@ class Config:
     # so a hostile mirror config cannot DoS the watcher.
     max_retry_attempts: int = 3
 
+    # max_throttle_wait_seconds: hard cap on the shared backoff
+    # coordinator's pause window when a backend signals
+    # RATE_LIMIT_GLOBAL (HTTP 429 from Drive `userRateLimitExceeded`,
+    # Dropbox `too_many_requests`, OneDrive 429, etc.). When any worker
+    # hits a global throttle, every in-flight upload pauses for an
+    # exponentially-growing window (initially 30s or the server-supplied
+    # Retry-After value, multiplied by 1.5× on each escalation) capped
+    # at this value.
+    #
+    # Default 600 (10 minutes) — long enough for the heaviest server
+    # throttles to clear, short enough that a cron job which
+    # accidentally hits a hard quota won't sit blocked all day. Lower
+    # to e.g. 60 for cron-style runs that should fail fast and let the
+    # next tick try again rather than holding open a long pause.
+    max_throttle_wait_seconds: float = 600.0
+
     # notify_failures: surface per-backend failures to desktop +
     # configured Slack webhook. Independent of the existing
     # slack_enabled flag — a project can have Slack on for events but
@@ -245,6 +261,19 @@ class Config:
             self.max_retry_attempts = min(max(int(self.max_retry_attempts), 1), 8)
         except (TypeError, ValueError):
             self.max_retry_attempts = 3
+        # Clamp max_throttle_wait_seconds to [0, 86400] — 0 disables the
+        # coordinator's pause entirely (failures still classify as
+        # RATE_LIMIT_GLOBAL but workers don't actually wait); 86400 (1
+        # day) is an absurdly high upper bound to defeat hostile configs
+        # that would otherwise pin workers indefinitely. Default 600s.
+        try:
+            self.max_throttle_wait_seconds = float(self.max_throttle_wait_seconds)
+            if self.max_throttle_wait_seconds < 0:
+                self.max_throttle_wait_seconds = 0.0
+            if self.max_throttle_wait_seconds > 86400.0:
+                self.max_throttle_wait_seconds = 86400.0
+        except (TypeError, ValueError):
+            self.max_throttle_wait_seconds = 600.0
 
     def effective_snapshot_on(self) -> str:
         """Resolve snapshot_on with format-aware defaults.

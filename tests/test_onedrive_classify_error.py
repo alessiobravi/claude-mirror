@@ -116,17 +116,16 @@ def test_random_runtime_error_classified_as_unknown(backend):
     assert result == ErrorClass.UNKNOWN
 
 
-def test_http_429_still_transient(backend):
-    """Regression guard: the existing HTTP-status branch must keep mapping
-    429 to QUOTA (which is the project's chosen classification for rate
-    limits — see ErrorClass.QUOTA docstring). Verifies the substring->
-    allowlist refactor didn't disturb the requests.HTTPError branch."""
+def test_http_429_classified_as_rate_limit_global(backend):
+    """A 429 from Microsoft Graph is an account-wide throttle signal, not a
+    storage-quota exhaustion or a per-file transient blip. It must route
+    through the shared backoff coordinator (RATE_LIMIT_GLOBAL) so every
+    in-flight upload pauses on the same deadline rather than each
+    retrying independently and compounding the rate-limit pressure."""
     response = requests.Response()
     response.status_code = 429
     exc = requests.exceptions.HTTPError(response=response)
-    # 429 in the OneDrive backend maps to QUOTA, not TRANSIENT — confirm
-    # the existing behaviour is preserved post-refactor.
-    assert backend.classify_error(exc) == ErrorClass.QUOTA
+    assert backend.classify_error(exc) == ErrorClass.RATE_LIMIT_GLOBAL
 
 
 def test_http_500_still_transient(backend):

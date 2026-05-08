@@ -114,7 +114,12 @@ class WebDAVBackend(StorageBackend):
                 if status == 423:
                     return ErrorClass.TRANSIENT
                 if status == 429:
-                    return ErrorClass.QUOTA
+                    # Most WebDAV servers don't send 429 (they use 503
+                    # under load), but a server that does is signalling
+                    # account-wide throttling — route through the shared
+                    # backoff coordinator the same as Drive / Dropbox /
+                    # OneDrive.
+                    return ErrorClass.RATE_LIMIT_GLOBAL
                 if status == 507:
                     return ErrorClass.QUOTA
                 if status in (502, 503, 504):

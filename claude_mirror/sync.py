@@ -36,6 +36,7 @@ from .ignore import IgnoreSet, IGNORE_FILENAME
 from .manifest import Manifest
 from .merge import MergeHandler
 from .notifications import NotificationBackend
+from .retry import BackoffCoordinator, extract_retry_after_seconds
 from .snapshots import SnapshotManager, SNAPSHOTS_FOLDER, BLOBS_FOLDER, _safe_join, _human_size
 
 console = Console(force_terminal=True)
@@ -158,6 +159,14 @@ class SyncEngine:
         self._ignore_set: Optional[IgnoreSet] = IgnoreSet.from_file(
             self._project / IGNORE_FILENAME
         )
+
+        # Shared backoff coordinator. Reset by push() / sync() / pull()
+        # at the start of every command invocation; remains None when no
+        # uploading command is running. When a backend signals
+        # RATE_LIMIT_GLOBAL (server-wide 429), every in-flight upload
+        # pauses on the same deadline rather than each retrying
+        # independently and compounding the rate-limit pressure.
+        self._coordinator: Optional[BackoffCoordinator] = None
 
     # ------------------------------------------------------------------
     # File discovery
@@ -744,6 +753,10 @@ class SyncEngine:
         # `{"path": str, "strategy": str}`. Empty in the interactive flow.
         auto_resolved: list[dict] = []
 
+        # Fresh coordinator per sync() so a previous run's throttle state
+        # never leaks into the next invocation.
+        self._coordinator = self._make_coordinator()
+
         with self._make_phase_progress() as progress:
             states = self._run_status_phase(progress)
 
@@ -943,6 +956,10 @@ class SyncEngine:
         pushed: list[str] = []
         pulled: list[str] = []
         deleted: list[str] = []
+
+        # Fresh coordinator per push() so a previous run's throttle state
+        # never leaks into the next invocation.
+        self._coordinator = self._make_coordinator()
 
         with self._make_phase_progress() as progress:
             states = self._run_status_phase(progress)
@@ -1469,6 +1486,86 @@ class SyncEngine:
                 for name in self._push_counters
             )
 
+    # ------------------------------------------------------------------
+    # Global rate-limit coordination (RATE_LIMIT_GLOBAL)
+    # ------------------------------------------------------------------
+
+    def _make_coordinator(self) -> BackoffCoordinator:
+        """Build a fresh BackoffCoordinator for the current command.
+
+        Wires the user-facing "Backend reports rate limit. Pausing Ns..."
+        and "Throttle cleared. Resuming uploads." messages so a flurry of
+        per-file 429s collapses to ONE calm pair of lines. Honours
+        `config.max_throttle_wait_seconds` for the hard cap (default 600s,
+        cron jobs can lower it for fail-fast behaviour).
+        """
+        cap = float(getattr(self.config, "max_throttle_wait_seconds", 600.0))
+
+        def _on_start(wait_seconds: float) -> None:
+            console.print(
+                f"  [yellow]⚠[/]  Backend reports rate limit. "
+                f"Pausing {int(wait_seconds)}s before retrying."
+            )
+
+        def _on_clear() -> None:
+            console.print("  [dim]Throttle cleared. Resuming uploads.[/]")
+
+        return BackoffCoordinator(
+            max_wait_seconds=cap,
+            on_throttle_start=_on_start,
+            on_throttle_clear=_on_clear,
+        )
+
+    def _upload_with_coordinator(
+        self,
+        upload_callable: Callable[[], str],
+        backend: StorageBackend,
+    ) -> str:
+        """Run an upload through the shared backoff coordinator.
+
+        `upload_callable` performs ONE upload attempt and returns the
+        resulting file ID. The wrapper waits if a global throttle is
+        active, invokes the callable, and on RATE_LIMIT_GLOBAL signals
+        the coordinator + loops up to `config.max_retry_attempts` times.
+        Other classifications and successful uploads are returned /
+        re-raised unchanged.
+        """
+        from .backends import BackendError, ErrorClass
+
+        coord = self._coordinator
+        if coord is None:
+            return upload_callable()
+
+        max_attempts = int(getattr(self.config, "max_retry_attempts", 3))
+        if max_attempts < 1:
+            max_attempts = 1
+
+        last_exc: Optional[BaseException] = None
+        for attempt in range(max_attempts):
+            coord.wait_if_throttled()
+            try:
+                return upload_callable()
+            except BackendError as be:
+                if be.error_class is ErrorClass.RATE_LIMIT_GLOBAL:
+                    coord.signal_rate_limit(extract_retry_after_seconds(be))
+                    last_exc = be
+                    continue
+                raise
+            except Exception as exc:
+                cls = backend.classify_error(exc)
+                if cls is ErrorClass.RATE_LIMIT_GLOBAL:
+                    coord.signal_rate_limit(extract_retry_after_seconds(exc))
+                    last_exc = exc
+                    continue
+                raise
+
+        raise BackendError(
+            ErrorClass.RATE_LIMIT_GLOBAL,
+            f"upload deferred by global rate limit after {max_attempts} attempts: {last_exc}",
+            backend_name=getattr(backend, "backend_name", "") or "",
+            cause=last_exc,
+        ) from None
+
     def _push_file(
         self,
         state: FileSyncState,
@@ -1487,13 +1584,22 @@ class SyncEngine:
         # callback — the bar is sized by primary bytes only so the
         # "X/Y MB" figure matches what `status` reports as the push
         # cost and never overshoots 100%.
-        file_id = self.storage.upload_file(
-            local_path=local_path,
-            rel_path=state.rel_path,
-            root_folder_id=self._folder_id,
-            file_id=state.drive_file_id,
-            progress_callback=progress_callback,
-        )
+        #
+        # The upload is wrapped in the shared backoff coordinator so a
+        # global 429 (Drive's `userRateLimitExceeded`, Dropbox's
+        # `too_many_requests`, OneDrive's 429+Retry-After, etc.) pauses
+        # every other in-flight upload via the same deadline rather than
+        # each retrying independently.
+        def _do_primary_upload() -> str:
+            return self.storage.upload_file(
+                local_path=local_path,
+                rel_path=state.rel_path,
+                root_folder_id=self._folder_id,
+                file_id=state.drive_file_id,
+                progress_callback=progress_callback,
+            )
+
+        file_id = self._upload_with_coordinator(_do_primary_upload, self.storage)
         remote_hash = self.storage.get_file_hash(file_id)
         primary_name = (
             getattr(self.storage, "backend_name", "") or self.config.backend
@@ -1539,22 +1645,28 @@ class SyncEngine:
             try:
                 # Use the classified retry adapter when available; fall back
                 # to plain upload_file for backends that haven't shipped
-                # the retry helper yet.
+                # the retry helper yet. Wrap in the shared backoff
+                # coordinator so a global 429 on this mirror pauses every
+                # other in-flight upload (primary + sibling mirrors)
+                # rather than each retrying independently.
                 upload_fn = getattr(backend, "_upload_with_retry", None)
                 if upload_fn:
-                    new_id = upload_fn(
-                        local_path=local_path,
-                        rel_path=rel_path,
-                        root_folder_id=backend.config.root_folder,
-                        file_id=mirror_file_id,
-                    )
+                    def _do_mirror_upload(fn=upload_fn) -> str:
+                        return fn(
+                            local_path=local_path,
+                            rel_path=rel_path,
+                            root_folder_id=backend.config.root_folder,
+                            file_id=mirror_file_id,
+                        )
                 else:
-                    new_id = backend.upload_file(
-                        local_path=local_path,
-                        rel_path=rel_path,
-                        root_folder_id=backend.config.root_folder,
-                        file_id=mirror_file_id,
-                    )
+                    def _do_mirror_upload() -> str:
+                        return backend.upload_file(
+                            local_path=local_path,
+                            rel_path=rel_path,
+                            root_folder_id=backend.config.root_folder,
+                            file_id=mirror_file_id,
+                        )
+                new_id = self._upload_with_coordinator(_do_mirror_upload, backend)
                 # Record success in manifest.
                 try:
                     remote_hash = backend.get_file_hash(new_id) or local_hash
@@ -1762,6 +1874,10 @@ class SyncEngine:
             console.print("[dim]No mirrors configured; nothing to retry.[/]")
             return result
 
+        # Fresh coordinator per retry_mirrors() so a previous run's
+        # throttle state never leaks in.
+        self._coordinator = self._make_coordinator()
+
         # Collect (rel_path, [mirrors_to_retry_for_that_path]).
         # Single-pass over manifest avoids N×M scans.
         plan: dict[str, list[StorageBackend]] = {}
@@ -1823,19 +1939,22 @@ class SyncEngine:
                 try:
                     upload_fn = getattr(backend, "_upload_with_retry", None)
                     if upload_fn:
-                        new_id = upload_fn(
-                            local_path=local_path,
-                            rel_path=rel_path,
-                            root_folder_id=backend.config.root_folder,
-                            file_id=mirror_file_id,
-                        )
+                        def _do_retry_upload(fn=upload_fn) -> str:
+                            return fn(
+                                local_path=local_path,
+                                rel_path=rel_path,
+                                root_folder_id=backend.config.root_folder,
+                                file_id=mirror_file_id,
+                            )
                     else:
-                        new_id = backend.upload_file(
-                            local_path=local_path,
-                            rel_path=rel_path,
-                            root_folder_id=backend.config.root_folder,
-                            file_id=mirror_file_id,
-                        )
+                        def _do_retry_upload() -> str:
+                            return backend.upload_file(
+                                local_path=local_path,
+                                rel_path=rel_path,
+                                root_folder_id=backend.config.root_folder,
+                                file_id=mirror_file_id,
+                            )
+                    new_id = self._upload_with_coordinator(_do_retry_upload, backend)
                     try:
                         remote_hash = backend.get_file_hash(new_id) or local_hash
                     except Exception:
@@ -1984,6 +2103,11 @@ class SyncEngine:
             f"[bold]Seeding {len(unseeded)} file(s) to mirror {backend_name!r}…[/]"
         )
 
+        # Fresh coordinator per seed_mirror() so a previous run's
+        # global-throttle state never leaks in. Wired into the per-file
+        # upload via _upload_with_coordinator below.
+        self._coordinator = self._make_coordinator()
+
         # Pre-compute per-file sizes + drift state so the transfer-
         # progress bar's `total` reflects the bytes we will actually
         # ship. Skipped (drift / missing) files do not contribute.
@@ -2041,29 +2165,34 @@ class SyncEngine:
                     upload_fn = getattr(target, "_upload_with_retry", None)
                     if upload_fn:
                         # `_upload_with_retry` does not yet thread the
-                        # progress callback (it predates PROG-ETA); fall
-                        # through with the raw upload_file when the
-                        # caller wants live byte progress, since the
-                        # retry adapter is a thin wrapper anyway.
-                        new_id = upload_fn(
-                            local_path=local_path,
-                            rel_path=rel_path,
-                            root_folder_id=target.config.root_folder,
-                            file_id=None,
-                        )
+                        # progress callback (it predates PROG-ETA);
+                        # the retry adapter is a thin wrapper anyway.
+                        # Wrap in the coordinator so a global throttle
+                        # pauses every parallel uploader on one
+                        # shared deadline.
+                        def _do_seed_upload(fn=upload_fn) -> str:
+                            return fn(
+                                local_path=local_path,
+                                rel_path=rel_path,
+                                root_folder_id=target.config.root_folder,
+                                file_id=None,
+                            )
+                        new_id = self._upload_with_coordinator(_do_seed_upload, target)
                         # Retry adapter has no progress hook — emit a
                         # single "transferred N bytes" delta after the
                         # call returns so the bar still moves.
                         if size:
                             _advance(size)
                     else:
-                        new_id = target.upload_file(
-                            local_path=local_path,
-                            rel_path=rel_path,
-                            root_folder_id=target.config.root_folder,
-                            file_id=None,
-                            progress_callback=_advance,
-                        )
+                        def _do_seed_upload_direct() -> str:
+                            return target.upload_file(
+                                local_path=local_path,
+                                rel_path=rel_path,
+                                root_folder_id=target.config.root_folder,
+                                file_id=None,
+                                progress_callback=_advance,
+                            )
+                        new_id = self._upload_with_coordinator(_do_seed_upload_direct, target)
                     try:
                         remote_hash = target.get_file_hash(new_id) or local_hash
                     except Exception:

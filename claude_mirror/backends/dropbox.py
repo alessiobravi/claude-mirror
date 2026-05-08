@@ -51,10 +51,12 @@ class DropboxBackend(StorageBackend):
             if isinstance(exc, AuthError):
                 return ErrorClass.AUTH
 
-            # Rate limiting — user must wait. Treat as QUOTA so we don't
-            # hammer Dropbox with retries within a single push.
+            # Rate limiting — server-wide throttle. Routed through the
+            # shared backoff coordinator so all in-flight uploads pause
+            # together rather than each retrying independently and
+            # compounding the rate-limit pressure.
             if isinstance(exc, RateLimitError):
-                return ErrorClass.QUOTA
+                return ErrorClass.RATE_LIMIT_GLOBAL
 
             # Dropbox 5xx wrapped exception.
             if isinstance(exc, InternalServerError):
@@ -62,6 +64,21 @@ class DropboxBackend(StorageBackend):
 
             # ApiError carries a typed union in `.error` — inspect carefully.
             if isinstance(exc, ApiError):
+                # First, the global-throttle path: Dropbox sometimes
+                # surfaces rate-limit conditions via ApiError with an
+                # `error_summary` containing `too_many_requests` /
+                # `too_many_write_operations` rather than the dedicated
+                # RateLimitError. Detect those before the typed-union
+                # path so they route to the coordinator.
+                try:
+                    summary = str(getattr(exc, "error_summary", "") or "").lower()
+                except Exception:
+                    summary = ""
+                if (
+                    "too_many_requests" in summary
+                    or "too_many_write_operations" in summary
+                ):
+                    return ErrorClass.RATE_LIMIT_GLOBAL
                 try:
                     err = getattr(exc, "error", None)
                     if err is not None and hasattr(err, "is_path") and err.is_path():
@@ -110,7 +127,11 @@ class DropboxBackend(StorageBackend):
                 if status == 413:
                     return ErrorClass.FILE_REJECTED
                 if status == 429:
-                    return ErrorClass.QUOTA
+                    # Account-wide throttle — coordinator pause, not
+                    # per-file retry. Distinct from QUOTA (which means
+                    # the storage cap is hit and only user action can
+                    # resolve it).
+                    return ErrorClass.RATE_LIMIT_GLOBAL
                 if status is not None and 500 <= status < 600:
                     return ErrorClass.TRANSIENT
                 if status is not None and 400 <= status < 500:

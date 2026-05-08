@@ -4,6 +4,72 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.49] — 2026-05-08
+
+Four independent additions integrated together. None depends on the others; each is shippable on the 0.5.x line as patch-level work.
+
+### Added — Live transfer progress with ETA + bytes/sec (PROG-ETA)
+- New `claude_mirror/_progress.py:make_transfer_progress(console)` factory alongside the existing `make_phase_progress`. Transfer phases (`push` / `pull` / `sync` / `seed-mirror`) now show `BarColumn + DownloadColumn(binary_units=True) + TransferSpeedColumn + TimeRemainingColumn` instead of just a spinner. Status / guard / snapshot / notify keep the existing phase-progress UI.
+- Each backend's `upload_file` and `download_file` now accept an optional `progress_callback: Callable[[int], None] | None = None` kwarg with a **delta-based** contract: `cb(N)` means "N more bytes transferred since the last call". Wired through every backend with care for SDK quirks (Drive's `next_chunk()` returns `(None, response)` on the final iteration; Dropbox's single-shot `files_upload` emits one final delta; OneDrive ignores `lastBytesUploaded` in favour of driving the chunk loop ourselves; SFTP's manual block loop from v0.5.39's throttle work means no cumulative→delta bridge needed).
+- 19 new tests in `tests/test_prog_eta.py`. Multi-backend `push` keeps the per-backend `googledrive: X/N · sftp: Y/N` breakdown via `extra_detail` flowing into `_run_transfer_phase`.
+
+### Added — `--profile NAME` credentials short-hand + `claude-mirror profile` subcommand group (PROFILE)
+- Define a credentials profile once at `~/.config/claude_mirror/profiles/<name>.yaml`, reference it from any project via the global `--profile NAME` flag. Eliminates the "5 Drive projects, same credentials path copy-pasted 5 times" pattern.
+- Project YAML wins over profile defaults — projects can override any field locally for one-off cases.
+- New module `claude_mirror/profiles.py`: `load_profile()`, `apply_profile()`, `list_profiles()`, `profile_summary()`. Process-wide profile override via module-level slot (`set_global_profile_override`) keeps the diff to `Config.load` callers minimal.
+- New `claude-mirror profile {list, show, create, delete}` subcommand group. `profile create` reuses the wizard helpers from `_byo_wizard.py`. `profile delete` follows the destructive-ops convention (dry-run default, typed `YES`, `--yes` for non-interactive). Profile YAMLs written with `chmod 0600` to match token-file protection.
+- `init --profile NAME` skips prompts for fields the profile already provides and writes a slim project YAML with just `profile: NAME` at the top, plus the project-specific fields (folder ID, topic ID, etc.). `Config.save(profile=, strip_fields=)` strips the credential fields from disk so the profile remains the on-disk source of truth.
+- 24 new tests in `tests/test_profile.py`. Full walkthrough in new `docs/profiles.md`.
+
+### Added — Shared backoff coordinator for global rate-limits (RETRY)
+- New `RATE_LIMIT_GLOBAL` value in `ErrorClass` (in `claude_mirror/backends/__init__.py`). Distinct from `TRANSIENT` (per-file network blip): when ANY worker reports `RATE_LIMIT_GLOBAL`, every in-flight upload pauses on a single shared deadline rather than each retrying independently and compounding the rate-limit pressure.
+- New `claude_mirror/retry.py` module: `BackoffCoordinator` with module-level `_now` / `_sleep` wrappers (per the project's no-global-time-sleep-patch rule). Initial backoff: 30s if the server doesn't supply `Retry-After`, else honour the server value. Subsequent escalations within the same throttled window: `min(60s, current * 1.5)`. Capped at `config.max_throttle_wait_seconds` (default 600s; cron jobs can lower for fail-fast). Threadsafe via `threading.Lock`. Uses `time.monotonic()` for the deadline.
+- Per-backend `classify_error` extensions (4 of 5 backends — SFTP intentionally untouched since SSH has no 429 equivalent):
+  - **Drive**: `userRateLimitExceeded` / `rateLimitExceeded` reasons (Drive's quirk — these come as 403 + reason, not 429); plain 429 also handled. `quotaExceeded` stays QUOTA (semantically distinct: storage cap, user action).
+  - **Dropbox**: dedicated `RateLimitError`, plus `ApiError` with `error_summary` containing `too_many_requests` / `too_many_write_operations`, plus bare `HttpError` 429 — all three classify uniformly now.
+  - **OneDrive**: Microsoft Graph reliably emits 429 + `Retry-After`; picked up by `extract_retry_after_seconds` for honest initial-window sizing.
+  - **WebDAV**: 429 routes correctly (most WebDAV servers send 503 under load, which stays TRANSIENT).
+- Engine wiring: `SyncEngine._make_coordinator()` builds a fresh coordinator per command; `_upload_with_coordinator(callable, backend)` wraps each upload (push, fan-out to mirrors, retry, seed-mirror). On `RATE_LIMIT_GLOBAL`: signals coordinator with the server-supplied `Retry-After`, then loops up to `config.max_retry_attempts` times with `wait_if_throttled()` at the top of each attempt.
+- User-visible: ONE calm "Backend reports rate limit. Pausing 30s before retrying." line + ONE "Throttle cleared. Resuming uploads." line, instead of N TRANSIENT warnings.
+- 35 new tests in `tests/test_retry_global_throttle.py` (mocked clock — `cv.wait(timeout=remaining)` interaction uses a `register_cv` mechanism so `clock.advance()` calls `cv.notify_all()` and blocked waiters re-check the fake deadline).
+
+### Added — Non-interactive `sync --no-prompt --strategy` for cron (CRON-SYNC)
+- New `--no-prompt` + `--strategy {keep-local, keep-remote}` flags on `sync`. With `--no-prompt`, conflicts auto-resolve via the chosen strategy instead of blocking on `click.prompt`. Default flow unchanged.
+- `MergeHandler.__init__(non_interactive_strategy=...)` extends the existing handler — back-compat preserved (`MergeHandler()` with no args still prompts).
+- Mutual-exclusion validation: `--no-prompt` requires `--strategy` (clean error); `--strategy` without `--no-prompt` is a yellow info line + falls back to interactive. **Non-tty stdin without `--no-prompt`: fail-fast at command entry** with a hint pointing at the new flags — picked over silent-defaulting (would violate destructive-defaults convention) and over hanging on `click.prompt` (the bug we're fixing).
+- Audit trail rides on the existing `SyncEvent` as an additive optional `auto_resolved_files: list[dict]` field. Older log readers ignore the field via the `valid = {k: v for k, v in raw.items() if k in cls.__dataclass_fields__}` filter added to `from_json` and `from_bytes`.
+- Banner suppression mirrors the v0.5.44 `--json` pattern: when `--no-prompt` is in argv, the watcher-not-running banner + update-check notice are suppressed — keeps cron mail to one yellow line per conflict + the trailing `Summary:` line.
+- Defensive `ValueError` on unknown strategy values in `MergeHandler.__init__` — a programmatic typo (`"keep_local"` with underscore) can't silently fall through to the interactive path under cron.
+- 12 new tests in `tests/test_cron_sync.py`. Sample crontab entries in `docs/admin.md`. Scenarios A and B in `docs/scenarios.md` gain "Automated nightly sync" subsections.
+
+### Documented
+- `docs/admin.md` — new "Transfer progress" subsection (PROG-ETA), new "Rate-limit handling" subsection (RETRY), new "Unattended sync via cron" subsection (CRON-SYNC), new "Credentials profiles" section (PROFILE).
+- `docs/cli-reference.md` — `--profile NAME` global flag, `profile` subcommand group, `--no-prompt` / `--strategy` on sync, `max_throttle_wait_seconds` config field, transfer-progress note on push/pull/sync/seed-mirror entries.
+- `docs/profiles.md` (NEW) — comprehensive walkthrough with per-backend sample profile YAMLs, merge precedence rule, common workflows.
+- `docs/conflict-resolution.md` — new "Non-interactive mode" section.
+- `docs/scenarios.md` — Scenarios A and B gain "Automated nightly sync" subsections.
+- `README.md` — Quality gates count `673 → 763` and four new coverage labels named explicitly.
+
+### Updated docs/files
+- `claude_mirror/_progress.py` (PROG-ETA factory).
+- `claude_mirror/profiles.py` (NEW — PROFILE).
+- `claude_mirror/retry.py` (NEW — RETRY coordinator).
+- `claude_mirror/cli.py` (--profile global, profile subcommand group, sync --no-prompt/--strategy, transfer-progress wiring).
+- `claude_mirror/sync.py` (transfer-progress callbacks, BackoffCoordinator wiring, non-interactive sync strategy).
+- `claude_mirror/merge.py` (non_interactive_strategy kwarg).
+- `claude_mirror/events.py` (auto_resolved_files field).
+- `claude_mirror/config.py` (set_global_profile_override + max_throttle_wait_seconds).
+- `claude_mirror/backends/__init__.py` (RATE_LIMIT_GLOBAL ErrorClass + progress_callback contract docs).
+- `claude_mirror/backends/{googledrive,dropbox,onedrive,webdav,sftp}.py` (progress_callback wiring + 4-of-5 classify_error rate-limit detection).
+- `tests/test_prog_eta.py`, `tests/test_profile.py`, `tests/test_retry_global_throttle.py`, `tests/test_cron_sync.py` (NEW — 90 tests total).
+- `docs/profiles.md` (NEW), `docs/admin.md`, `docs/cli-reference.md`, `docs/conflict-resolution.md`, `docs/scenarios.md`, `docs/README.md` (index entry for profiles.md), `README.md`.
+- `pyproject.toml` (version 0.5.48 → 0.5.49).
+
+### Tests
+- `pytest tests/` — **763 passed in ~3s** (= 673 baseline + 19 PROG-ETA + 24 PROFILE + 35 RETRY + 12 CRON-SYNC + 1 small fixture update on existing test). All offline.
+
+---
+
 ## [0.5.48] — 2026-05-08
 
 `doctor --backend NAME` now layers deep, backend-specific diagnostic checks on top of the generic per-backend pass for **all five backends**. v0.5.46 shipped this for `googledrive`; v0.5.48 closes the parity gap by adding equivalent deep checks for `dropbox`, `onedrive`, `webdav`, and `sftp`.

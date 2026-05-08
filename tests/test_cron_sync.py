@@ -119,6 +119,7 @@ class _InMemoryBackend(StorageBackend):
         rel_path: str,
         root_folder_id: str,
         file_id: Optional[str] = None,
+        progress_callback=None,
     ) -> str:
         self.calls.append(("upload_file", rel_path, file_id))
         with open(local_path, "rb") as f:
@@ -132,8 +133,11 @@ class _InMemoryBackend(StorageBackend):
         self._files[fid] = {"name": name, "rel_path": rel_path, "content": content}
         return fid
 
-    def download_file(self, file_id: str) -> bytes:
-        return self._files[file_id]["content"]
+    def download_file(self, file_id: str, progress_callback=None) -> bytes:
+        content = self._files[file_id]["content"]
+        if progress_callback is not None and content:
+            progress_callback(len(content))
+        return content
 
     def upload_bytes(
         self,

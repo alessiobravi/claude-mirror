@@ -579,6 +579,17 @@ webdav_streaming_threshold_bytes: 4194304
 
 Ignored by the four other backends (each has its own native chunking story documented in [admin.md — Upload resume behaviour by backend](admin.md#upload-resume-behaviour-by-backend)).
 
+### `max_throttle_wait_seconds`
+
+Hard cap on the shared backoff coordinator's pause window when a backend signals a server-wide rate limit (HTTP 429 from Drive `userRateLimitExceeded`, Dropbox `too_many_requests`, OneDrive 429, etc.). When any worker hits a global throttle, every in-flight upload pauses for an exponentially-growing window (initially 30s or the server-supplied `Retry-After` value, multiplied by 1.5× on each escalation) — capped at this value. Default `600.0` (10 minutes).
+
+```yaml
+# in your project YAML — lower for cron jobs that should fail fast
+max_throttle_wait_seconds: 60
+```
+
+Lower it for cron-driven runs that should fail fast and let the next tick retry, rather than holding open a long pause. Leave at the default for interactive `push` / `sync` / `watch` where the calm pause-and-resume pattern is the desired behaviour. See [admin.md — Rate-limit handling](admin.md#rate-limit-handling) for the full design rationale, the per-backend 429 detection matrix, and the user-facing message contract.
+
 ### Notification webhook fields
 
 claude-mirror can post sync events to Slack, Discord, Microsoft Teams, and any generic JSON-receiving URL. All four are independent and opt-in; failures never block a sync. Full setup walkthroughs in [admin.md — Notifications](admin.md#notifications).

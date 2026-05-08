@@ -135,7 +135,12 @@ class OneDriveBackend(StorageBackend):
             if status == 423:
                 return ErrorClass.TRANSIENT
             if status == 429:
-                return ErrorClass.QUOTA
+                # Microsoft Graph signals account-wide throttling with
+                # 429 + a Retry-After header. Route through the shared
+                # backoff coordinator so all parallel uploads pause
+                # together; the engine reads the Retry-After value out
+                # of `exc.response.headers` to size the initial window.
+                return ErrorClass.RATE_LIMIT_GLOBAL
             if status is not None and 500 <= status < 600:
                 return ErrorClass.TRANSIENT
             if status is not None and 400 <= status < 500:

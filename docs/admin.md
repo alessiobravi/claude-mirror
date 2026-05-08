@@ -418,6 +418,38 @@ The simple-PUT path is preserved for small markdown files so the hot path is unc
 
 The throttle bucket integrates with both paths: every block yielded by the streaming generator is pre-paid via `bucket.consume(len(block))` so the long-run rate stays honest across multi-megabyte transfers.
 
+### Rate-limit handling
+
+claude-mirror's retry path distinguishes two failure modes that look superficially similar but need very different responses:
+
+- **TRANSIENT** — a per-file network blip. One file's upload timed out / saw a 502 / had a TLS hiccup. The right response is to retry **just that file** with the per-backend exponential backoff (0.8s, 1.6s, 3.2s, ...) embedded in `_upload_with_retry`. Other files' uploads continue normally — the backend itself is healthy.
+- **RATE_LIMIT_GLOBAL** — the SERVER is throttling this client/account overall. HTTP 429 from Google Drive (`userRateLimitExceeded` / `rateLimitExceeded`), Dropbox (`too_many_requests` / `too_many_write_operations`), Microsoft Graph (429 + `Retry-After` header), or any WebDAV server returning 429. The right response is to pause **every** in-flight upload on the same shared deadline. Per-file retries here just compound the rate-limit pressure: N parallel workers each retrying 3× sends 3N more requests into a server that's already pushing back.
+
+#### Shared backoff coordinator
+
+When any worker classifies a failure as `RATE_LIMIT_GLOBAL`, it signals a process-wide `BackoffCoordinator` (`claude_mirror/retry.py`). Every other worker checks the coordinator at the top of its next upload attempt — if a window is active, the worker blocks on a shared `threading.Condition` until the deadline elapses. The user sees one calm message instead of N transient warnings:
+
+```
+  ⚠  Backend reports rate limit. Pausing 30s before retrying.
+  ...
+  Throttle cleared. Resuming uploads.
+```
+
+The window is sized from the server's `Retry-After` header (OneDrive consistently sends one; Drive and Dropbox sometimes do; WebDAV varies). When no value is supplied, the coordinator uses a **30s** default. If a second `RATE_LIMIT_GLOBAL` fires while a window is still active, the deadline escalates by 1.5× (30s → 45s → 67.5s → ...), capped at `max_throttle_wait_seconds` (default **600s** = 10 minutes). Once the deadline passes with no further signals, the throttled state clears and uploads resume.
+
+#### Lowering the cap for cron jobs
+
+A cron-driven push that hits a hard quota would otherwise sit blocked for the full 10-minute cap. For fail-fast cron behaviour, set `max_throttle_wait_seconds` low in the project YAML — the next cron tick will retry naturally:
+
+```yaml
+# in your project YAML
+max_throttle_wait_seconds: 60     # default 600
+```
+
+#### What the coordinator does NOT do
+
+The coordinator is purely a **timing primitive**. It does not decide whether a particular failure should be retried — that's still the per-class state machine in `manifest.update_remote(...)` (`pending_retry` for retryable classes, `failed_perm` for AUTH / QUOTA / PERMISSION). It does not change classification semantics for any other ErrorClass. TRANSIENT, AUTH, QUOTA, PERMISSION, FILE_REJECTED all behave exactly as before — the coordinator only affects the WHEN of a retry, never the WHAT.
+
 ### Upload resume behaviour by backend
 
 Resume semantics differ across backends. Document the matrix here so users know what to expect when a watcher / push process crashes mid-upload:

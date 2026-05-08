@@ -35,6 +35,18 @@ class ErrorClass(enum.Enum):
                      refused this specific file. Skip the one file; the
                      rest of the push proceeds normally.
 
+    RATE_LIMIT_GLOBAL — the SERVER signalled that this client/account is
+                     making too many requests overall (HTTP 429 with no
+                     Retry-After OR Retry-After indicating seconds-scale,
+                     OR Drive's `userRateLimitExceeded` reason, OR
+                     Dropbox's 429, etc.). Shared backoff: every
+                     in-flight upload pauses, and the next retry window
+                     starts after the coordinator's deadline elapses.
+                     Distinct from TRANSIENT (which is per-file) — when
+                     this fires, all parallel workers slow down together
+                     instead of each retrying independently and
+                     compounding the rate-limit pressure.
+
     UNKNOWN        — unclassified. Treated like TRANSIENT (retry once)
                      but with a louder warning so the user can report it.
     """
@@ -44,12 +56,17 @@ class ErrorClass(enum.Enum):
     QUOTA = "quota"
     PERMISSION = "permission"
     FILE_REJECTED = "file_rejected"
+    RATE_LIMIT_GLOBAL = "rate_limit_global"
     UNKNOWN = "unknown"
 
     @property
     def is_retryable(self) -> bool:
         """True if a retry might succeed without user intervention."""
-        return self in (ErrorClass.TRANSIENT, ErrorClass.UNKNOWN)
+        return self in (
+            ErrorClass.TRANSIENT,
+            ErrorClass.UNKNOWN,
+            ErrorClass.RATE_LIMIT_GLOBAL,
+        )
 
     @property
     def needs_user_action(self) -> bool:
@@ -238,32 +255,12 @@ class StorageBackend(ABC):
         rel_path: str,
         root_folder_id: str,
         file_id: Optional[str] = None,
-        progress_callback: Optional[Callable[[int], None]] = None,
     ) -> str:
-        """Upload a local file. If file_id given, update existing. Returns file ID.
-
-        progress_callback: optional `Callable[[int], None]`. When provided,
-        invoked with the number of bytes-transferred-since-the-last-call
-        (a delta, not a cumulative count). Backends with chunked uploads
-        emit per-chunk; single-shot uploads emit once after success with
-        the full body size. The contract is delta-based so the surrounding
-        Rich Progress can simply call ``progress.advance(N)`` from the
-        callback. Backends MUST treat this as fully optional — passing
-        ``None`` (or omitting the kwarg) preserves the historic single-
-        shot fast path with no extra calls.
-        """
+        """Upload a local file. If file_id given, update existing. Returns file ID."""
 
     @abstractmethod
-    def download_file(
-        self,
-        file_id: str,
-        progress_callback: Optional[Callable[[int], None]] = None,
-    ) -> bytes:
-        """Download file content by ID.
-
-        progress_callback: optional `Callable[[int], None]` with the same
-        delta-based contract documented on ``upload_file``.
-        """
+    def download_file(self, file_id: str) -> bytes:
+        """Download file content by ID."""
 
     @abstractmethod
     def upload_bytes(

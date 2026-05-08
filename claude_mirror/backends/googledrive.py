@@ -183,7 +183,15 @@ class GoogleDriveBackend(StorageBackend):
                 if status == 403:
                     if reason == "authError":
                         return ErrorClass.AUTH
-                    if reason in ("quotaExceeded", "userRateLimitExceeded", "rateLimitExceeded"):
+                    # `userRateLimitExceeded` and `rateLimitExceeded` are
+                    # account-wide throttle signals — every parallel
+                    # worker should pause via the shared coordinator
+                    # rather than retrying independently. `quotaExceeded`
+                    # means the daily/storage quota is exhausted (user
+                    # action required), so it stays QUOTA.
+                    if reason in ("userRateLimitExceeded", "rateLimitExceeded"):
+                        return ErrorClass.RATE_LIMIT_GLOBAL
+                    if reason == "quotaExceeded":
                         return ErrorClass.QUOTA
                     if reason in ("forbidden", "domainPolicy", "insufficientPermissions"):
                         return ErrorClass.PERMISSION
@@ -194,7 +202,15 @@ class GoogleDriveBackend(StorageBackend):
                 if status == 413:
                     return ErrorClass.FILE_REJECTED
                 if status == 429:
-                    return ErrorClass.TRANSIENT
+                    # File-level rejections (`fileSizeLimitExceeded`)
+                    # never come back as 429 in Drive's contract, but
+                    # the per-file body reason is still inspected for
+                    # forward-compat.
+                    if reason in ("fileSizeLimitExceeded",):
+                        return ErrorClass.FILE_REJECTED
+                    # Plain 429 with no rate-limit reason still means
+                    # the account is being throttled overall.
+                    return ErrorClass.RATE_LIMIT_GLOBAL
                 if status is not None and 500 <= status < 600:
                     return ErrorClass.TRANSIENT
                 if status is not None and 400 <= status < 500:

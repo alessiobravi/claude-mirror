@@ -4,6 +4,23 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.44] — 2026-05-08
+
+The actual fix for v0.5.39's `--json` mode on Linux. v0.5.43's diagnostic captured the smoking gun, and the original "empty stdout" interpretation was wrong.
+
+### Fixed — Suppress pre-subcommand banners when `--json` is in argv
+- **Real root cause:** `_CLIGroup.invoke()` runs `_check_watcher_running()` before any subcommand handler. That helper writes a Rich-formatted "watcher not running" warning (with ANSI escape codes) to stdout via the module-level `cli.console`. In `--json` mode, that warning lands in stdout BEFORE the JSON envelope, then `_emit_json_success` appends the JSON. `result.stdout` ends up as `<ANSI watcher banner>\n<JSON envelope>\n`. The test failure `json.loads(result.stdout)` raises `JSONDecodeError: Expecting value: line 1 column 1 (char 0)` because **`\x1b` (ESC) is not a valid JSON start character** — and `json.loads("")` and `json.loads("\x1b...")` produce the literal same error message, which made the failure mode look like "stdout is empty" when it actually was "stdout starts with ANSI gunk".
+- **Fix:** when `--json` is anywhere in argv, `_CLIGroup.invoke()` skips both `_check_watcher_running()` and the update-check fetch. Both write to stdout via Rich and corrupt JSON output for jq / script consumers — neither belongs in `--json` mode regardless of the test failure.
+- v0.5.40 (`click.echo`), v0.5.41 (`sys.stdout` snapshot/restore), and v0.5.42 (no-op `make_phase_progress`) remain in place — they were correct hardening even though none of them was the root cause.
+- `tests/test_DIAG043_streams.py` retained as an always-failing canary so any future regression that re-pollutes the JSON path's stdout is visible immediately.
+
+### Documented in v0.5.43 release notes
+- That v0.5.43 was a diagnostic-only release: the `[DIAG043]` markers in `_emit_json_success` were never actually shipped (the local edit was reverted before commit; only the new diagnostic test made it onto `origin/main`). The dump from that test gave us the watcher-banner evidence.
+
+None of v0.5.39 / v0.5.40 / v0.5.41 / v0.5.42 / v0.5.43 was tagged or published to PyPI.
+
+---
+
 ## [0.5.43] — 2026-05-08
 
 **DIAGNOSTIC release.** Not for production use. v0.5.39's `--json` mode is broken on Linux under Click's CliRunner; three theory-driven hotfixes (v0.5.40 / v0.5.41 / v0.5.42) failed to land. This release ships instrumentation rather than a fix:

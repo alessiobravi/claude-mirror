@@ -629,16 +629,25 @@ class _CLIGroup(click.Group):
         # calls below). So parse the subcommand from protected_args ourselves.
         args = list(ctx.protected_args) + list(ctx.args)
         sub_cmd = args[0] if args else ""
-        _check_watcher_running(sub_cmd)
-        # Update check (best-effort, silent on any failure). Skipped for
-        # the silent inbox path (PreToolUse hook) so it doesn't print an
-        # "update available" line into the Claude Code conversation.
-        if sub_cmd not in _NO_WATCHER_CHECK_CMDS:
-            try:
-                from ._update_check import check_for_update
-                check_for_update(notify_desktop=False)
-            except Exception:
-                pass  # never let update-check break a command
+        # When --json is anywhere in argv, suppress the pre-subcommand
+        # banners (watcher warning + update-check notice). Both write to
+        # stdout via Rich; in --json mode stdout is reserved for the
+        # JSON document, and any other content corrupts it for jq /
+        # script consumers. The diagnostic dump from v0.5.43 confirmed
+        # the watcher banner was leaking into stdout ahead of the JSON
+        # envelope on Linux.
+        json_mode = "--json" in args
+        if not json_mode:
+            _check_watcher_running(sub_cmd)
+            # Update check (best-effort, silent on any failure). Skipped for
+            # the silent inbox path (PreToolUse hook) so it doesn't print an
+            # "update available" line into the Claude Code conversation.
+            if sub_cmd not in _NO_WATCHER_CHECK_CMDS:
+                try:
+                    from ._update_check import check_for_update
+                    check_for_update(notify_desktop=False)
+                except Exception:
+                    pass  # never let update-check break a command
         # When the user explicitly invokes `auth`, every "fix: run claude-mirror auth"
         # message below would be a logical infinite-loop ("you ran auth; to fix it,
         # run auth"). Detect that case once and route to a different diagnostic.

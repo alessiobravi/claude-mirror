@@ -6613,6 +6613,1508 @@ def _run_dropbox_deep_checks(path: str, config: "Config") -> list[str]:
 
     return failures
 
+_ONEDRIVE_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+_ONEDRIVE_REQUIRED_SCOPES = ("Files.ReadWrite", "Files.ReadWrite.All")
+
+_AZURE_CLIENT_ID_RE = (
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+def _onedrive_deep_check_factory(
+    config: "Config", token_path: "Path"
+) -> dict:
+    """Build the MSAL PublicClientApplication + cached account used by
+    the deep OneDrive doctor checks.
+
+    Lazily imports the MSAL SDK so the cost is only paid when
+    `claude-mirror doctor` is actually inspecting a OneDrive backend.
+
+    Returns a dict with keys:
+      app           — msal.PublicClientApplication instance (or None on
+                      construction failure — e.g. malformed client_id)
+      app_error     — exception or None; non-None means MSAL refused to
+                      construct the app (typically an invalid client_id)
+      account       — the first cached account, or None if cache is empty
+      cache_error   — exception or None; non-None means the token cache
+                      file failed to read / deserialize
+      cached_count  — number of cached accounts (informational)
+
+    Tests monkeypatch this whole function to inject a stub app / account,
+    which is why it's a module-level seam rather than inline.
+    """
+    import json as _json_local  # noqa: PLC0415 — local alias
+    import re as _re_local  # noqa: PLC0415 — only used in the OneDrive deep path
+
+    app = None
+    app_error: Optional[BaseException] = None
+    account = None
+    cache_error: Optional[BaseException] = None
+    cached_count = 0
+
+    client_id = (config.onedrive_client_id or "").strip()
+
+    # Validate client_id format BEFORE constructing the MSAL app — MSAL
+    # will accept a non-GUID string and only fail later on token-acquire,
+    # at which point the error message is far less actionable than
+    # "invalid GUID format".
+    if not _re_local.match(_AZURE_CLIENT_ID_RE, client_id):
+        app_error = ValueError(
+            f"onedrive_client_id has invalid format: {client_id!r}"
+        )
+        return {
+            "app": None,
+            "app_error": app_error,
+            "account": None,
+            "cache_error": None,
+            "cached_count": 0,
+        }
+
+    # Lazy-import MSAL — pays the cost only on the OneDrive deep path.
+    try:
+        import msal as _msal  # noqa: PLC0415
+    except ImportError as e:
+        return {
+            "app": None,
+            "app_error": e,
+            "account": None,
+            "cache_error": None,
+            "cached_count": 0,
+        }
+
+    # Read + deserialize the token cache. We do this BEFORE constructing
+    # the MSAL app so a corrupt cache file surfaces as a separate
+    # diagnostic from a malformed client_id.
+    cache = _msal.SerializableTokenCache()
+    try:
+        token_data = _json_local.loads(token_path.read_text())
+        if isinstance(token_data, dict):
+            cache_blob = token_data.get("token_cache", "{}")
+            cache.deserialize(cache_blob)
+        else:
+            cache_error = ValueError(
+                "token file does not contain a JSON object"
+            )
+    except (OSError, _json_local.JSONDecodeError) as e:
+        cache_error = e
+    except BaseException as e:  # noqa: BLE001 — diagnostic must not bubble
+        cache_error = e
+
+    # Construct the MSAL PublicClientApplication. Wrapped because a
+    # malformed client_id (rare, since we regex-validated above) or any
+    # other constructor failure should surface as `app_error`, not
+    # crash doctor.
+    try:
+        app = _msal.PublicClientApplication(
+            client_id,
+            authority="https://login.microsoftonline.com/consumers",
+            token_cache=cache,
+        )
+    except BaseException as e:  # noqa: BLE001
+        app_error = e
+        return {
+            "app": None,
+            "app_error": app_error,
+            "account": None,
+            "cache_error": cache_error,
+            "cached_count": 0,
+        }
+
+    # Inspect cached accounts. Empty cache ⇒ user has never authenticated
+    # successfully on this machine; first cached account is the one our
+    # `acquire_token_silent` call will use.
+    try:
+        accounts = app.get_accounts() or []
+        cached_count = len(accounts)
+        if accounts:
+            account = accounts[0]
+    except BaseException as e:  # noqa: BLE001
+        cache_error = cache_error or e
+
+    return {
+        "app": app,
+        "app_error": app_error,
+        "account": account,
+        "cache_error": cache_error,
+        "cached_count": cached_count,
+    }
+
+def _run_onedrive_deep_checks(path: str, config: "Config") -> list[str]:
+    """OneDrive-specific deep diagnostic checks.
+
+    Runs AFTER the generic credentials/token/connectivity checks have
+    already reported. Adds OneDrive-specific assertions that the generic
+    pass cannot make:
+
+      1. Token cache integrity — read the MSAL token cache, deserialize,
+         confirm at least one cached account.
+      2. Azure client_id format valid — Application (client) ID is a
+         GUID; surface malformed values before MSAL spits a cryptic
+         error from deeper down the stack.
+      3. Granted scopes match config — cached account scopes include
+         `Files.ReadWrite` (or `Files.ReadWrite.All` for shared business
+         tenants). Missing scopes ⇒ info line "scopes missing: re-run
+         auth".
+      4. Token still refreshable — `acquire_token_silent` against the
+         cached account. None / `error` in the result ⇒ AUTH bucket fail.
+      5. Drive item access — Microsoft Graph GET against
+         `me/drive/root:/{onedrive_folder}`. 200 ⇒ folder exists. 404 ⇒
+         "create the folder, or push to create it on first sync". 401 ⇒
+         AUTH bucket fail. 5xx ⇒ TRANSIENT classification.
+      6. Drive item type — confirm Graph returned a drive item / folder
+         shape; quickXorHash detection happens at sync time per-file
+         (not verifiable here without listing the whole folder).
+
+    Returns the list of failure summary strings (empty ⇒ all-pass).
+    Renders ✓ / ✗ / ⚠ lines to `console` as it goes, matching the
+    surrounding doctor's output style.
+
+    Auth failures are bucketed: if the saved token is unusable, ONE
+    AUTH-class failure line is emitted and remaining checks are skipped,
+    so the user sees a single "fix: re-run claude-mirror auth" rather
+    than three identical lines for the same root cause.
+    """
+    failures: list[str] = []
+
+    # Skip the entire deep section gracefully when the user hasn't
+    # configured the OneDrive folder. Without it, the drive-item probe
+    # can't run and the rest of the section is meaningless.
+    onedrive_folder = (config.onedrive_folder or "").strip()
+    if not onedrive_folder:
+        console.print(
+            "  [yellow]⚠[/] OneDrive folder not configured "
+            "([dim]onedrive_folder empty[/]) — skipping deep "
+            "OneDrive checks. "
+            "[yellow]Fix:[/] run "
+            f"[bold]claude-mirror init --wizard --config {path}[/] "
+            "to add OneDrive settings."
+        )
+        return failures
+
+    token_path = Path(config.token_file)
+    if not token_path.exists():
+        # The generic check above already emitted a failure for the
+        # missing token file; don't repeat.
+        return failures
+
+    # ───── Build the MSAL app + cached account via the test seam ─────
+    factory_result = _onedrive_deep_check_factory(config, token_path)
+    app = factory_result["app"]
+    app_error = factory_result["app_error"]
+    account = factory_result["account"]
+    cache_error = factory_result["cache_error"]
+    cached_count = int(factory_result["cached_count"])
+
+    # ───── Check 2: Azure client_id format valid ─────
+    # Run this BEFORE the cache check because a malformed client_id
+    # short-circuits everything else (no point inspecting the cache when
+    # the cache will never be usable with a bad client_id).
+    if app_error is not None and isinstance(app_error, ValueError) and (
+        "invalid format" in str(app_error)
+    ):
+        client_id_disp = (config.onedrive_client_id or "").strip()
+        console.print(
+            f"  [red]✗[/] Azure client_id has invalid format: "
+            f"[bold]{client_id_disp!r}[/]\n"
+            f"      [yellow]Fix:[/] edit [bold]{path}[/] and set "
+            f"[bold]onedrive_client_id[/] to your Azure App "
+            f"registration's Application (client) ID (GUID format: "
+            f"[dim]xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx[/])."
+        )
+        failures.append(
+            f"Azure client_id has invalid format: {client_id_disp!r}"
+        )
+        return failures
+
+    # ───── Check 1: Token cache integrity ─────
+    if cache_error is not None:
+        console.print(
+            f"  [red]✗[/] Token cache unreadable: "
+            f"[dim]{type(cache_error).__name__}: "
+            f"{str(cache_error)[:140]}[/]\n"
+            f"      [yellow]Fix:[/] run "
+            f"[bold]claude-mirror auth --config {path}[/] to "
+            f"re-authenticate."
+        )
+        failures.append(f"OneDrive token cache unreadable: {token_path}")
+        return failures
+
+    if app is None:
+        # Catch-all for any non-format MSAL construction failure that
+        # made it past the regex validator above.
+        err_text = str(app_error) if app_error is not None else "unknown"
+        console.print(
+            f"  [red]✗[/] MSAL PublicClientApplication construction "
+            f"failed: [dim]{err_text[:160]}[/]\n"
+            f"      [yellow]Fix:[/] verify [bold]onedrive_client_id[/] "
+            f"in [bold]{path}[/] and re-run "
+            f"[bold]claude-mirror auth --config {path}[/]."
+        )
+        failures.append("MSAL app construction failed")
+        return failures
+
+    if cached_count == 0 or account is None:
+        console.print(
+            "  [red]✗[/] Token cache has no cached accounts "
+            f"([dim]{token_path}[/])\n"
+            "      [yellow]Fix:[/] run "
+            f"[bold]claude-mirror auth --config {path}[/] to "
+            "complete the device-code login."
+        )
+        failures.append("OneDrive token cache has no cached accounts")
+        return failures
+
+    console.print(
+        f"  [green]✓[/] Token cache valid; "
+        f"[dim]{cached_count} cached account"
+        f"{'s' if cached_count != 1 else ''}[/]"
+    )
+
+    # ───── Check 2 (positive): Azure client_id format valid ─────
+    console.print("  [green]✓[/] Azure client_id format valid")
+
+    # ───── Check 3: Granted scopes include configured ones ─────
+    # MSAL's get_accounts() returns Account objects whose serialized form
+    # holds a 'scopes' field if available. Fall back to introspecting
+    # the cache directly when the account dict doesn't surface scopes.
+    granted_scopes: list[str] = []
+    try:
+        if isinstance(account, dict):
+            raw_scopes = account.get("scopes") or account.get("scope") or ""
+            if isinstance(raw_scopes, str):
+                granted_scopes = raw_scopes.split()
+            elif isinstance(raw_scopes, list):
+                granted_scopes = [str(s) for s in raw_scopes]
+        # MSAL also stores per-token scopes in the cache's AccessToken
+        # entries; if the per-account dict didn't have them, look there.
+        if not granted_scopes:
+            try:
+                cache_obj = getattr(app, "token_cache", None)
+                if cache_obj is not None and hasattr(cache_obj, "find"):
+                    # CredentialType.ACCESS_TOKEN == "AccessToken" string.
+                    found = cache_obj.find("AccessToken") or []
+                    for entry in found:
+                        target = entry.get("target") if isinstance(entry, dict) else None
+                        if target:
+                            granted_scopes = (
+                                target.split() if isinstance(target, str)
+                                else [str(s) for s in target]
+                            )
+                            if granted_scopes:
+                                break
+            except Exception:
+                pass
+    except Exception:
+        granted_scopes = []
+
+    has_required_scope = any(
+        req in granted_scopes for req in _ONEDRIVE_REQUIRED_SCOPES
+    )
+    if has_required_scope:
+        # Pick the first matching scope for display.
+        match = next(
+            (req for req in _ONEDRIVE_REQUIRED_SCOPES if req in granted_scopes),
+            "Files.ReadWrite",
+        )
+        console.print(f"  [green]✓[/] Scopes: [dim]{match}[/]")
+    elif granted_scopes:
+        # Cache had scopes but none of ours — degraded but not fatal;
+        # acquire_token_silent below will tell us definitively.
+        console.print(
+            f"  [yellow]⚠[/] Scopes missing from cache: expected one of "
+            f"[bold]{', '.join(_ONEDRIVE_REQUIRED_SCOPES)}[/], "
+            f"saw [dim]{', '.join(granted_scopes) or '(none)'}[/]. "
+            f"Re-run [bold]claude-mirror auth --config {path}[/] "
+            "to grant the scope."
+        )
+    else:
+        # No scopes surfaced from the cache — could be a legit-but-old
+        # cache shape; log info rather than fail and let the silent-token
+        # call settle it.
+        console.print(
+            "  [dim]·[/] Scopes: cache shape doesn't expose granted "
+            "scopes — silent-token call below will verify."
+        )
+
+    # ───── Check 4: Token still refreshable ─────
+    # acquire_token_silent against the cached account. None or a result
+    # dict carrying an 'error' key ⇒ refresh failed; user must re-auth.
+    auth_bucket_reported = False
+
+    def _emit_auth_bucket(reason: str) -> None:
+        """Emit ONE bucketed AUTH-class failure line. Subsequent calls
+        with `auth_bucket_reported=True` from the caller short-circuit."""
+        nonlocal auth_bucket_reported
+        if auth_bucket_reported:
+            return
+        auth_bucket_reported = True
+        console.print(
+            f"  [red]✗[/] OneDrive auth failed: [dim]{reason[:200]}[/]\n"
+            f"      [yellow]Fix:[/] re-run "
+            f"[bold]claude-mirror auth --config {path}[/] — "
+            "remaining OneDrive checks skipped to avoid duplicate "
+            "failures from the same root cause."
+        )
+        failures.append("OneDrive auth failed (token refresh)")
+
+    access_token: Optional[str] = None
+    try:
+        # Use the broadest scope so a token granted with Files.ReadWrite.All
+        # still satisfies a Files.ReadWrite request.
+        scopes_for_silent = ["Files.ReadWrite"]
+        result = app.acquire_token_silent(scopes_for_silent, account=account)
+    except BaseException as exc:  # noqa: BLE001
+        _emit_auth_bucket(f"{type(exc).__name__}: {exc}")
+        return failures
+
+    if result is None:
+        _emit_auth_bucket(
+            "acquire_token_silent returned None — refresh token expired "
+            "or revoked"
+        )
+        return failures
+
+    if isinstance(result, dict) and result.get("error"):
+        err_code = result.get("error", "")
+        err_desc = result.get("error_description", "")
+        _emit_auth_bucket(f"{err_code}: {err_desc}")
+        return failures
+
+    if isinstance(result, dict):
+        access_token = result.get("access_token")
+
+    if not access_token:
+        _emit_auth_bucket(
+            "acquire_token_silent returned no access_token"
+        )
+        return failures
+
+    console.print(
+        "  [green]✓[/] Token refreshable; "
+        "[dim]access_token acquired[/]"
+    )
+
+    # ───── Check 5: Drive item access ─────
+    # GET https://graph.microsoft.com/v1.0/me/drive/root:/{folder}
+    # Returns a DriveItem on 200, with the folder's metadata. 404 means
+    # the folder doesn't exist (yet). 401 means the access_token we just
+    # obtained is somehow not valid — likely a tenant / scope mismatch.
+    import requests as _requests  # noqa: PLC0415 — already a top-level dep
+    folder_for_url = onedrive_folder.lstrip("/")
+    drive_item_url = (
+        f"{_ONEDRIVE_GRAPH_BASE}/me/drive/root:/{folder_for_url}"
+    )
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        resp = _requests.get(drive_item_url, headers=headers, timeout=10)
+    except _requests.exceptions.RequestException as exc:
+        console.print(
+            f"  [red]✗[/] Drive item access failed (network): "
+            f"[dim]{type(exc).__name__}: {str(exc)[:140]}[/]\n"
+            f"      [yellow]Fix:[/] check internet connectivity (and any "
+            f"corporate proxy / VPN settings) and retry."
+        )
+        failures.append("OneDrive drive item access network failure")
+        return failures
+
+    status = resp.status_code
+    if status == 200:
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {}
+        console.print(
+            f"  [green]✓[/] OneDrive folder accessible: "
+            f"[dim]/{folder_for_url}[/]"
+        )
+
+        # ───── Check 6: drive item shape ─────
+        # quickXorHash detection happens at sync time (per-file). All we
+        # can verify here is that Graph returned a drive item / folder
+        # shape — the per-file hash is in `file.hashes.quickXorHash` and
+        # only appears on individual files, not on folder metadata.
+        is_folder = isinstance(payload, dict) and "folder" in payload
+        is_file = isinstance(payload, dict) and "file" in payload
+        if is_folder:
+            console.print("  [green]✓[/] Drive item type: folder")
+        elif is_file:
+            console.print(
+                "  [yellow]⚠[/] Drive item type: file ([dim]onedrive_folder "
+                "points at a file, not a folder — sync will fail[/])"
+            )
+            failures.append(
+                f"onedrive_folder points at a file, not a folder: "
+                f"/{folder_for_url}"
+            )
+        else:
+            # Unknown shape — Graph normally returns one of the two; treat
+            # as a soft warning so the user knows the response was odd.
+            console.print(
+                "  [yellow]⚠[/] Drive item type: unknown ([dim]Graph "
+                "returned a payload without `folder` or `file` "
+                "keys; quickXorHash detection runs at sync time per-file[/])"
+            )
+        return failures
+
+    if status == 401:
+        _emit_auth_bucket(
+            f"Microsoft Graph returned HTTP 401 for "
+            f"{drive_item_url}"
+        )
+        return failures
+
+    if status == 404:
+        console.print(
+            f"  [red]✗[/] Drive item access: HTTP 404\n"
+            f"      OneDrive folder doesn't exist at the configured "
+            f"path: [bold]/{folder_for_url}[/]\n"
+            f"      [yellow]Fix:[/] create [bold]/{folder_for_url}[/] in "
+            f"the OneDrive web UI, or run "
+            f"[bold]claude-mirror push --config {path}[/] which will "
+            f"create the folder on first sync."
+        )
+        failures.append(
+            f"OneDrive folder does not exist: /{folder_for_url}"
+        )
+        return failures
+
+    if status == 403:
+        console.print(
+            f"  [red]✗[/] Drive item access: HTTP 403 "
+            f"([dim]forbidden[/])\n"
+            f"      [yellow]Fix:[/] your account lacks permission for "
+            f"[bold]/{folder_for_url}[/]. Check folder sharing in the "
+            f"OneDrive web UI or re-run "
+            f"[bold]claude-mirror auth --config {path}[/] with an "
+            f"account that has access."
+        )
+        failures.append(
+            f"OneDrive drive item access forbidden: /{folder_for_url}"
+        )
+        return failures
+
+    if 500 <= status < 600:
+        console.print(
+            f"  [red]✗[/] Drive item access: HTTP {status} "
+            f"([dim]Microsoft Graph transient[/])\n"
+            f"      [yellow]Fix:[/] retry; if persistent, check "
+            f"[bold]https://status.office.com[/] for service incidents."
+        )
+        failures.append(
+            f"OneDrive drive item access transient HTTP {status}"
+        )
+        return failures
+
+    # Catch-all for any other 4xx/3xx/etc. status.
+    console.print(
+        f"  [red]✗[/] Drive item access: HTTP {status} "
+        f"([dim]unexpected[/])\n"
+        f"      [yellow]Fix:[/] inspect the error above; verify "
+        f"[bold]onedrive_folder[/] and [bold]onedrive_client_id[/] in "
+        f"[bold]{path}[/]."
+    )
+    failures.append(
+        f"OneDrive drive item access unexpected HTTP {status}"
+    )
+    return failures
+
+def _run_webdav_deep_checks(path: str, config: "Config") -> list[str]:
+    """WebDAV-specific deep diagnostic checks.
+
+    Runs AFTER the generic credentials/token/connectivity checks have
+    already reported. Adds WebDAV-specific assertions that the generic
+    pass cannot make:
+
+      1. Configured URL is well-formed (https:// + netloc + path).
+      2. PROPFIND on the configured root returns 207 Multi-Status —
+         the explicit "the configured WebDAV path actually exists and
+         the credentials work" smoke-test that goes beyond list_folders.
+      3. DAV class detection — parse the `DAV:` response header to
+         report the server's RFC 4918 compliance level (claude-mirror
+         needs class 1+ minimum).
+      4. ETag header presence on the configured root — without ETags,
+         change-detection falls back to last-modified or content-md5.
+      5. oc:checksums extension support detection — Nextcloud / OwnCloud
+         expose this XML namespace in PROPFIND responses with MD5 / SHA1
+         / SHA256 hashes that claude-mirror prefers for primary-backend
+         parity.
+      6. Account-level smoke test — for Nextcloud / OwnCloud URLs,
+         PROPFIND `/remote.php/dav/files/{user}/` to confirm the account
+         itself is reachable separately from the project sub-folder.
+
+    Returns the list of failure summary strings (empty ⇒ all-pass).
+    Renders ✓ / ✗ / ⚠ lines to `console` as it goes, matching the
+    surrounding doctor's output style.
+
+    Auth failures are bucketed: a single ACTION REQUIRED auth-bucket
+    line is emitted on the first 401 and remaining checks are skipped
+    so the user sees one "fix your credentials" line rather than five
+    cascading copies of the same root cause.
+
+    Uses `requests` directly (already a dependency via the WebDAV
+    backend) rather than instantiating a WebDAVBackend instance — the
+    deep checks need lower-level header/status visibility than the
+    backend's high-level `list_folders` exposes.
+    """
+    import requests as _requests  # noqa: PLC0415 — keep top-of-module clean
+    from urllib.parse import urlparse  # noqa: PLC0415
+
+    failures: list[str] = []
+
+    # ───── Check 1: URL well-formed ─────
+    # Reject empty, unparseable, or http:// (unless explicitly opted in).
+    url = (config.webdav_url or "").strip()
+    if not url:
+        console.print(
+            "  [red]✗[/] WebDAV URL is empty in config\n"
+            "      [yellow]Fix:[/] set [bold]webdav_url[/] in "
+            f"[bold]{path}[/], or run "
+            f"[bold]claude-mirror init --wizard --config {path}[/]."
+        )
+        failures.append(f"WebDAV URL empty: {path}")
+        return failures
+
+    parsed = urlparse(url)
+    insecure_http_ok = bool(getattr(config, "webdav_insecure_http", False))
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        console.print(
+            f"  [red]✗[/] WebDAV URL malformed: [bold]{url}[/]\n"
+            "      [yellow]Fix:[/] expected "
+            "[bold]https://host/path[/]; edit "
+            f"[bold]{path}[/] or re-run "
+            f"[bold]claude-mirror init --wizard --config {path}[/]."
+        )
+        failures.append(f"WebDAV URL malformed: {url}")
+        return failures
+    if parsed.scheme == "http" and not insecure_http_ok:
+        # The backend constructor itself rejects this, but the deep
+        # check should still surface it explicitly so the failure
+        # message is actionable rather than a cryptic ValueError.
+        console.print(
+            f"  [red]✗[/] WebDAV URL uses http:// (cleartext): "
+            f"[bold]{url}[/]\n"
+            f"      [yellow]Fix:[/] switch to https:// or set "
+            f"[bold]webdav_insecure_http: true[/] in [bold]{path}[/] "
+            f"(NOT recommended — basic-auth credentials cross the wire "
+            f"in cleartext)."
+        )
+        failures.append(f"WebDAV URL uses cleartext http: {url}")
+        return failures
+    console.print(
+        f"  [green]✓[/] URL well-formed: [dim]{url}[/]"
+    )
+
+    # If credentials are missing the connectivity check above already
+    # emitted a failure for that — skip the deep section silently
+    # rather than firing another redundant 401-class line.
+    username = (config.webdav_username or "").strip()
+    password = config.webdav_password or ""
+    # The token file may carry the password if the user ran `auth`; fall
+    # back to it so the deep checks work post-auth even when the YAML
+    # only stores the username.
+    if not password:
+        try:
+            token_path = Path(config.token_file)
+            if token_path.exists():
+                token_data = _json.loads(token_path.read_text())
+                if isinstance(token_data, dict):
+                    username = username or str(
+                        token_data.get("username", "") or ""
+                    )
+                    password = str(token_data.get("password", "") or "")
+        except (OSError, _json.JSONDecodeError):
+            # Generic check 3 already surfaced credential problems.
+            pass
+    if not username or not password:
+        # Generic check 3 already flagged this; bail without a duplicate
+        # complaint and without making a real network call we can't auth.
+        return failures
+
+    auth = _requests.auth.HTTPBasicAuth(username, password)
+
+    # Track AUTH-bucket emission so a 401 cascade across multiple
+    # PROPFIND / HEAD calls surfaces ONCE not five times — same shape
+    # as the Drive deep checks.
+    auth_bucket_reported = False
+
+    def _maybe_auth_bucket(status: int, where: str) -> bool:
+        """If `status` is 401, emit ONE auth-bucket line (only the
+        first time) and return True. Caller must skip its own per-check
+        message and bail."""
+        nonlocal auth_bucket_reported
+        if status != 401:
+            return False
+        if not auth_bucket_reported:
+            auth_bucket_reported = True
+            console.print(
+                f"  [red]✗[/] {where} failed: HTTP 401\n"
+                "      Credentials rejected. Verify "
+                "[bold]webdav_username[/] and [bold]webdav_password[/].\n"
+                f"      [yellow]Fix:[/] run "
+                f"[bold]claude-mirror auth --config {path}[/]"
+            )
+            failures.append(f"WebDAV auth failed (HTTP 401) at {where}")
+        return True
+
+    # ───── Check 2: PROPFIND on configured root (depth=0) ─────
+    # The exact body the WebDAV backend uses internally — keep them in
+    # sync so the deep check reproduces the real-world request shape.
+    propfind_body = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">'
+        "<d:prop>"
+        "<d:resourcetype/>"
+        "<d:getcontentlength/>"
+        "<d:getetag/>"
+        "<d:getlastmodified/>"
+        "<d:getcontenttype/>"
+        "<oc:checksums/>"
+        "</d:prop>"
+        "</d:propfind>"
+    )
+    propfind_resp = None
+    try:
+        propfind_resp = _requests.request(
+            "PROPFIND", url,
+            auth=auth,
+            headers={
+                "Depth": "0",
+                "Content-Type": "application/xml; charset=utf-8",
+            },
+            data=propfind_body.encode("utf-8"),
+            timeout=15,
+        )
+    except _requests.exceptions.RequestException as exc:
+        console.print(
+            "  [red]✗[/] PROPFIND probe failed (network): "
+            f"[dim]{type(exc).__name__}: {str(exc)[:160]}[/]\n"
+            "      [yellow]Fix:[/] verify the server is reachable; "
+            "retry once network is healthy."
+        )
+        failures.append(
+            f"WebDAV PROPFIND network failure: {type(exc).__name__}"
+        )
+        return failures
+
+    status = propfind_resp.status_code
+    if _maybe_auth_bucket(status, "PROPFIND"):
+        return failures
+    if status == 207:
+        console.print(
+            f"  [green]✓[/] PROPFIND succeeded; HTTP 207"
+        )
+    elif status == 404:
+        console.print(
+            f"  [red]✗[/] PROPFIND failed: HTTP 404\n"
+            f"      Configured WebDAV root doesn't exist: [bold]{url}[/]\n"
+            f"      [yellow]Fix:[/] create the folder on the server, "
+            f"or correct [bold]webdav_url[/] in [bold]{path}[/]."
+        )
+        failures.append(f"WebDAV root does not exist (404): {url}")
+        return failures
+    elif status == 405:
+        console.print(
+            f"  [red]✗[/] PROPFIND failed: HTTP 405\n"
+            f"      Server doesn't support PROPFIND on this URL "
+            f"([dim]{url}[/]).\n"
+            f"      [yellow]Fix:[/] verify the URL points at a WebDAV "
+            f"endpoint (not a plain HTTP folder). For Nextcloud / "
+            f"OwnCloud, the URL must include "
+            f"[bold]/remote.php/dav/files/USER/[/]."
+        )
+        failures.append(f"WebDAV server does not support PROPFIND: {url}")
+        return failures
+    elif 500 <= status < 600:
+        console.print(
+            f"  [red]✗[/] PROPFIND failed: HTTP {status} (transient)\n"
+            f"      [yellow]Fix:[/] server-side error; retry. If it "
+            f"persists, check the server's error log."
+        )
+        failures.append(f"WebDAV PROPFIND transient (HTTP {status})")
+        return failures
+    else:
+        console.print(
+            f"  [red]✗[/] PROPFIND failed: HTTP {status}\n"
+            f"      [yellow]Fix:[/] inspect the server response and "
+            f"verify [bold]webdav_url[/] in [bold]{path}[/]."
+        )
+        failures.append(f"WebDAV PROPFIND unexpected HTTP {status}")
+        return failures
+
+    # ───── Check 3: DAV class detection ─────
+    # The DAV: header lists the RFC 4918 compliance levels, comma-
+    # separated, e.g. `1, 2, 3` (Nextcloud), `1, 3` (OwnCloud), `1, 2`
+    # (Apache mod_dav). Class 1 is the bare minimum for claude-mirror;
+    # class 2 (locking) is unused but informative; class 3 (range PUT)
+    # would let us optimize partial uploads in future.
+    dav_header = propfind_resp.headers.get("DAV", "") or ""
+    if not dav_header:
+        console.print(
+            "  [yellow]⚠[/] no DAV class header reported by server "
+            "([dim]missing `DAV:` response header[/]); some WebDAV "
+            "features may be unavailable but basic operations should "
+            "still work."
+        )
+    else:
+        # Normalize: strip whitespace around each class token.
+        classes = [c.strip() for c in dav_header.split(",") if c.strip()]
+        # claude-mirror only requires "1" to be present.
+        if "1" in classes:
+            console.print(
+                f"  [green]✓[/] DAV class: [dim]{', '.join(classes)}[/]"
+            )
+        else:
+            console.print(
+                f"  [yellow]⚠[/] DAV header reported [dim]{dav_header}[/] "
+                "but does NOT list class 1 — the server may not be a "
+                "compliant WebDAV implementation; expect issues."
+            )
+
+    # ───── Check 4: ETag header presence on the root resource ─────
+    # Two sources to check: the response's `ETag:` header AND the
+    # PROPFIND XML's `<d:getetag/>` field. Either present is enough.
+    etag_header = propfind_resp.headers.get("ETag", "") or ""
+    has_etag_xml = False
+    propfind_xml = None
+    try:
+        import xml.etree.ElementTree as _ET  # noqa: PLC0415
+        propfind_xml = _ET.fromstring(propfind_resp.content)
+        for getetag_elem in propfind_xml.iter("{DAV:}getetag"):
+            if getetag_elem.text and getetag_elem.text.strip():
+                has_etag_xml = True
+                break
+    except _ET.ParseError:
+        # Server returned 207 but the body isn't valid XML — odd but
+        # not fatal for the overall deep check.
+        propfind_xml = None
+
+    if etag_header or has_etag_xml:
+        console.print(
+            "  [green]✓[/] ETag header present"
+        )
+    else:
+        console.print(
+            "  [yellow]⚠[/] no ETag returned; claude-mirror will fall "
+            "back to last-modified / content-md5 for change detection "
+            "(slower but still correct)."
+        )
+
+    # ───── Check 5: oc:checksums extension support detection ─────
+    # Nextcloud / OwnCloud emit `<oc:checksums>SHA1:abc MD5:def</oc:checksums>`
+    # in PROPFIND responses when the server has the
+    # files_checksums-style extension active. claude-mirror prefers
+    # these over ETags for parity with primary backends. Their absence
+    # is informational only — non-Nextcloud / non-OwnCloud servers
+    # never expose this namespace.
+    has_oc_checksums = False
+    checksum_kinds: list[str] = []
+    if propfind_xml is not None:
+        for cks_elem in propfind_xml.iter(
+            "{http://owncloud.org/ns}checksums"
+        ):
+            if cks_elem.text and cks_elem.text.strip():
+                has_oc_checksums = True
+                # Surface the kinds in the info line so the user knows
+                # what their server advertises.
+                for token in cks_elem.text.split():
+                    kind = token.split(":", 1)[0].strip().upper()
+                    if kind and kind not in checksum_kinds:
+                        checksum_kinds.append(kind)
+                break
+        # Some servers include the element but with empty text — fall
+        # back to namespace-only detection.
+        if not has_oc_checksums:
+            for _ in propfind_xml.iter(
+                "{http://owncloud.org/ns}checksums"
+            ):
+                has_oc_checksums = True
+                break
+    if has_oc_checksums:
+        if checksum_kinds:
+            console.print(
+                "  [green]✓[/] oc:checksums extension supported "
+                f"([dim]{', '.join(checksum_kinds)}[/])"
+            )
+        else:
+            console.print(
+                "  [green]✓[/] oc:checksums extension supported"
+            )
+    else:
+        console.print(
+            "  [dim]·[/] oc:checksums extension not advertised "
+            "([dim]Nextcloud / OwnCloud only[/]) — falling back to "
+            "ETag for change detection (still correct)."
+        )
+
+    # ───── Check 6: account-level smoke test ─────
+    # For Nextcloud / OwnCloud URLs of the form
+    # `https://host/remote.php/dav/files/USERNAME/...`, PROPFIND the
+    # account-level `/remote.php/dav/files/USERNAME/` to confirm the
+    # account itself is reachable separately from the project folder.
+    # Skipped silently for non-Nextcloud-pattern URLs.
+    import re as _re  # noqa: PLC0415
+    nc_match = _re.match(
+        r"^(https?://[^/]+/remote\.php/dav/files/[^/]+/)",
+        url,
+    )
+    if nc_match:
+        account_url = nc_match.group(1)
+        if account_url.rstrip("/") == url.rstrip("/"):
+            # The configured root IS the account base — Check 2 already
+            # exercised it; emitting a duplicate ✓ would be noise.
+            pass
+        else:
+            try:
+                acct_resp = _requests.request(
+                    "PROPFIND", account_url,
+                    auth=auth,
+                    headers={
+                        "Depth": "0",
+                        "Content-Type": "application/xml; charset=utf-8",
+                    },
+                    data=propfind_body.encode("utf-8"),
+                    timeout=15,
+                )
+            except _requests.exceptions.RequestException as exc:
+                console.print(
+                    "  [red]✗[/] Account-level PROPFIND failed "
+                    f"(network): [dim]{type(exc).__name__}: "
+                    f"{str(exc)[:140]}[/]\n"
+                    "      [yellow]Fix:[/] verify the server is "
+                    "reachable; retry once network is healthy."
+                )
+                failures.append(
+                    "WebDAV account-level PROPFIND network failure"
+                )
+                return failures
+            acct_status = acct_resp.status_code
+            if _maybe_auth_bucket(acct_status, "Account-level PROPFIND"):
+                return failures
+            if acct_status == 207:
+                console.print(
+                    f"  [green]✓[/] Account-level PROPFIND succeeded: "
+                    f"[dim]{account_url}[/]"
+                )
+            elif acct_status == 404:
+                console.print(
+                    f"  [red]✗[/] Account-level PROPFIND failed: HTTP "
+                    f"404\n"
+                    f"      Account base unreachable: "
+                    f"[bold]{account_url}[/]\n"
+                    f"      [yellow]Fix:[/] verify the username "
+                    f"segment in [bold]webdav_url[/] of [bold]{path}[/]."
+                )
+                failures.append(
+                    f"WebDAV account base 404: {account_url}"
+                )
+                return failures
+            else:
+                console.print(
+                    f"  [yellow]⚠[/] Account-level PROPFIND returned "
+                    f"HTTP {acct_status} ([dim]{account_url}[/]); the "
+                    "project folder is reachable but the account base "
+                    "isn't — server may have non-standard ACLs."
+                )
+
+    return failures
+
+def _sftp_deep_check_factory(
+    config: "Config",
+) -> dict:
+    """Build the live SSH key (post-handshake) used by the SFTP deep
+    checks, plus the resolved key-file path on disk.
+
+    Returns a dict with keys:
+      live_host_key   — paramiko.PKey (the server's key from a real
+                        Transport handshake), or None if the connection
+                        couldn't be established yet.
+      transport_error — exception or None; non-None means the host
+                        wasn't reachable / TCP failed / SSH banner
+                        timed out (i.e. transient).
+      key_path        — resolved absolute path to sftp_key_file
+                        (~ expanded), or "" if not configured.
+      transport       — the open paramiko.Transport, or None. Caller
+                        owns closing it.
+
+    Tests monkeypatch this whole function to inject stubs. Keeping it as
+    a module-level seam mirrors the Drive deep-check pattern and avoids
+    having to mock half a dozen paramiko classes inside the test body.
+    """
+    import paramiko as _paramiko  # noqa: PLC0415 — lazy
+    import socket as _socket  # noqa: PLC0415
+
+    key_path = ""
+    raw_key = (getattr(config, "sftp_key_file", "") or "").strip()
+    if raw_key:
+        key_path = str(Path(raw_key).expanduser())
+
+    host = getattr(config, "sftp_host", "") or ""
+    port = int(getattr(config, "sftp_port", 22) or 22)
+
+    transport: Optional[Any] = None
+    live_host_key: Optional[Any] = None
+    transport_error: Optional[BaseException] = None
+    try:
+        # Open a raw TCP socket to the host:port with a short timeout, then
+        # wrap it in a paramiko.Transport so we can pull the host key out
+        # of the handshake WITHOUT authenticating yet. This separation lets
+        # the fingerprint check fail BEFORE we send a key/password — which
+        # is exactly what you want when the host has been swapped under you.
+        sock = _socket.create_connection((host, port), timeout=5)
+        transport = _paramiko.Transport(sock)
+        transport.start_client(timeout=5)
+        live_host_key = transport.get_remote_server_key()
+    except BaseException as e:  # noqa: BLE001 — diagnostic must not bubble
+        transport_error = e
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception:
+                pass
+            transport = None
+
+    return {
+        "live_host_key": live_host_key,
+        "transport_error": transport_error,
+        "key_path": key_path,
+        "transport": transport,
+    }
+
+def _run_sftp_deep_checks(path: str, config: "Config") -> list[str]:
+    """SFTP-specific deep diagnostic checks.
+
+    Runs AFTER the generic credentials/connectivity checks above. Adds
+    SSH-specific assertions the generic loop can't make:
+
+      1. Host fingerprint matches `~/.ssh/known_hosts`.
+      2. SSH key file exists + readable.
+      3. SSH key file permissions are 0600.
+      4. SSH key can decrypt (or ssh-agent will handle).
+      5. Connect + authenticate.
+      6. `exec_command` capability.
+      7. Root path access.
+
+    Returns the list of failure summary strings (empty ⇒ all-pass).
+    Renders ✓ / ✗ / ⚠ lines to `console` as it goes, matching the
+    surrounding doctor's output style.
+
+    Auth failures bucket: a single AUTH-class fail (host fingerprint
+    mismatch, auth rejected, root-path permission denied) emits ONE
+    auth-bucket line and short-circuits the rest of the chain — the
+    user doesn't need five copies of "your access is broken".
+    """
+    failures: list[str] = []
+
+    console.print("[bold]SFTP deep checks[/]")
+
+    # Lazy-import paramiko + its exception module so generic doctor
+    # invocations on other backends don't pay the import cost.
+    import paramiko as _paramiko  # noqa: PLC0415
+
+    sftp_host = (getattr(config, "sftp_host", "") or "").strip()
+    sftp_port = int(getattr(config, "sftp_port", 22) or 22)
+    sftp_username = (getattr(config, "sftp_username", "") or "").strip()
+    sftp_folder = (getattr(config, "sftp_folder", "") or "").strip()
+    sftp_password = getattr(config, "sftp_password", "") or None
+    raw_key = (getattr(config, "sftp_key_file", "") or "").strip()
+    kh_raw = (
+        getattr(config, "sftp_known_hosts_file", "") or "~/.ssh/known_hosts"
+    )
+    kh_path = str(Path(kh_raw).expanduser())
+    key_path = str(Path(raw_key).expanduser()) if raw_key else ""
+
+    # ───── Auth-bucket plumbing (mirrors Drive deep-check pattern) ─────
+    auth_bucket_reported = False
+
+    def _emit_auth_bucket(headline: str, fix_hint: str, summary: str) -> None:
+        """Emit ONE auth-bucket failure line; subsequent auth-class
+        failures go silent so the user sees ONE root cause."""
+        nonlocal auth_bucket_reported
+        if auth_bucket_reported:
+            return
+        auth_bucket_reported = True
+        console.print(
+            f"  [red]✗[/] {headline}\n"
+            f"      [yellow]Fix:[/] {fix_hint}"
+        )
+        failures.append(summary)
+
+    # ───── Check 1: host fingerprint matches known_hosts ─────
+    # Load known_hosts (if it exists) and look up the configured host.
+    # If the host is absent → INFO line ("first connection will prompt
+    # to verify"). If it's present, open a Transport without authenticating
+    # and compare the live key's fingerprint to the stored entry. A
+    # mismatch is a SECURITY INCIDENT — bucket it as AUTH and stop.
+    stored_key = None
+    kh_present = os.path.exists(kh_path)
+    if kh_present:
+        try:
+            host_keys = _paramiko.HostKeys(filename=kh_path)
+        except (IOError, OSError) as e:
+            console.print(
+                f"  [yellow]⚠[/] known_hosts file unreadable: "
+                f"[bold]{kh_path}[/] ([dim]{e}[/]) — fingerprint check "
+                f"skipped, first connection will prompt to verify."
+            )
+            host_keys = None
+        if host_keys is not None:
+            # paramiko's HostKeys.lookup understands "[host]:port" for non-22
+            # ports; for the standard port we just look up the bare host.
+            lookup_target = (
+                f"[{sftp_host}]:{sftp_port}"
+                if sftp_port != 22
+                else sftp_host
+            )
+            entry = host_keys.lookup(lookup_target)
+            if entry is None and sftp_port != 22:
+                # Fall back to bare host — some ssh clients write the bare
+                # form even for non-standard ports.
+                entry = host_keys.lookup(sftp_host)
+            if entry is not None:
+                # `entry` is a dict {keytype: PKey}; any key in there is
+                # a valid stored fingerprint.
+                stored_keys = list(entry.values())
+                if stored_keys:
+                    stored_key = stored_keys[0]
+
+    factory_result = _sftp_deep_check_factory(config)
+    live_key = factory_result.get("live_host_key")
+    transport_error = factory_result.get("transport_error")
+    transport = factory_result.get("transport")
+
+    try:
+        if stored_key is None:
+            if not kh_present:
+                console.print(
+                    f"  [yellow]⚠[/] known_hosts file missing: "
+                    f"[bold]{kh_path}[/] — first connection will prompt "
+                    f"to verify the host fingerprint."
+                )
+            else:
+                console.print(
+                    f"  [yellow]⚠[/] host [bold]{sftp_host}[/] not in "
+                    f"[dim]{kh_path}[/]; first connection will prompt to "
+                    f"verify the host fingerprint."
+                )
+        else:
+            # Need a live key to compare. If the Transport handshake
+            # itself failed, we can't run check 1 — surface a transient
+            # error here and let check 5 emit a real failure.
+            if live_key is None:
+                exc = transport_error
+                exc_name = type(exc).__name__ if exc is not None else "unknown"
+                exc_text = str(exc) if exc is not None else "?"
+                console.print(
+                    f"  [yellow]⚠[/] could not fetch live host key from "
+                    f"[bold]{sftp_host}:{sftp_port}[/] ([dim]{exc_name}: "
+                    f"{exc_text[:120]}[/]) — fingerprint compare skipped; "
+                    f"see connection check below."
+                )
+            else:
+                stored_fp = getattr(stored_key, "fingerprint", None) or "?"
+                live_fp = getattr(live_key, "fingerprint", None) or "?"
+                if stored_fp == live_fp:
+                    console.print(
+                        f"  [green]✓[/] Host in known_hosts; fingerprint "
+                        f"matches ([dim]{stored_fp}[/])"
+                    )
+                else:
+                    # POSSIBLE MITM. Strong warning, dedicated fix hint
+                    # (NOT `claude-mirror auth` — fingerprint mismatches
+                    # are not a token problem, they're a security incident).
+                    console.print(
+                        f"  [red]✗[/] Host fingerprint mismatch in "
+                        f"[bold]{kh_path}[/]\n"
+                        f"           Stored fingerprint: [dim]{stored_fp}[/]\n"
+                        f"           Live fingerprint:   [dim]{live_fp}[/]\n"
+                        f"           [red bold]POSSIBLE MAN-IN-THE-MIDDLE — "
+                        f"refusing to connect.[/]\n"
+                        f"      [yellow]Fix:[/] investigate the mismatch. "
+                        f"If the host genuinely changed, run "
+                        f"[bold]ssh-keygen -R {sftp_host}[/] and re-add the "
+                        f"host (verify the new fingerprint out-of-band first)."
+                    )
+                    failures.append(
+                        f"SFTP host fingerprint mismatch: {sftp_host}"
+                    )
+                    auth_bucket_reported = True
+                    # Stop here — refusing to connect is exactly the right
+                    # response to a fingerprint mismatch. Don't try to
+                    # auth or stat anything against a host we don't trust.
+                    return failures
+
+        # ───── Check 2: SSH key file exists + readable ─────
+        if key_path:
+            if not os.path.exists(key_path):
+                console.print(
+                    f"  [red]✗[/] SSH key file not found: "
+                    f"[bold]{key_path}[/]\n"
+                    f"      [yellow]Fix:[/] verify [bold]sftp_key_file[/] in "
+                    f"[bold]{path}[/] points at an existing private key, "
+                    f"or generate one with "
+                    f"[bold]ssh-keygen -t ed25519[/]."
+                )
+                failures.append(f"SFTP key file not found: {key_path}")
+                # Without a key file we can't run checks 3 and 4 — but
+                # we still want to attempt connect+auth (paramiko may
+                # have agent / default keys that work), so don't return.
+            elif not os.access(key_path, os.R_OK):
+                console.print(
+                    f"  [red]✗[/] SSH key file not readable: "
+                    f"[bold]{key_path}[/]\n"
+                    f"      [yellow]Fix:[/] [bold]chmod 600 {key_path}[/] "
+                    f"and ensure the current user owns it."
+                )
+                failures.append(
+                    f"SFTP key file not readable: {key_path}"
+                )
+            else:
+                console.print(
+                    f"  [green]✓[/] Key file readable: [dim]{key_path}[/]"
+                )
+
+                # ───── Check 3: SSH key file permissions are 0600 ─────
+                # OpenSSH refuses keys with any group/world bits set. We
+                # use `st_mode & 0o077` to detect them — non-zero means
+                # somebody other than the owner can read or write the key.
+                # NOTE: we do NOT auto-fix; chmod 600 is one command and
+                # the human needs to run it consciously.
+                try:
+                    perm_bits = os.stat(key_path).st_mode & 0o777
+                except OSError as e:
+                    console.print(
+                        f"  [yellow]⚠[/] could not stat key file "
+                        f"([dim]{e}[/]) — permission check skipped."
+                    )
+                else:
+                    if perm_bits & 0o077:
+                        console.print(
+                            f"  [red]✗[/] Key file permissions too open: "
+                            f"[bold]{oct(perm_bits)[2:]:>04}[/] on "
+                            f"[bold]{key_path}[/]\n"
+                            f"      [dim]OpenSSH refuses keys readable by "
+                            f"group or world.[/]\n"
+                            f"      [yellow]Fix:[/] [bold]chmod 600 "
+                            f"{key_path}[/]"
+                        )
+                        failures.append(
+                            f"SFTP key file permissions too open: "
+                            f"{oct(perm_bits)[2:]:>04} on {key_path}"
+                        )
+                    else:
+                        console.print(
+                            f"  [green]✓[/] Key file permissions: "
+                            f"[dim]{oct(perm_bits)[2:]:>04}[/]"
+                        )
+
+                # ───── Check 4: SSH key can decrypt ─────
+                # paramiko 4.x exposes `PKey.from_private_key_file` (auto-
+                # detects key type). On encrypted keys without a passphrase
+                # it raises PasswordRequiredException — that's an INFO
+                # line, not a failure: ssh-agent or claude-mirror's auth
+                # flow handles the passphrase at sync time.
+                #
+                # paramiko has been known to raise unexpected exception
+                # types on malformed/binary garbage masquerading as a key
+                # (TypeError, ValueError, generic SSHException, etc.); a
+                # broad catch here keeps the deep check from crashing on
+                # a single bad file and lets the connect+auth check below
+                # surface the real error.
+                try:
+                    _paramiko.PKey.from_private_key_file(key_path)
+                    console.print(
+                        "  [green]✓[/] Key decryptable "
+                        "(or ssh-agent will handle)"
+                    )
+                except _paramiko.PasswordRequiredException:
+                    console.print(
+                        "  [yellow]⚠[/] Key is encrypted; ssh-agent or "
+                        "claude-mirror's auth flow handles this at sync time."
+                    )
+                except _paramiko.SSHException as e:
+                    # Malformed key, unsupported format, etc. Surface as
+                    # a failure — paramiko's runtime will hit the same
+                    # error during sync.
+                    console.print(
+                        f"  [red]✗[/] Key file unparseable: "
+                        f"[bold]{key_path}[/] ([dim]{e}[/])\n"
+                        f"      [yellow]Fix:[/] regenerate the key with "
+                        f"[bold]ssh-keygen -t ed25519 -f {key_path}[/] or "
+                        f"point [bold]sftp_key_file[/] at a valid key."
+                    )
+                    failures.append(
+                        f"SFTP key file unparseable: {key_path}"
+                    )
+                except OSError:
+                    # Already covered by the readable check above —
+                    # silently ignore here.
+                    pass
+                except Exception as e:  # noqa: BLE001 — defensive
+                    # Unexpected paramiko error shape (e.g. TypeError on
+                    # binary garbage); report as unparseable and keep going.
+                    console.print(
+                        f"  [red]✗[/] Key file unparseable: "
+                        f"[bold]{key_path}[/] "
+                        f"([dim]{type(e).__name__}: {str(e)[:120]}[/])\n"
+                        f"      [yellow]Fix:[/] regenerate the key with "
+                        f"[bold]ssh-keygen -t ed25519 -f {key_path}[/] or "
+                        f"point [bold]sftp_key_file[/] at a valid key."
+                    )
+                    failures.append(
+                        f"SFTP key file unparseable: {key_path}"
+                    )
+
+        # ───── Check 5: connect + authenticate ─────
+        # We already have an unauthenticated Transport from the factory
+        # (used for fingerprint check 1). Authenticate it here. Time-
+        # bounded by the 5s socket timeout we set when opening it.
+        if transport is None:
+            # The factory couldn't even open a Transport — classify the
+            # underlying error and emit an appropriate line.
+            exc = transport_error
+            exc_name = type(exc).__name__ if exc is not None else "unknown"
+            exc_text = str(exc) if exc is not None else "?"
+            text_lower = exc_text.lower()
+            if (
+                isinstance(exc, (TimeoutError,))
+                or "timeout" in text_lower
+                or "timed out" in text_lower
+            ):
+                console.print(
+                    f"  [red]✗[/] Connection to "
+                    f"[bold]{sftp_host}:{sftp_port}[/] timed out\n"
+                    f"      [yellow]Fix:[/] check that the server is "
+                    f"reachable ([bold]ping {sftp_host}[/]) and that port "
+                    f"[bold]{sftp_port}[/] is open from this machine."
+                )
+                failures.append(
+                    f"SFTP connection timeout: {sftp_host}:{sftp_port}"
+                )
+            elif (
+                isinstance(exc, ConnectionRefusedError)
+                or "refused" in text_lower
+                or "unreachable" in text_lower
+            ):
+                console.print(
+                    f"  [red]✗[/] Server unreachable: "
+                    f"[bold]{sftp_host}:{sftp_port}[/] "
+                    f"([dim]{exc_name}: {exc_text[:120]}[/])\n"
+                    f"      [yellow]Fix:[/] verify the server is up and "
+                    f"port [bold]{sftp_port}[/] is open."
+                )
+                failures.append(
+                    f"SFTP server unreachable: {sftp_host}:{sftp_port}"
+                )
+            else:
+                console.print(
+                    f"  [red]✗[/] Could not open SSH transport to "
+                    f"[bold]{sftp_host}:{sftp_port}[/] "
+                    f"([dim]{exc_name}: {exc_text[:120]}[/])\n"
+                    f"      [yellow]Fix:[/] inspect the error above and "
+                    f"verify the host/port in [bold]{path}[/]."
+                )
+                failures.append(
+                    f"SFTP transport open failed: {exc_name}"
+                )
+            return failures
+
+        # Transport is open — authenticate. Prefer the configured key
+        # file; fall back to password if set; finally let paramiko try
+        # ssh-agent / default keys via the auth_none/agent path.
+        auth_ok = False
+        try:
+            if key_path and os.path.exists(key_path) and os.access(key_path, os.R_OK):
+                try:
+                    pkey = _paramiko.PKey.from_private_key_file(key_path)
+                except _paramiko.PasswordRequiredException:
+                    # Encrypted key without passphrase — paramiko's
+                    # transport.auth_publickey would raise, so try
+                    # ssh-agent / password instead. INFO already printed
+                    # in check 4; just fall through to other auth methods.
+                    pkey = None
+                except Exception:
+                    pkey = None
+
+                if pkey is not None:
+                    transport.auth_publickey(sftp_username, pkey)
+                    auth_ok = transport.is_authenticated()
+            if not auth_ok and sftp_password:
+                transport.auth_password(sftp_username, sftp_password)
+                auth_ok = transport.is_authenticated()
+            if not auth_ok:
+                # No usable creds — paramiko's high-level SSHClient would
+                # try ssh-agent here. We surface this as an auth failure
+                # since the deep check is supposed to verify configured
+                # creds work end-to-end.
+                raise _paramiko.AuthenticationException(
+                    "no usable credentials (no key, no password, "
+                    "agent-only auth not exercised here)"
+                )
+            console.print(
+                "  [green]✓[/] Connection + auth succeeded"
+            )
+        except _paramiko.AuthenticationException as exc:
+            _emit_auth_bucket(
+                headline=(
+                    f"SSH authentication rejected by [bold]{sftp_host}[/] "
+                    f"([dim]{type(exc).__name__}: {str(exc)[:140]}[/])"
+                ),
+                fix_hint=(
+                    f"verify [bold]sftp_username[/] / "
+                    f"[bold]sftp_key_file[/] / [bold]sftp_password[/] in "
+                    f"[bold]{path}[/]. If using a key, confirm the public "
+                    f"key is in the server's "
+                    f"[bold]~/.ssh/authorized_keys[/]."
+                ),
+                summary=f"SFTP auth rejected: {sftp_host}",
+            )
+            return failures
+        except _paramiko.BadHostKeyException as exc:
+            # Paramiko's own host-key check fired — mirrors check 1's
+            # detection but at the auth layer. Same security semantics.
+            _emit_auth_bucket(
+                headline=(
+                    f"Host key changed for [bold]{sftp_host}[/] "
+                    f"([dim]{type(exc).__name__}: {str(exc)[:140]}[/]). "
+                    f"[red bold]POSSIBLE MAN-IN-THE-MIDDLE.[/]"
+                ),
+                fix_hint=(
+                    f"investigate the mismatch. If the host genuinely "
+                    f"changed, run [bold]ssh-keygen -R {sftp_host}[/] and "
+                    f"re-add the host."
+                ),
+                summary=f"SFTP host key changed: {sftp_host}",
+            )
+            return failures
+        except (_paramiko.SSHException, OSError, EOFError) as exc:
+            console.print(
+                f"  [red]✗[/] SSH transport error during auth "
+                f"([dim]{type(exc).__name__}: {str(exc)[:140]}[/])\n"
+                f"      [yellow]Fix:[/] retry; if the failure persists, "
+                f"check the server's SSH service and the network path."
+            )
+            failures.append(
+                f"SFTP transport error during auth: {type(exc).__name__}"
+            )
+            return failures
+
+        # ───── Check 6: exec_command capability ─────
+        # internal-sftp-jailed accounts disallow shell commands; we fall
+        # back to client-side hashing in that case. INFO line either
+        # branch — neither is a failure, just a perf signal.
+        try:
+            session = transport.open_session()
+            try:
+                session.settimeout(5)
+                session.exec_command(
+                    "echo claude-mirror-doctor-probe"
+                )
+                # Drain any response so the channel closes cleanly.
+                try:
+                    session.recv(64)
+                except Exception:
+                    pass
+                # `recv_exit_status` blocks until the server sends the
+                # close; capped by the 5s settimeout above.
+                exit_status = session.recv_exit_status()
+            finally:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+            if exit_status == 0:
+                console.print(
+                    "  [green]✓[/] exec_command available; server-side "
+                    "hashing will be used"
+                )
+            else:
+                console.print(
+                    f"  [yellow]⚠[/] exec_command returned exit "
+                    f"[bold]{exit_status}[/] — client-side hashing "
+                    f"fallback active"
+                )
+        except Exception as exc:  # noqa: BLE001 — diagnostic only
+            console.print(
+                f"  [yellow]⚠[/] exec_command unavailable "
+                f"([dim]{type(exc).__name__}: {str(exc)[:120]}[/]) — "
+                f"client-side hashing fallback active"
+            )
+
+        # ───── Check 7: root path access ─────
+        # Open an SFTP channel and stat the configured folder. NotFound is
+        # an INFO line (claude-mirror creates it on first push); permission
+        # denied is an AUTH-bucket failure.
+        try:
+            sftp_chan = _paramiko.SFTPClient.from_transport(transport)
+        except Exception as exc:  # noqa: BLE001
+            console.print(
+                f"  [red]✗[/] Could not open SFTP channel "
+                f"([dim]{type(exc).__name__}: {str(exc)[:140]}[/])\n"
+                f"      [yellow]Fix:[/] confirm the server allows SFTP "
+                f"subsystem access for user [bold]{sftp_username}[/]."
+            )
+            failures.append(
+                f"SFTP channel open failed: {type(exc).__name__}"
+            )
+            return failures
+
+        try:
+            sftp_chan.stat(sftp_folder)
+            console.print(
+                f"  [green]✓[/] Root path: [dim]{sftp_folder}[/]"
+            )
+        except IOError as exc:
+            code = getattr(exc, "errno", None)
+            msg = str(exc).lower()
+            if code == 2 or "no such" in msg or "not found" in msg:
+                console.print(
+                    f"  [yellow]⚠[/] Configured root doesn't exist: "
+                    f"[bold]{sftp_folder}[/] — claude-mirror creates it "
+                    f"on first push."
+                )
+            elif code == 13 or "permission" in msg or "denied" in msg:
+                _emit_auth_bucket(
+                    headline=(
+                        f"Permission denied stat'ing root path "
+                        f"[bold]{sftp_folder}[/]"
+                    ),
+                    fix_hint=(
+                        f"user [bold]{sftp_username}[/] lacks access to "
+                        f"[bold]{sftp_folder}[/]. Adjust server-side ACLs "
+                        f"or change [bold]sftp_folder[/] in [bold]{path}[/]."
+                    ),
+                    summary=(
+                        f"SFTP root path permission denied: {sftp_folder}"
+                    ),
+                )
+            else:
+                console.print(
+                    f"  [red]✗[/] Could not stat root path "
+                    f"[bold]{sftp_folder}[/] "
+                    f"([dim]{type(exc).__name__}: {str(exc)[:140]}[/])\n"
+                    f"      [yellow]Fix:[/] inspect the error above and "
+                    f"verify [bold]sftp_folder[/] in [bold]{path}[/]."
+                )
+                failures.append(
+                    f"SFTP root path stat failed: {type(exc).__name__}"
+                )
+        finally:
+            try:
+                sftp_chan.close()
+            except Exception:
+                pass
+    finally:
+        # Always close the Transport — it owns the underlying socket.
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception:
+                pass
+
+    return failures
+
+
 
 def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
     """Run the doctor check sequence for one config + its mirrors.
@@ -7079,6 +8581,21 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
         # for other backends.
         if backend_name == "dropbox":
             failures.extend(_run_dropbox_deep_checks(path, config))
+
+        # ───── OneDrive deep checks (DOC-ONE) ─────
+        if backend_name == "onedrive":
+            console.print("\n[bold]OneDrive deep checks[/]")
+            failures.extend(_run_onedrive_deep_checks(path, config))
+
+        # ───── WebDAV deep checks (DOC-WD) ─────
+        if backend_name == "webdav":
+            console.print("\n[bold]WebDAV deep checks[/]")
+            failures.extend(_run_webdav_deep_checks(path, config))
+
+        # ───── SFTP deep checks (DOC-SFTP) ─────
+        if backend_name == "sftp":
+            console.print("\n[bold]SFTP deep checks[/]")
+            failures.extend(_run_sftp_deep_checks(path, config))
 
         # ───── Check 5: project_path exists locally ─────
         # Only check on the primary — every mirror config validated by

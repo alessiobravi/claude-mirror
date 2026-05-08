@@ -54,6 +54,72 @@ user: alice
 - **Server-side snapshot copy** — `full`-format snapshots use the WebDAV `COPY` method; no file data passes through the client.
 - **Common errors** — see [`401 Unauthorized`](../../README.md#webdav-401-unauthorized) and [`405 Method Not Allowed` / `409 Conflict` from `MKCOL`](../../README.md#webdav-405-method-not-allowed-or-409-conflict-from-mkcol).
 
+## Diagnosing setup problems
+
+Once a WebDAV backend is configured (or you suspect it's misconfigured), run:
+
+```bash
+claude-mirror doctor --backend webdav
+```
+
+This runs the generic credentials/token/connectivity checks AND six WebDAV-specific deep checks:
+
+1. **URL well-formed** — the configured `webdav_url` must parse to `https://` (or `http://` with `webdav_insecure_http: true`) plus a netloc and a path. Empty / scheme-less / netloc-less URLs are rejected before any network call.
+2. **PROPFIND on the configured root** — issues `PROPFIND` with `Depth: 0` on the configured `webdav_url`. Expects HTTP 207 Multi-Status. 401 → auth-bucket (verify `webdav_username` and `webdav_password`), 404 → "configured WebDAV root doesn't exist" (create the folder server-side or fix the URL), 405 → "server doesn't support PROPFIND" (typically a misconfigured endpoint serving plain HTTP, or a Nextcloud URL missing `/remote.php/dav/files/USER/`), 5xx → transient retry hint.
+3. **DAV class detection** — parses the `DAV:` response header (e.g. `DAV: 1, 2, 3` from Nextcloud). claude-mirror requires class 1 minimum; class 2 (locking) and class 3 (range PUT) are informational. Missing header or sub-1 classes emit a yellow warning, not a failure.
+4. **ETag header presence** — checked from both the `ETag:` response header and the PROPFIND XML's `<d:getetag/>` field. Missing ETag is informational only — claude-mirror falls back to last-modified / content-md5 for change detection (slower but still correct).
+5. **oc:checksums extension support** — Nextcloud / OwnCloud servers expose `<oc:checksums>SHA1:abc MD5:def SHA256:ghi</oc:checksums>` in PROPFIND responses, which claude-mirror prefers over ETags for primary-backend parity. Absence is informational only — non-Nextcloud / non-OwnCloud servers don't advertise this namespace.
+6. **Account-level smoke test** — for Nextcloud / OwnCloud-shaped URLs (`https?://HOST/remote.php/dav/files/USERNAME/...`), PROPFIND the `/remote.php/dav/files/USERNAME/` base separately to confirm the account itself is reachable. Skipped silently for non-Nextcloud-pattern URLs (Apache mod_dav, Synology, Box.com, etc.).
+
+Sample successful output:
+
+```
+$ claude-mirror doctor --backend webdav
+claude-mirror doctor — /home/alice/.config/claude_mirror/myproject.yaml
+
+  ✓ config file parses: /home/alice/.config/claude_mirror/myproject.yaml
+
+── checking webdav backend (/home/alice/.config/claude_mirror/myproject.yaml)
+  · credentials file: skipped (WebDAV uses inline username/password)
+  ✓ WebDAV credentials present in config (username + password)
+  ✓ backend connectivity ok (list_folders on root succeeded)
+WebDAV deep checks
+  ✓ URL well-formed: https://nextcloud.example.com/remote.php/dav/files/alice/myproject
+  ✓ PROPFIND succeeded; HTTP 207
+  ✓ DAV class: 1, 2, 3
+  ✓ ETag header present
+  ✓ oc:checksums extension supported (SHA1, MD5, SHA256)
+  ✓ Account-level PROPFIND succeeded: https://nextcloud.example.com/remote.php/dav/files/alice/
+  ✓ project_path exists: /home/alice/projects/myproject
+  ✓ manifest parses: /home/alice/projects/myproject/.claude_mirror_manifest.json
+
+✓ All checks passed.
+```
+
+Sample failure on the most common case (wrong credentials):
+
+```
+WebDAV deep checks
+  ✓ URL well-formed: https://nextcloud.example.com/remote.php/dav/files/alice/myproject
+  ✗ PROPFIND failed: HTTP 401
+       Credentials rejected. Verify webdav_username and webdav_password.
+       Fix: run claude-mirror auth --config /home/alice/.config/claude_mirror/myproject.yaml
+```
+
+If the configured root doesn't exist (e.g. the project sub-folder hasn't been created on the server yet):
+
+```
+WebDAV deep checks
+  ✓ URL well-formed: https://nextcloud.example.com/remote.php/dav/files/alice/myproject
+  ✗ PROPFIND failed: HTTP 404
+       Configured WebDAV root doesn't exist: https://nextcloud.example.com/remote.php/dav/files/alice/myproject
+       Fix: create the folder on the server, or correct webdav_url in /home/alice/.config/claude_mirror/myproject.yaml.
+```
+
+Multiple 401 failures across the root and account-level PROPFIND calls are bucketed into ONE `Credentials rejected` line — re-run `claude-mirror auth --config PATH` to update the saved credentials.
+
+See [admin.md#webdav-deep-checks](../admin.md#webdav-deep-checks) for the full deep-check reference table and the auth-bucketing semantics.
+
 ## See also
 
 - [Scenario A — Standalone](../scenarios.md#a-standalone-mirror) for end-to-end usage patterns with this backend.

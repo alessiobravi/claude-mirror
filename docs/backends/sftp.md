@@ -103,9 +103,77 @@ The password (when used) is stored only in the token file (chmod 0600), never in
 - **Server-side snapshot copy** — when shell `exec_command` is available, `full`-format snapshots use server-side `cp -p` and `sha256sum` for free hashing. With `ForceCommand internal-sftp` (chrooted accounts), claude-mirror falls back to client-side hashing + `get`/`put` — functionally identical, slightly slower on large files.
 - **Strict host checking** — `sftp_strict_host_check: true` (default) means claude-mirror refuses to connect if the server's host key doesn't match `~/.ssh/known_hosts`. Set to `false` only for trusted LAN setups with rotating IPs.
 
+## Diagnosing setup problems
+
+Once an SFTP backend is configured (or you suspect it's misconfigured), run:
+
+```bash
+claude-mirror doctor --backend sftp
+```
+
+This runs the generic credentials/connectivity checks AND seven SFTP-specific deep checks:
+
+1. **Host fingerprint matches `~/.ssh/known_hosts`** — paramiko's `HostKeys` looks up the configured `sftp_host` in your known_hosts; if found, doctor opens an unauthenticated SSH transport, pulls the server's live host key from the handshake, and compares fingerprints. A mismatch is a SECURITY INCIDENT (possible MITM) and causes doctor to refuse to continue. If the host isn't in known_hosts at all, doctor emits an info line — first connection will prompt to verify.
+2. **SSH key file exists + readable** — checks `sftp_key_file` (after `~` expansion). Failures point at the YAML or `ssh-keygen` to generate a fresh key.
+3. **SSH key file permissions are 0600** — uses `os.stat(...).st_mode & 0o077` to detect any group/world bits set. OpenSSH refuses keys with looser permissions; doctor surfaces the offending mode and tells you to run `chmod 600 PATH`. Doctor does NOT auto-fix — chmod is a deliberate human action.
+4. **SSH key can decrypt** — encrypted keys (passphrase-protected) raise `PasswordRequiredException`, which doctor reports as an info line, not a failure. ssh-agent (or claude-mirror's `auth` flow) handles the passphrase at sync time.
+5. **Connection + authenticate** — opens a paramiko `Transport` to `sftp_host:sftp_port` (5-second timeout), authenticates with the configured key (or password fallback). Catches: server unreachable, auth rejected, host-key mismatch detected at the auth layer.
+6. **`exec_command` capability** — probes `echo claude-mirror-doctor-probe` over an SSH session. If it returns exit 0, claude-mirror will use server-side `sha256sum` + `cp -p` for snapshot operations. If the channel request is refused (typical of `ForceCommand internal-sftp` setups), claude-mirror falls back to client-side hashing — functionally identical, slightly slower on large files. Either branch is an info line, not a failure.
+7. **Root path access** — `sftp.stat(sftp_folder)` against the live SFTP channel. NotFound is an info line ("claude-mirror creates it on first push"); PermissionDenied is an auth-bucket failure pointing at server-side ACLs.
+
+Sample successful output:
+
+```
+$ claude-mirror doctor --backend sftp
+claude-mirror doctor — /home/alice/.config/claude_mirror/myproject.yaml
+
+  ✓ config file parses: /home/alice/.config/claude_mirror/myproject.yaml
+
+── checking sftp backend (/home/alice/.config/claude_mirror/myproject.yaml)
+  · credentials file: skipped (SFTP uses inline host/user/key in YAML)
+  ✓ SFTP credentials present in config (host + username + folder + key/password)
+  ✓ SFTP connectivity ok (session opened + stat(/home/alice/claude-mirror/myproject) succeeded)
+  ✓ SSH key file readable: /home/alice/.ssh/id_ed25519
+  ✓ known_hosts file present: /home/alice/.ssh/known_hosts
+SFTP deep checks
+  ✓ Host in known_hosts; fingerprint matches (SHA256:abcdef...)
+  ✓ Key file readable: /home/alice/.ssh/id_ed25519
+  ✓ Key file permissions: 0600
+  ✓ Key decryptable (or ssh-agent will handle)
+  ✓ Connection + auth succeeded
+  ✓ exec_command available; server-side hashing will be used
+  ✓ Root path: /home/alice/claude-mirror/myproject
+  ✓ project_path exists: /home/alice/projects/myproject
+  ✓ manifest parses: /home/alice/projects/myproject/.claude_mirror_manifest.json
+
+✓ All checks passed.
+```
+
+Sample failure on the host-fingerprint-mismatch case (the security-critical one):
+
+```
+SFTP deep checks
+  ✗ Host fingerprint mismatch in /home/alice/.ssh/known_hosts
+           Stored fingerprint: SHA256:abcdef...
+           Live fingerprint:   SHA256:000000...
+           POSSIBLE MAN-IN-THE-MIDDLE — refusing to connect.
+      Fix: investigate the mismatch. If the host genuinely changed, run
+           ssh-keygen -R sftp.example.com and re-add the host (verify the
+           new fingerprint out-of-band first).
+```
+
+The fix-hint mentions `ssh-keygen -R HOSTNAME` deliberately — fingerprint mismatches are not a token problem, they're a security incident. Do NOT just re-run `claude-mirror auth`; verify the new host fingerprint out-of-band (e.g. ask the server administrator) before adding it back to known_hosts.
+
+If multiple auth-class checks would fail (fingerprint mismatch + permission denied at the same time), doctor emits ONE bucketed failure and short-circuits the rest — you don't get five copies of "your access is broken" rooted in the same problem.
+
+For chrooted (`internal-sftp`) accounts, expect the `exec_command` check to surface as a yellow info line — that's fine. claude-mirror falls back to client-side hashing transparently.
+
+See [admin.md#sftp-deep-checks](../admin.md#sftp-deep-checks) for the full deep-check reference table and the auth-bucketing semantics.
+
 ## See also
 
 - [Scenario A — Standalone](../scenarios.md#a-standalone-mirror) for end-to-end usage patterns with this backend.
 - [admin.md](../admin.md) for snapshots, retention policies, and the watcher daemon.
+- [admin.md#sftp-deep-checks](../admin.md#sftp-deep-checks) for the full doctor deep-check matrix.
 - [conflict-resolution.md](../conflict-resolution.md) for handling `sync` conflicts.
 - [cli-reference.md](../cli-reference.md) for the full command list.

@@ -4,6 +4,35 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.48] — 2026-05-08
+
+`doctor --backend NAME` now layers deep, backend-specific diagnostic checks on top of the generic per-backend pass for **all five backends**. v0.5.46 shipped this for `googledrive`; v0.5.48 closes the parity gap by adding equivalent deep checks for `dropbox`, `onedrive`, `webdav`, and `sftp`.
+
+### Added — Cross-backend `doctor` deep diagnostic parity
+- **`doctor --backend dropbox`** (DOC-DBX) — six new checks: token JSON shape (`access_token` or `refresh_token` present), `dropbox_app_key` format sanity (regex), `users_get_current_account` smoke test against the Dropbox SDK, granted-scope inspection (`files.content.read` + `files.content.write` for PKCE tokens; legacy tokens emit info line + skip), `files_list_folder` against the configured `dropbox_folder` (catches NotFound, permission-denied, team-folder access issues), and an account-type / team-status info line (team admins can disable third-party app access, silently breaking sync). 11 new tests.
+- **`doctor --backend onedrive`** (DOC-ONE) — six new checks: MSAL token cache integrity, Azure `onedrive_client_id` GUID format validation (runs BEFORE MSAL construction so error messages stay actionable), granted-scope inspection (with fallback chain through both `app.get_accounts()` and `cache.find("AccessToken")` — MSAL cache shape varies), silent token refresh against the cached account, Microsoft Graph drive-item probe (`me/drive/root:/{onedrive_folder}`), and a folder-vs-file shape assertion on the response. `requests.get` is lazy-imported inside the deep-check function for clean test mocking. 12 new tests.
+- **`doctor --backend webdav`** (DOC-WD) — six new checks: URL well-formedness, `PROPFIND` on the configured root (HTTP 207 expected; classifies 401 / 404 / 405 / 5xx with specific fix-hints), `DAV:` class header detection (server-quirk-tolerant: `oc:checksums` exposure varies wildly across Nextcloud / OwnCloud / Apache `mod_dav` and is treated as informational), `getetag` presence for change-detection, `oc:checksums` extension support detection, and an account-base smoke probe gated on the Nextcloud / OwnCloud URL pattern. 13 new tests.
+- **`doctor --backend sftp`** (DOC-SFTP) — seven new checks: host fingerprint match against `~/.ssh/known_hosts` with **bracketed `[host]:port` lookup form** (paramiko's quirk for non-standard ports) and fallback to bare host, mismatch treated as a possible MITM with a fix-hint pointing at `ssh-keygen -R hostname` (NOT `claude-mirror auth` — fingerprint mismatches are a security incident, not a token problem); SSH key file existence + 0600 permissions (`os.stat & 0o077` detects any group/world bit, no auto-fix — user runs `chmod 600` consciously); key decryption (or ssh-agent fallback for encrypted keys); a raw-socket → `Transport(sock)` → `start_client(timeout=5)` handshake pattern (NOT `SSHClient.connect`) so the live host key can be checked **before** credentials are sent; auth + connection; `exec_command` capability detection (some `internal-sftp`-jailed accounts disallow shell, in which case claude-mirror falls back to client-side hashing); root-path `stat` (NotFound is informational — claude-mirror creates the path on first push). 15 new tests; the auth-bucket short-circuit is verified end-to-end with an inverted assertion that `auth_publickey` / `open_session` / `SFTPClient.from_transport` never fire after a fingerprint mismatch.
+- All four mirror v0.5.46's auth-bucket grouping pattern: multiple auth-class failures collapse into a single `ACTION REQUIRED` block instead of N duplicate re-auth lines for the same root cause. SDK clients are lazy-imported so the generic `doctor` invocation stays quick.
+- **51 new tests total** (DOC-DBX 11 + DOC-ONE 12 + DOC-WD 13 + DOC-SFTP 15). All offline (mocked SDKs), <100ms each.
+
+### Documented
+- `docs/admin.md` — extended the Doctor section with five `### <Backend> deep checks` subsections (Drive, Dropbox, OneDrive, WebDAV, SFTP), each with check-matrix table, auth-bucketing semantics, lazy-import note, sample success + failure outputs.
+- `docs/backends/{dropbox,onedrive,webdav,sftp}.md` — each backend doc gains a `## Diagnosing setup problems` subsection mirroring the existing `docs/backends/google-drive.md` shape from v0.5.46.
+- `docs/cli-reference.md` — extended the `doctor` entry with one paragraph per backend describing the deep-check matrix and cross-linking to admin.md + the backend-specific doc.
+- `README.md` — Quality gates count `622 → 673` and the surface list now names the deep-check coverage for **all five backends** rather than only googledrive.
+
+### Updated docs/files
+- `claude_mirror/cli.py` (~1700 lines added: `_run_dropbox_deep_checks`, `_onedrive_deep_check_factory` + `_run_onedrive_deep_checks`, `_run_webdav_deep_checks`, `_sftp_deep_check_factory` + `_run_sftp_deep_checks`, four new dispatch hooks in `_run_doctor_checks` with section headers).
+- `tests/test_doctor_{dropbox,onedrive,webdav,sftp}_deep.py` (NEW, 51 tests total).
+- `docs/admin.md`, `docs/cli-reference.md`, `docs/backends/{dropbox,onedrive,webdav,sftp}.md`, `README.md`.
+- `pyproject.toml` (version 0.5.47 → 0.5.48).
+
+### Tests
+- `pytest tests/` — **673 passed in ~2.8s** (= 622 baseline + 51 new). All offline, all deterministic.
+
+---
+
 ## [0.5.47] — 2026-05-08
 
 Two independent additions: three new notification backends (Discord / Teams / Generic webhook) plus the Drive Pub/Sub auto-setup that v0.5.46's deep `doctor` only diagnosed.

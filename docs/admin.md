@@ -973,6 +973,32 @@ The Pub/Sub admin SDK (`google.cloud.pubsub_v1`) is lazy-imported inside the dee
 
 If `doctor` reports a missing Pub/Sub topic, missing per-machine subscription, or missing IAM grant for Drive's service account, re-run `claude-mirror init --auto-pubsub-setup --config <path>` to fix all three in one step. The auto-setup helper (added in v0.5.47, documented in [backends/google-drive.md](backends/google-drive.md#auto-create-pubsub-topic--subscription--iam-grant---auto-pubsub-setup-since-v0547)) is idempotent: anything that already exists is left in place, anything missing is created using the OAuth credentials acquired by the wizard's smoke test. Re-running `doctor` afterwards should now report all six checks green.
 
+### OneDrive deep checks
+
+When `--backend onedrive` is in effect (explicitly via the flag, or because the primary / a Tier 2 mirror is `onedrive`), the doctor runs an additional set of checks targeting failure modes that only show up on OneDrive. These complement the generic credentials/token/connectivity loop above; they don't replace it. Skipped silently for every other backend.
+
+| Check | Failure looks like |
+|---|---|
+| Token cache integrity | `Token cache unreadable` (corrupt JSON / wrong shape) or `Token cache has no cached accounts` (cache exists but is empty). Fix is `claude-mirror auth --config PATH` to (re-)complete the device-code login. The MSAL token cache is a JSON document inside the `token_file`; we deserialize it via `msal.SerializableTokenCache` and confirm at least one cached account |
+| Azure client_id format valid | `Azure client_id has invalid format: 'STRING'` — Azure Application (client) IDs are GUIDs in `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` format. Fix is to edit the YAML and set `onedrive_client_id` to your Azure App registration's Application (client) ID. Doctor surfaces this BEFORE attempting MSAL so the user doesn't see a cryptic "invalid client" error from deeper in the stack |
+| Granted scopes match config | claude-mirror's OneDrive backend requests `Files.ReadWrite` (or `Files.ReadWrite.All` for shared OneDrive Business tenants). If the cached account's scopes don't include either, doctor emits a yellow warning "Scopes missing from cache: expected one of Files.ReadWrite, Files.ReadWrite.All" and suggests re-running `claude-mirror auth`. This is informational rather than fatal — the silent-token call below will settle it definitively |
+| Token still refreshable | `acquire_token_silent(scopes, account)` is called against the cached account. If the result is `None`, contains an `error` key, or raises, the refresh token has expired or been revoked — AUTH bucket fail with `claude-mirror auth --config PATH` as the fix. The error code (`invalid_grant`, `AADSTS70008`, etc.) is surfaced verbatim so the user can match it against Microsoft's documentation |
+| Drive item access | Microsoft Graph GET against `me/drive/root:/{onedrive_folder}`. 200 ⇒ folder exists and is reachable. 404 ⇒ "OneDrive folder doesn't exist; create it via the OneDrive web UI or run `claude-mirror push` to create it on first sync". 401 ⇒ AUTH bucket fail. 403 ⇒ permission failure (account lacks access to the folder). 5xx ⇒ TRANSIENT classification, "retry; check status.office.com for service incidents". Network failure ⇒ same TRANSIENT treatment |
+| Drive item type | Confirms Graph returned a `folder` shape (not a `file`). If the configured `onedrive_folder` points at a file rather than a folder, sync would fail; doctor catches this up front. Per-file `quickXorHash` detection happens at sync time (the hash field appears on individual `DriveItem`s, not on folder metadata), so we don't probe individual files here — folder access alone is sufficient evidence the configuration is workable |
+
+#### Auth-failure bucketing
+
+If `acquire_token_silent` fails (returns None / error dict / raises), or if the Graph drive-item probe returns 401, the deep section emits ONE auth-bucket failure line (`OneDrive auth failed`) and skips the remaining checks. This avoids two-or-three identical "auth needed" lines for what is always the same root cause and the same fix (`claude-mirror auth --config PATH`).
+
+#### Lazy import
+
+The MSAL SDK (`msal`) is lazy-imported inside the deep-check function so the multi-hundred-millisecond import cost is only paid when `--backend onedrive` is actually exercising these checks. Generic `claude-mirror doctor` invocations on other backends remain fast.
+
+#### When the deep section is skipped
+
+- `onedrive_folder` empty in the YAML — doctor emits a yellow info line ("OneDrive folder not configured … skipping deep OneDrive checks") and stops the deep section there. The generic checks still run; the user is presumably mid-wizard.
+- Token file missing — the generic Check 3 above already emitted a failure for this; doctor doesn't repeat it in the deep section.
+
 ### Sample successful output
 
 ```
@@ -1068,6 +1094,60 @@ If `users_get_current_account` fails with `AuthError` (or an HTTP 401 from a gen
 
 The Dropbox SDK (`dropbox`) is lazy-imported inside the deep-check function so its tens-of-milliseconds import cost is only paid when `--backend dropbox` is actually exercising these checks. Generic `claude-mirror doctor` invocations on other backends remain fast.
 
+### WebDAV deep checks
+
+When `--backend webdav` is in effect (explicitly via the flag, or because the primary / a Tier 2 mirror is `webdav`), the doctor runs an additional six checks targeting failure modes that only show up on WebDAV servers. These complement the generic credentials/token/connectivity loop above; they don't replace it. Skipped silently for every other backend.
+
+| Check | Failure looks like |
+|---|---|
+| URL well-formed | `WebDAV URL malformed: URL` — fix is `https://host/path`-shaped URL in the YAML, or re-run `claude-mirror init --wizard --config PATH`. Empty `webdav_url` and bare `http://` (without `webdav_insecure_http: true`) are both rejected here, before any network call |
+| PROPFIND on the configured root returns HTTP 207 | `PROPFIND failed: HTTP STATUS` — branch hints by status code: 401 → auth-bucket (verify `webdav_username` / `webdav_password`), 404 → "configured WebDAV root doesn't exist" (create the folder server-side or fix the URL), 405 → "server doesn't support PROPFIND" (typically a misconfigured endpoint serving plain HTTP, or a Nextcloud URL missing `/remote.php/dav/files/USER/`), 5xx → transient retry hint |
+| DAV class detection | `no DAV class header reported by server` (info, not failure) — server may still work for basic ops. A header that lacks class 1 emits a yellow warning ("does NOT list class 1"); class 1, 2, 3 from Nextcloud is the canonical green case |
+| ETag header presence | `no ETag returned` (info, not failure) — claude-mirror falls back to last-modified / content-md5 for change detection. Detected from either the `ETag:` response header OR the PROPFIND XML's `<d:getetag/>` field |
+| oc:checksums extension support | `oc:checksums extension not advertised` (info, not failure) — Nextcloud / OwnCloud only. When advertised, the kinds (`MD5`, `SHA1`, `SHA256`, etc.) are listed inline so the user knows what their server exposes |
+| Account-level PROPFIND for Nextcloud / OwnCloud-shaped URLs | `Account-level PROPFIND failed: HTTP 404` ⇒ "Account base unreachable" — the username segment in `webdav_url` is wrong. Skipped silently for non-Nextcloud-pattern URLs (Apache mod_dav, Synology, Box.com, etc.). Triggered only when the URL matches `https?://HOST/remote.php/dav/files/USER/...` |
+
+#### Auth-failure bucketing
+
+If the very first PROPFIND returns 401 (or the account-level PROPFIND does, but the root succeeded somehow), the deep section emits ONE auth-bucket failure line (`Credentials rejected. Verify webdav_username and webdav_password.`) and skips the remaining checks. This avoids duplicate "credentials rejected" copies for what is always the same root cause and the same fix (`claude-mirror auth --config PATH`).
+
+#### Lazy import
+
+The `requests` and `urllib.parse` modules are top-level imports already in the WebDAV backend, so the deep section adds no additional import cost. The XML parser and regex used for the Nextcloud-pattern URL detection are stdlib-only.
+
+#### When the deep section is skipped
+
+- Backend is not `webdav` — the deep section is gated on `backend_name == "webdav"`.
+- `webdav_url` empty in the YAML — Check 1 surfaces this and bails.
+- Token file absent AND no `webdav_password` in the YAML — generic Check 3 already flagged it; the deep section bails silently rather than emitting a duplicate complaint and a network call it can't authenticate.
+
+### SFTP deep checks
+
+When `--backend sftp` is in effect (explicitly via the flag, or because the primary / a Tier 2 mirror is `sftp`), the doctor runs an additional seven checks targeting failure modes that only show up on SFTP/SSH backends. These complement the generic credentials/connectivity loop above; they don't replace it. Skipped silently for every other backend.
+
+| Check | Failure looks like |
+|---|---|
+| Host fingerprint matches `~/.ssh/known_hosts` | `Host fingerprint mismatch in PATH` plus the explanatory line `POSSIBLE MAN-IN-THE-MIDDLE — refusing to connect.` and the fix `ssh-keygen -R HOSTNAME` (verify the new fingerprint out-of-band first). The fix-hint deliberately does NOT mention `claude-mirror auth` — fingerprint mismatches are not a token problem, they're a security incident. If the host isn't in known_hosts at all, doctor emits a yellow info line ("first connection will prompt to verify") and runs the rest of the checks |
+| SSH key file exists + readable | `SSH key file not found: PATH` (fix: regenerate with `ssh-keygen` or fix the YAML) or `SSH key file not readable: PATH` (fix: `chmod 600 PATH`) |
+| SSH key file permissions are 0600 | `Key file permissions too open: NNNN on PATH` plus the explanatory line `OpenSSH refuses keys readable by group or world.` and the fix `chmod 600 PATH`. Doctor uses `os.stat(...).st_mode & 0o077` to detect any group/world bits and does NOT auto-fix — chmod is a deliberate human action |
+| SSH key can decrypt | If the key is encrypted, doctor emits a yellow info line ("ssh-agent or claude-mirror's auth flow handles this at sync time"), NOT a failure. Malformed/garbage key files surface as `Key file unparseable: PATH` with a regenerate fix-hint |
+| Connection + auth succeeds | TCP connect failures classify as `Connection timed out` (fix: `ping HOST`, check port) or `Server unreachable` (fix: verify server is up and port is open). Auth rejections classify as `SSH authentication rejected` (fix: verify key/password and `~/.ssh/authorized_keys` on the server). Both auth-class failures bucket into ONE failure line — no cascading copies of the same root cause |
+| `exec_command` capability | If `transport.open_session()` succeeds and the probe returns exit 0, doctor emits `exec_command available; server-side hashing will be used`. If it fails (typical of `internal-sftp`-jailed accounts), doctor emits a yellow info line `exec_command unavailable — client-side hashing fallback active`. Neither branch is a failure — both modes are fully supported, just with slightly different snapshot performance on large files |
+| Root path access | `sftp.stat(sftp_folder)` succeeds → green ✓. NotFound → yellow info line ("claude-mirror creates it on first push"), NOT a failure. PermissionDenied → AUTH-bucket failure with a server-side ACL fix-hint mentioning the configured `sftp_username` |
+
+#### Auth-failure bucketing
+
+Auth-class failures (host fingerprint mismatch, auth rejected, root-path permission denied) all funnel through ONE auth-bucket — at most one of these fires per run, and the remaining checks are short-circuited so the user doesn't see five copies of "your access is broken" rooted in the same problem. The bucket fix-hint is contextual: fingerprint mismatch points at `ssh-keygen -R HOSTNAME` (NOT `claude-mirror auth` — fingerprint mismatches aren't a token problem), auth rejection points at the YAML + server-side `authorized_keys`, and permission-denied points at server-side ACLs.
+
+#### Lazy import
+
+`paramiko` is lazy-imported inside the deep-check function so the import cost is only paid when `--backend sftp` is actually exercising these checks. Generic `claude-mirror doctor` invocations on other backends remain fast.
+
+#### When the deep section is skipped
+
+- Backend is not `sftp` — the deep section is gated on `backend_name == "sftp"` and silently skipped for everything else.
+- Generic Check 3 (SFTP credentials present in YAML) failed — the deep section still runs, but most checks degrade to "missing credentials" failures pointing back at the YAML.
+
 ### Sample Dropbox deep-check successful output
 
 ```
@@ -1117,6 +1197,7 @@ claude-mirror doctor                                              # auto-detect 
 claude-mirror doctor --config ~/.config/claude_mirror/work.yaml   # specific config
 claude-mirror doctor --backend dropbox                            # only check the dropbox backend (Tier 2)
 claude-mirror doctor --backend googledrive                        # generic checks PLUS Drive deep checks (scopes, APIs, topic, subscription, IAM grant)
+claude-mirror doctor --backend onedrive                           # generic checks PLUS OneDrive deep checks (token cache, client_id, scopes, refresh, Graph drive-item probe)
 ```
 
 The `--backend` filter is case-insensitive and accepts `googledrive`, `dropbox`, `onedrive`, `webdav`, or `sftp`. The primary config is always parsed; only the per-backend loop is filtered. Skipped backends print a dim `── skipped: NAME (PATH) — does not match --backend FILTER` line so the output stays self-explanatory.

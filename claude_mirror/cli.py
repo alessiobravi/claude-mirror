@@ -93,24 +93,16 @@ class _JsonMode:
         self._sink: Optional[io.StringIO] = None
         self._saved_stdout: Optional[Any] = None
         self._saved_stderr: Optional[Any] = None
+        self._saved_progress: Optional[tuple] = None
 
     def __enter__(self) -> "_JsonMode":
         import claude_mirror.cli as _cli_mod
         from claude_mirror import snapshots as _snap_mod
         from claude_mirror import sync as _sync_mod
+        from claude_mirror import _progress as _progress_mod
         self._saved = _cli_mod.console
         self._saved_snap = _snap_mod.console
         self._saved_sync = getattr(_sync_mod, "console", None)
-        # Snapshot sys.stdout/stderr so we can forcibly restore them on
-        # exit. Rich Live (used by transient=True Progress regions inside
-        # engine.get_status, SnapshotManager.list_snapshots, etc.) does
-        # `redirect_stdout=True` by default — it replaces sys.stdout
-        # during its lifetime and restores on exit. Under Click's
-        # CliRunner on Linux, that restore can leave sys.stdout pointing
-        # at a void instead of the runner's captured buffer, so
-        # subsequent click.echo writes never reach result.stdout. Forcing
-        # the restore here pins sys.stdout/stderr back to what they were
-        # at __enter__, which IS the runner's captured stream.
         self._saved_stdout = sys.stdout
         self._saved_stderr = sys.stderr
         self._sink = io.StringIO()
@@ -119,21 +111,45 @@ class _JsonMode:
         _snap_mod.console = quiet
         if self._saved_sync is not None:
             _sync_mod.console = quiet
+        # Replace make_phase_progress with a no-op factory for the
+        # duration. Rich's Progress(transient=True) wraps a Live region
+        # that does redirect_stdout=True by default; under Click's
+        # CliRunner on Linux that redirect leaves Click's stdout wiring
+        # poisoned even after Live.__exit__ runs, so subsequent
+        # click.echo writes never reach result.stdout. Suppressing the
+        # Progress entirely sidesteps the issue. We patch the SOURCE
+        # module plus every consuming module's local binding (sync,
+        # snapshots both do `from ._progress import make_phase_progress`
+        # at module load time, which creates per-module name bindings).
+        self._saved_progress = (
+            _progress_mod.make_phase_progress,
+            getattr(_sync_mod, "make_phase_progress", None),
+            getattr(_snap_mod, "make_phase_progress", None),
+        )
+        _progress_mod.make_phase_progress = _no_op_progress  # type: ignore[assignment]
+        if self._saved_progress[1] is not None:
+            _sync_mod.make_phase_progress = _no_op_progress  # type: ignore[assignment]
+        if self._saved_progress[2] is not None:
+            _snap_mod.make_phase_progress = _no_op_progress  # type: ignore[assignment]
         return self
 
     def __exit__(self, *_exc: Any) -> None:
         import claude_mirror.cli as _cli_mod
         from claude_mirror import snapshots as _snap_mod
         from claude_mirror import sync as _sync_mod
+        from claude_mirror import _progress as _progress_mod
         if self._saved is not None:
             _cli_mod.console = self._saved
         if self._saved_snap is not None:
             _snap_mod.console = self._saved_snap
         if self._saved_sync is not None:
             _sync_mod.console = self._saved_sync
-        # Forcibly restore sys.stdout/stderr in case Rich Live (or any
-        # other context manager opened during the with block) failed to
-        # put them back. See note in __enter__.
+        if self._saved_progress is not None:
+            _progress_mod.make_phase_progress = self._saved_progress[0]  # type: ignore[assignment]
+            if self._saved_progress[1] is not None:
+                _sync_mod.make_phase_progress = self._saved_progress[1]  # type: ignore[assignment]
+            if self._saved_progress[2] is not None:
+                _snap_mod.make_phase_progress = self._saved_progress[2]  # type: ignore[assignment]
         if self._saved_stdout is not None:
             sys.stdout = self._saved_stdout
         if self._saved_stderr is not None:
@@ -144,6 +160,35 @@ class _JsonMode:
             except Exception:
                 pass
             self._sink = None
+
+
+class _NoOpProgressCtx:
+    """Stand-in for `rich.progress.Progress` used when --json mode is
+    active. Mimics the small surface that callers use (`add_task`,
+    `update`, `remove_task`, context-manager protocol) and does
+    nothing. Avoids opening a Rich Live region, which on Linux under
+    Click's CliRunner leaves Click's stdout wiring poisoned."""
+
+    def __enter__(self) -> "_NoOpProgressCtx":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        pass
+
+    def add_task(self, *_args: Any, **_kwargs: Any) -> int:
+        return 0
+
+    def update(self, *_args: Any, **_kwargs: Any) -> None:
+        pass
+
+    def remove_task(self, *_args: Any, **_kwargs: Any) -> None:
+        pass
+
+
+def _no_op_progress(_console: Any) -> _NoOpProgressCtx:
+    """Drop-in replacement for `make_phase_progress` while --json mode
+    is active. See `_NoOpProgressCtx`."""
+    return _NoOpProgressCtx()
 
 
 def _emit_json_success(command: str, result: Any) -> None:

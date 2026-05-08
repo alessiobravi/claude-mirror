@@ -4,6 +4,20 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.42] — 2026-05-08
+
+Third and decisive hotfix for v0.5.39's `--json` mode on Linux. The two prior fixes (`click.echo` in v0.5.40, `sys.stdout` snapshot/restore in v0.5.41) addressed symptoms; this one addresses the cause.
+
+### Fixed — prevent Rich Progress from opening during `--json` mode
+- The 13 failing `tests/test_json_output.py` cases on the CI Linux matrix all hit commands whose `with _JsonMode():` block opens a Rich `Progress(transient=True)` region (status, snapshots, history, log via `engine.get_status` / `SnapshotManager.list_snapshots` / etc.). Inbox alone passed because its block opens no Progress.
+- Rich's `Progress(transient=True)` wraps a `Live` region with `redirect_stdout=True` by default. Once Live runs under Click's `CliRunner` on Linux, it leaves Click's stdout wiring in a state where subsequent `click.echo` writes do not reach `result.stdout` — even after Live's own restoration runs and even after `_JsonMode.__exit__` forcibly restores `sys.stdout`. macOS doesn't reproduce.
+- v0.5.40's switch from `sys.stdout.write` to `click.echo` was correct (still in place). v0.5.41's `sys.stdout` snapshot/restore was correct (still in place). Both were necessary but not sufficient — neither could un-poison Click's wiring once Live had touched it.
+- v0.5.42 prevents Live from ever opening during `--json` mode: `_JsonMode.__enter__` replaces `make_phase_progress` with a `_no_op_progress` factory in the source module AND in every consuming module's local binding (`claude_mirror.sync` and `claude_mirror.snapshots` both do `from ._progress import make_phase_progress` at load time, creating per-module name bindings that need their own patches). `__exit__` restores all three. The no-op returns a stub context manager that mimics the small Progress surface callers use (`add_task`, `update`, `remove_task`, context-manager protocol) and does nothing.
+- 505 tests pass on macOS; CI re-run on push validates the Linux matrix conclusively.
+- None of v0.5.39 / v0.5.40 / v0.5.41 was tagged or published to PyPI, so no end users received a broken `--json` path.
+
+---
+
 ## [0.5.41] — 2026-05-08
 
 Follow-up to the v0.5.40 hotfix for v0.5.39's `--json` mode: the `click.echo` switch was correct but not sufficient. The deeper root cause was Rich Live's stdout redirection.

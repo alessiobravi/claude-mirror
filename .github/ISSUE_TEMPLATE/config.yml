@@ -2,6 +2,14 @@
 # https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/configuring-issue-templates-for-your-repository
 blank_issues_enabled: true
 contact_links:
+  - name: Question / setup help / general usage
+    url: https://github.com/alessiobravi/claude-mirror/discussions
+    about: |
+      For questions, configuration help (Drive / Dropbox / OneDrive /
+      WebDAV / SFTP setup, Tier 2 multi-backend, snapshot retention,
+      etc.), or general usage discussion, please use Discussions
+      rather than filing an issue. Issues are reserved for confirmed
+      bugs and concrete feature requests.
   - name: Security vulnerability (private)
     url: https://github.com/alessiobravi/claude-mirror/security/advisories/new
     about: |

@@ -4,6 +4,7 @@
 [![PyPI](https://img.shields.io/pypi/v/claude-mirror)](https://pypi.org/project/claude-mirror/)
 [![Python](https://img.shields.io/pypi/pyversions/claude-mirror)](https://pypi.org/project/claude-mirror/)
 [![License](https://img.shields.io/pypi/l/claude-mirror)](https://github.com/alessiobravi/claude-mirror/blob/main/LICENSE)
+[![Discussions](https://img.shields.io/github/discussions/alessiobravi/claude-mirror)](https://github.com/alessiobravi/claude-mirror/discussions)
 
 **Mirror your project files across machines and cloud backends — with multi-cloud redundancy, time-travel disaster recovery, and real-time collaboration signals.**
 

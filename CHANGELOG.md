@@ -4,6 +4,16 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.35] — 2026-05-08
+
+### Added — GitHub Discussions wired into the issue chooser + README badge
+- GitHub Discussions enabled on the repository (Settings → Features → Discussions). Splits "I have a question" / "how do I configure SFTP" / "Tier 2 best practices" from "this is a confirmed bug" before noise accumulates in the issues tracker.
+- `.github/ISSUE_TEMPLATE/config.yml` extended with a "Question / setup help / general usage" contact link that points to the Discussions tab. Anyone clicking "New issue" now sees Discussions as the first listed alternative, with an explicit note that issues are reserved for confirmed bugs and concrete feature requests.
+- README badge row gains a Discussions count badge alongside the existing Tests / PyPI / Python / License row — completes the standard 5-badge maturity-signalling row that public Python tools typically display.
+- No code changes; no test surface impact.
+
+---
+
 ## [0.5.34] — 2026-05-08
 
 A wave of fixes and additions to the v0.5.33 Tier 2 + SFTP surfaces, all surfaced by real-world use of the SFTP backend the day after it shipped. Highlights: `seed-mirror`, `status --by-backend`, live-verifying status views, paramiko channel-multiplex perf fix, Ctrl+C-safe manifest persistence.

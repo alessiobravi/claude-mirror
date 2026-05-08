@@ -19,6 +19,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBaseUpload
 
 from ..config import Config
+from ..throttle import get_throttle
 from . import BackendError, ErrorClass, StorageBackend
 from ._util import write_token_secure as _write_token_secure
 
@@ -518,22 +519,70 @@ class GoogleDriveBackend(StorageBackend):
         root_folder_id: str,
         file_id: Optional[str] = None,
     ) -> str:
+        """Resumable upload with optional bandwidth throttling.
+
+        Drive resumable upload semantics (per
+        https://developers.google.com/drive/api/guides/manage-uploads
+        #resumable): the client opens an upload session, the server
+        returns a session URI, and the client streams 256 KiB-aligned
+        chunks (default chunksize ≈ 5 MiB in the python client). This
+        protocol natively SURVIVES PROCESS RESTART — the upload session
+        URI can be reused to resume a partially-uploaded file. We rely
+        on it implicitly via `resumable=True`; integration-level resume
+        from disk after a crash is a future feature, not in v0.5.39.
+
+        Bandwidth-cap path: when `max_upload_kbps` is set we drive the
+        upload manually via `request.next_chunk()` so we can call
+        `bucket.consume(chunk_size)` BEFORE each chunk goes on the wire.
+        Without a cap we keep the legacy single-`.execute()` path so
+        Drive's internal resumable loop runs at full speed.
+        """
+        rate = getattr(self.config, "max_upload_kbps", None)
         media = MediaFileUpload(local_path, resumable=True)
         if file_id:
-            file = self.service.files().update(
+            request = self.service.files().update(
                 fileId=file_id,
                 media_body=media,
                 fields="id, md5Checksum",
-            ).execute()
+            )
         else:
             parent_id, name = self.resolve_path(rel_path, root_folder_id)
             meta = {"name": name, "parents": [parent_id]}
-            file = self.service.files().create(
+            request = self.service.files().create(
                 body=meta,
                 media_body=media,
                 fields="id, md5Checksum",
-            ).execute()
-        return file["id"]
+            )
+        if not rate:
+            # Legacy fast path — Drive's SDK runs the resumable loop
+            # internally with no per-chunk throttle hook.
+            file = request.execute()
+            return file["id"]
+
+        # Throttled path — manual chunk loop.
+        bucket = get_throttle(rate)
+        try:
+            file_size = int(os.path.getsize(local_path))
+        except OSError:
+            file_size = 0
+        # `chunksize` is a property on MediaFileUpload; default ≈ 5 MiB.
+        try:
+            chunk_size = int(media.chunksize)
+        except Exception:
+            chunk_size = 5 * 1024 * 1024
+        last_progress = 0
+        response = None
+        while response is None:
+            reserve = max(chunk_size, 1)
+            if file_size:
+                remaining = max(0, file_size - last_progress)
+                if remaining > 0:
+                    reserve = min(reserve, remaining)
+            bucket.consume(reserve)
+            status, response = request.next_chunk()
+            if status is not None:
+                last_progress = int(getattr(status, "resumable_progress", last_progress))
+        return response["id"]
 
     # Hard cap on remote-file size we will load into memory. claude-mirror is
     # designed for small text/markdown files; nothing legitimate should ever

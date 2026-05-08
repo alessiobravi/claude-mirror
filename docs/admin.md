@@ -341,6 +341,74 @@ Both `blobs` and `full` snapshots are accepted, and the two snapshots may even b
 
 ---
 
+## Performance and bandwidth control
+
+claude-mirror is built around small markdown / JSON files, but the same upload paths handle snapshot blobs and (in Tier 2) parallel mirror writes. v0.5.39 adds two performance levers: a per-backend bandwidth cap and WebDAV chunked-PUT for large files.
+
+### Bandwidth throttling: `max_upload_kbps`
+
+Set `max_upload_kbps` in the project YAML to cap upload bandwidth on that backend. The value is in **kilobits per second** (1 kbps = 128 bytes/sec) so it matches the units users see in their ISP / NAS contracts.
+
+```yaml
+# in your project YAML — null (default) disables throttling
+max_upload_kbps: 1024     # ≈ 128 KiB/sec, ≈ 7.5 MiB/min
+```
+
+How it works under the hood:
+
+- A token-bucket limiter (in `claude_mirror/throttle.py`) lives inside each backend instance. The bucket fills at `max_upload_kbps * 1024 / 8` bytes/sec, up to a default capacity of `max(64 KiB, rate-bytes-per-sec)`.
+- Every upload path consumes from the bucket BEFORE handing bytes to the SDK / wire: Drive's resumable-chunk loop, Dropbox `files_upload`, OneDrive simple-PUT and chunked upload session, WebDAV PUT (both simple and chunked), SFTP per-block writes.
+- A small file (smaller than the bucket capacity) passes through with **zero added latency** — the bucket starts full at construction.
+- A larger-than-bucket file paces in capacity-sized waves, so the long-run rate stays exactly at the cap regardless of how big the file is.
+- When `max_upload_kbps` is `null` (the default), every backend uses a no-op `NullBucket` — no overhead, no behaviour change vs older versions.
+
+In **Tier 2** multi-backend setups, every mirror config has its own `max_upload_kbps` field. So you can throttle Google Drive but leave SFTP unbounded, or vice versa, by setting the field on one config and leaving it `null` on the other.
+
+When NOT to set it:
+
+- On a fast home connection where upload bandwidth is plentiful — leaving it null keeps the hot path uncapped.
+- On a process that only writes the manifest + a handful of small markdown files per push (the bucket is essentially free in that case, but also delivers no benefit).
+
+When to set it:
+
+- On a metered / capped link (mobile hotspot, 4G failover) where saturating upload affects voice / video calls.
+- When pushing large `_claude_mirror_blobs/` payloads on a freshly-seeded mirror — the seed-mirror operation moves the most data and benefits most from rate-limiting.
+- When sharing an upstream link with latency-sensitive workloads (gaming, VoIP) and you want claude-mirror to defer to those.
+
+### WebDAV chunked PUT for large files
+
+WebDAV's `upload_file` selects between two paths based on `webdav_streaming_threshold_bytes` (default `4194304`, i.e. 4 MiB):
+
+- **Below threshold** (typical markdown content): single in-memory PUT — minimal overhead.
+- **At or above threshold**: streaming PUT — the request body is a generator yielding fixed 1 MiB blocks read lazily from disk. Peak memory is bounded to one block (1 MiB) regardless of file size, and an explicit `Content-Length` header is sent so servers that reject chunked transfer-encoding (Apache mod_dav with default config) accept the upload.
+
+Configure via:
+
+```yaml
+# in your project YAML — files >= this size stream; smaller use simple PUT
+webdav_streaming_threshold_bytes: 4194304   # default 4 MiB
+```
+
+The simple-PUT path is preserved for small markdown files so the hot path is unchanged. The streaming path matters when a `_claude_mirror_blobs/` payload, an attachment, or a non-markdown asset crosses 4 MiB — without the chunked path, the whole file would land in memory before the PUT starts.
+
+The throttle bucket integrates with both paths: every block yielded by the streaming generator is pre-paid via `bucket.consume(len(block))` so the long-run rate stays honest across multi-megabyte transfers.
+
+### Upload resume behaviour by backend
+
+Resume semantics differ across backends. Document the matrix here so users know what to expect when a watcher / push process crashes mid-upload:
+
+| Backend     | Native resume protocol                          | Survives process restart | Behaviour on failure                                              |
+|-------------|-------------------------------------------------|--------------------------|-------------------------------------------------------------------|
+| googledrive | Drive resumable upload (session URI + offset)   | No (session URI not persisted across runs) | In-process retries via `_upload_with_retry` resume the session; a crashed process re-uploads from scratch on next push. |
+| dropbox     | `files_upload_session_*` (chunked + commit)     | No (session ID not persisted across runs)  | In-process retry of `files_upload`; crashed process re-uploads from scratch.                                            |
+| onedrive    | Microsoft Graph `createUploadSession`           | Up to ~7 days per Graph spec (URL not persisted by claude-mirror) | In-process retry resumes within the session; crashed process re-creates the session and re-uploads.                     |
+| webdav      | None (HTTP PUT is single-shot)                  | No                       | Re-upload from scratch on retry. Streaming PUT (v0.5.39+) keeps peak memory bounded but the wire still re-sends.        |
+| sftp        | None (paramiko's `SFTPClient` does not resume)  | No                       | Re-upload from scratch on retry. The `.tmp + posix_rename` dance keeps the destination atomic — never half-written.     |
+
+claude-mirror does NOT currently persist upload-session URLs / IDs to disk between runs, so even backends with native resume protocols restart from byte zero after a process crash. This is by design for v0.5.39: claude-mirror's working set is small markdown files, where re-uploading is cheap and the complexity of cross-restart resume isn't justified. If you push a large blob payload often enough to hit this, raise the issue and we can revisit.
+
+---
+
 ## Auto-start the watcher
 
 Use `claude-mirror watch-all` to watch every project in a single process. It auto-discovers all configs in `~/.config/claude_mirror/` and starts one notification listener per project, each in its own thread. Projects using different backends are handled transparently — each thread picks the right notifier for its backend (Pub/Sub for Google Drive, long-polling for Dropbox, periodic polling for OneDrive, WebDAV, and SFTP):

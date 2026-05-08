@@ -21,6 +21,7 @@ except ImportError:
     )
 
 from ..config import Config
+from ..throttle import get_throttle
 from . import BackendError, ErrorClass, StorageBackend
 from ._util import write_token_secure
 
@@ -366,17 +367,34 @@ class DropboxBackend(StorageBackend):
         root_folder_id: str,
         file_id: Optional[str] = None,
     ) -> str:
-        """Upload a local file. Returns the full Dropbox path as the file 'ID'."""
+        """Upload a local file. Returns the full Dropbox path as the file 'ID'.
+
+        Resume behaviour: Dropbox's `files_upload_session_*` family of
+        APIs supports resuming a multi-part upload session, but the
+        session ID does NOT survive process restart per the Dropbox SDK
+        contract — a crashed process loses the session and re-uploads
+        from scratch. claude-mirror is built around small markdown
+        files, so we use the single-call `files_upload` path; if a
+        future change moves to chunked upload sessions, the resume
+        caveat still applies.
+        """
         if file_id:
             dest_path = file_id
         else:
             parent, filename = self.resolve_path(rel_path, root_folder_id)
             dest_path = self._full_path(parent, filename)
 
+        bucket = get_throttle(getattr(self.config, "max_upload_kbps", None))
         with open(local_path, "rb") as f:
-            self.dbx.files_upload(
-                f.read(), dest_path, mode=WriteMode.overwrite,
-            )
+            body = f.read()
+        # Throttle BEFORE the SDK call — the bucket pre-pays for the
+        # bytes about to go on the wire. For larger-than-bucket files
+        # `consume()` internally paces in capacity-sized waves, so the
+        # long-run rate stays honest.
+        bucket.consume(len(body))
+        self.dbx.files_upload(
+            body, dest_path, mode=WriteMode.overwrite,
+        )
         return dest_path
 
     def download_file(self, file_id: str) -> bytes:

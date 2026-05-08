@@ -244,6 +244,34 @@ One-shot in-place upgrade. Dry-run by default — prints the pip command that wo
 
 ---
 
+## Config fields (selected)
+
+Most config fields are documented inline at the points where they affect behaviour (per-backend setup pages, retention in [admin.md](admin.md#auto-pruning-by-retention-policy), etc.). The fields that don't fit any single command's scope live here:
+
+### `max_upload_kbps`
+
+Per-backend upload bandwidth cap, in **kilobits per second** (1 kbps = 128 bytes/sec). Default `null` (disabled — every upload runs uncapped). When set, every upload path on that backend (Drive resumable-chunk loop, Dropbox `files_upload`, OneDrive simple PUT and chunked upload session, WebDAV PUT, SFTP per-block writes) consumes from a token-bucket limiter before sending bytes.
+
+```yaml
+# in your project YAML
+max_upload_kbps: 1024     # ≈ 128 KiB/sec, ≈ 7.5 MiB/min
+```
+
+In Tier 2 multi-backend setups, every mirror config has its own `max_upload_kbps` field — throttle Drive but leave SFTP unbounded, or vice versa, by setting the field on one config and leaving it `null` on the other. See [admin.md — Performance and bandwidth control](admin.md#performance-and-bandwidth-control) for the full design rationale and the per-backend resume-behaviour table.
+
+### `webdav_streaming_threshold_bytes`
+
+WebDAV-only field. Files at or above this size go through a streaming chunked-PUT path (request body is a generator yielding 1 MiB blocks; peak memory bounded to one block, NOT the whole file). Smaller files use the historic in-memory PUT path so the hot path for typical markdown content is unchanged. Default `4194304` (4 MiB).
+
+```yaml
+# in your project YAML — files >= this size stream
+webdav_streaming_threshold_bytes: 4194304
+```
+
+Ignored by the four other backends (each has its own native chunking story documented in [admin.md — Upload resume behaviour by backend](admin.md#upload-resume-behaviour-by-backend)).
+
+---
+
 ## See also
 
 - [admin.md](admin.md) — snapshots, retention, watcher daemon.

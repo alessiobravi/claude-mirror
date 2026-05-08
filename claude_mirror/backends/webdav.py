@@ -13,6 +13,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 
 from ..config import Config
+from ..throttle import get_throttle
 from . import BackendError, ErrorClass, StorageBackend
 from ._util import write_token_secure
 
@@ -568,6 +569,11 @@ class WebDAVBackend(StorageBackend):
     # File operations
     # ------------------------------------------------------------------
 
+    # Streaming-PUT block size. 1 MiB is small enough to keep peak
+    # memory bounded for arbitrarily large files, large enough to
+    # amortise per-block syscall + TLS-frame overhead.
+    _STREAM_CHUNK_BYTES: int = 1 * 1024 * 1024
+
     def upload_file(
         self,
         local_path: str,
@@ -575,7 +581,22 @@ class WebDAVBackend(StorageBackend):
         root_folder_id: str,
         file_id: Optional[str] = None,
     ) -> str:
-        """Upload a local file via PUT. Returns the relative path as file 'ID'."""
+        """Upload a local file via PUT. Returns the relative path as file 'ID'.
+
+        Two paths are selected by `webdav_streaming_threshold_bytes`
+        (default 4 MiB):
+
+          * Small files use a simple in-memory PUT (the historic path)
+            — minimal overhead for typical markdown content.
+          * Large files use a streaming chunk-iterator PUT with explicit
+            `Content-Length` so the request body never fully resides in
+            memory; peak memory is bounded to one `_STREAM_CHUNK_BYTES`
+            block (1 MiB) regardless of file size.
+
+        Resume behaviour: WebDAV has no native resume protocol. A
+        crashed upload re-uploads from scratch on retry; in-process
+        retries are covered by `_upload_with_retry`.
+        """
         if file_id:
             dest_rel = file_id
         else:
@@ -583,8 +604,39 @@ class WebDAVBackend(StorageBackend):
             dest_rel = f"{parent.rstrip('/')}/{filename}"
 
         url = self._url(dest_rel)
-        with open(local_path, "rb") as f:
-            resp = self.session.put(url, data=f)
+        bucket = get_throttle(getattr(self.config, "max_upload_kbps", None))
+        threshold = int(getattr(
+            self.config, "webdav_streaming_threshold_bytes", 4 * 1024 * 1024,
+        ))
+        try:
+            file_size = Path(local_path).stat().st_size
+        except OSError:
+            file_size = 0
+
+        if file_size and file_size >= threshold:
+            # Streaming PUT — read the file lazily one block at a time.
+            chunk_size = self._STREAM_CHUNK_BYTES
+            with open(local_path, "rb") as f:
+                def _gen():
+                    while True:
+                        block = f.read(chunk_size)
+                        if not block:
+                            break
+                        # Pace the wire per-block so the long-run rate
+                        # stays honest across multi-megabyte uploads.
+                        bucket.consume(len(block))
+                        yield block
+                resp = self.session.put(
+                    url,
+                    data=_gen(),
+                    headers={"Content-Length": str(file_size)},
+                )
+        else:
+            # Simple path — small files, single PUT, single throttle.
+            with open(local_path, "rb") as f:
+                body = f.read()
+            bucket.consume(len(body))
+            resp = self.session.put(url, data=body)
         resp.raise_for_status()
         return dest_rel
 

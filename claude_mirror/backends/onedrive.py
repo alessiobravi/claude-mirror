@@ -16,6 +16,7 @@ except ImportError:
 import requests
 
 from ..config import Config
+from ..throttle import get_throttle
 from . import BackendError, ErrorClass, StorageBackend
 from ._util import write_token_secure
 
@@ -501,7 +502,19 @@ class OneDriveBackend(StorageBackend):
         root_folder_id: str,
         file_id: Optional[str] = None,
     ) -> str:
-        """Upload a local file. Returns relative path as file 'ID'."""
+        """Upload a local file. Returns relative path as file 'ID'.
+
+        Resume behaviour: the Microsoft Graph `createUploadSession`
+        endpoint returns an `uploadUrl` that, per
+        https://learn.microsoft.com/en-us/onedrive/developer/rest-api/api/driveitem_createuploadsession
+        ,survives process restart for up to ~7 days. Re-using the URL
+        from a persisted state file would let us resume mid-file after
+        a crash — claude-mirror does not currently persist the upload
+        session URL between runs, so a crashed upload re-creates the
+        session on retry. In-process retries via `_upload_with_retry`
+        cover the common transient-network case.
+        """
+        bucket = get_throttle(getattr(self.config, "max_upload_kbps", None))
         if file_id and self._is_path_id(file_id):
             dest_rel = file_id
         elif not file_id:
@@ -517,15 +530,19 @@ class OneDriveBackend(StorageBackend):
 
         # Files < 4MB use simple upload; larger files need upload session
         if len(content) < 4 * 1024 * 1024:
+            # Throttle BEFORE the PUT — the bucket pre-pays for the
+            # whole body; for tiny markdown files this is essentially
+            # free against a sensibly-sized bucket.
+            bucket.consume(len(content))
             resp = self.session.put(url, data=content,
                                     headers={"Content-Type": "application/octet-stream"})
             resp.raise_for_status()
         else:
-            self._upload_large(dest_rel, content)
+            self._upload_large(dest_rel, content, bucket=bucket)
 
         return dest_rel
 
-    def _upload_large(self, dest_rel: str, content: bytes) -> None:
+    def _upload_large(self, dest_rel: str, content: bytes, bucket=None) -> None:
         """Upload a large file (>4MB) using a Microsoft Graph upload session.
 
         Per Graph API spec, the `uploadUrl` returned by `createUploadSession`
@@ -535,6 +552,8 @@ class OneDriveBackend(StorageBackend):
         at worst rejected by the upload-host CDN.
         Ref: https://learn.microsoft.com/en-us/onedrive/developer/rest-api/api/driveitem_createuploadsession
         """
+        if bucket is None:
+            bucket = get_throttle(getattr(self.config, "max_upload_kbps", None))
         url = f"{self._item_url(dest_rel)}:/createUploadSession"
         resp = self.session.post(url, json={
             "item": {"@microsoft.graph.conflictBehavior": "replace"},
@@ -551,6 +570,9 @@ class OneDriveBackend(StorageBackend):
                 "Content-Length": str(len(chunk)),
                 "Content-Range": f"bytes {start}-{end - 1}/{total}",
             }
+            # Throttle per-chunk so the long-run rate stays honest
+            # across multi-megabyte uploads.
+            bucket.consume(len(chunk))
             # Intentionally `requests.put`, not `self.session.put` — see docstring.
             resp = requests.put(upload_url, data=chunk, headers=headers)
             resp.raise_for_status()

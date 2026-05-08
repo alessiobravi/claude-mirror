@@ -154,6 +154,40 @@ class Config:
     keep_monthly: int = 0
     keep_yearly: int = 0
 
+    # Bandwidth throttling (v0.5.39+).
+    #
+    # When set, every upload path on this backend (Drive resumable-upload
+    # chunk loop; Dropbox files_upload; OneDrive simple PUT and chunked
+    # upload session; WebDAV PUT; SFTP put-file loop) consumes from a
+    # token bucket sized at this rate before sending bytes. Files
+    # smaller than the bucket capacity pass through with zero added
+    # latency; bursts above the cap are paced down to the long-run rate.
+    #
+    # `null` (default) disables throttling — the no-op `NullBucket` is
+    # used and callers see no overhead.
+    #
+    # In Tier 2 multi-backend setups, each mirror config carries its
+    # own field, so a user can throttle Drive but leave SFTP unbounded
+    # (or vice versa). Cap is per-backend, NOT per-process.
+    #
+    # Units are KILOBITS PER SECOND (1024 bits/s = 128 bytes/s) so the
+    # value matches what users see in their ISP / NAS contracts.
+    # 1024 kbps ≈ 128 KiB/sec ≈ 7.5 MiB/min.
+    max_upload_kbps: Optional[int] = None
+
+    # WebDAV streaming-upload threshold (v0.5.39+).
+    #
+    # Files at or above this size go through the chunked-PUT path
+    # (request body is a generator yielding fixed-size blocks; peak
+    # memory bounded to one block, not the whole file). Files below
+    # the threshold use the simple in-memory PUT — keeps the hot path
+    # for typical small markdown files unchanged.
+    #
+    # Default 4 MiB. WebDAV-only field; ignored by the other four
+    # backends (each has its own native chunking story documented in
+    # `docs/admin.md#upload-resume-behaviour-by-backend`).
+    webdav_streaming_threshold_bytes: int = 4 * 1024 * 1024
+
     def __post_init__(self) -> None:
         if not self.credentials_file:
             self.credentials_file = str(CONFIG_DIR / "credentials.json")

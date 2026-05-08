@@ -36,6 +36,7 @@ except ImportError:
     )
 
 from ..config import Config
+from ..throttle import get_throttle
 from . import BackendError, ErrorClass, StorageBackend
 from ._util import write_token_secure
 
@@ -410,6 +411,11 @@ class SFTPBackend(StorageBackend):
     # File operations
     # ------------------------------------------------------------------
 
+    # Block size for the manual put-loop. Matches paramiko's internal
+    # default (32 KiB) — small enough that a slow connection still
+    # throttles smoothly, large enough to amortise SSH packet overhead.
+    _UPLOAD_CHUNK_BYTES: int = 32 * 1024
+
     def upload_file(
         self,
         local_path: str,
@@ -426,6 +432,16 @@ class SFTPBackend(StorageBackend):
         guarantees the destination is either the old content or the new
         content, never a half-written mix. On error we attempt to remove
         the orphan .tmp so the next push doesn't trip over it.
+
+        Resume behaviour: paramiko's SFTPClient does not support
+        protocol-level resume of a partially-uploaded transfer. A
+        crashed upload re-uploads from scratch on the next retry; the
+        .tmp + posix_rename dance ensures the destination path is
+        either the old or new content, never a mid-transfer torso.
+
+        v0.5.39+: optional bandwidth cap via `max_upload_kbps`. We
+        switch from `sftp.put` to a manual block loop so the throttle
+        bucket can pre-pay each block before it's written.
         """
         if file_id:
             dst = file_id
@@ -435,8 +451,24 @@ class SFTPBackend(StorageBackend):
 
         sftp = self.sftp
         tmp = f"{dst}.tmp"
+        bucket = get_throttle(getattr(self.config, "max_upload_kbps", None))
+        chunk_size = self._UPLOAD_CHUNK_BYTES
         try:
-            sftp.put(local_path, tmp)
+            with open(local_path, "rb") as src, sftp.open(tmp, "wb") as dst_f:
+                # 32 KiB write buffer matches paramiko's default; setting
+                # it explicitly keeps the manual loop's per-call cost
+                # comparable to `sftp.put` — no regression on uncapped
+                # throughput.
+                try:
+                    dst_f.set_pipelined(True)
+                except AttributeError:
+                    pass
+                while True:
+                    block = src.read(chunk_size)
+                    if not block:
+                        break
+                    bucket.consume(len(block))
+                    dst_f.write(block)
             sftp.posix_rename(tmp, dst)
         except Exception:
             # Best-effort cleanup of the partial .tmp.

@@ -4,6 +4,48 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.36] — 2026-05-08
+
+A documentation refactor + two correctness fixes shipped together. The 2323-line README was split into a sleek 586-line navigation hub plus a `docs/` tree organised by topic; sequential mirror walks in two status renderables were parallelised; and the network error path for unreachable backends is now a clean diagnostic message instead of a Python traceback.
+
+### Documentation — README split into a browseable docs/ tree
+- `README.md` trimmed from 2323 → 586 lines. The "Part 1/2/3/4" linear-tutorial structure dropped in favour of clean H2 sections: hero / why / how / supported backends / prerequisites / install / Documentation index / your first project / daily-usage cheatsheet / Claude Code skill / Slack / desktop / update notifications / troubleshooting / file locations / migrating / disclaimer / license. The first H2 after install is the new **Documentation index** — exhaustive map of every `docs/*.md` file, organised by Backends / Operations & admin / Topology guides.
+- "Your first project" now features Drive AND SFTP wizard walk-throughs side-by-side (Q5 of the doc-split plan). Other backends (Dropbox / OneDrive / WebDAV) are linked into per-backend pages.
+- New `docs/` tree, 9 files, ~2200 lines:
+  - `docs/README.md` — docs-tree index page (also reachable via the breadcrumb on every nested page).
+  - `docs/backends/google-drive.md`, `dropbox.md`, `onedrive.md`, `webdav.md`, `sftp.md` — per-backend setup, config fields, troubleshooting.
+  - `docs/admin.md` — snapshots and disaster recovery, retention policies, `gc` / `prune` / `forget`, doctor, watcher service auto-start (launchd / systemd), manual component installation, and **Multi-backend mirroring (Tier 2)** including the configuration reference, daily-usage diff, ErrorClass failure-handling table, and the "when to use Tier 2 vs running two configs by hand" comparison.
+  - `docs/conflict-resolution.md` — interactive `keep local / keep remote / merge / skip` flow.
+  - `docs/cli-reference.md` — every command, every flag, grouped by topic.
+  - `docs/scenarios.md` — seven deployment topologies (A. Standalone / B. Personal multi-machine / C. Multi-user collaboration / D. Multi-backend redundancy Tier 2 / F. Selective sync / G. Multi-user + multi-backend production-realistic with full Alice/Bob YAMLs and a 12-step transcript / H. Multi-project enterprise).
+- Cross-linking convention enforced: every `docs/*.md` opens with "← Back to README index" plus a breadcrumb when nested. README's Documentation index is the first H2 after install. Backend pages link forward to scenarios; scenarios link back to backend pages and admin. CLI reference is the destination for every command-flag mention. All `.md` link targets verified to resolve (via a programmatic audit pass).
+- Conventions captured in project memory:
+  - `feedback_docs_browseable.md` — every doc page MUST carry sideways navigation; readers should never hit a dead end.
+  - `convention_docs_tree_updates.md` — future feature changes touch every relevant `docs/*.md` in the same commit, not as a follow-up. CHANGELOG entries name every doc file touched.
+
+### Fixed — `claude-mirror status --by-backend` and `--pending` walked mirrors sequentially
+- Both renderables (`_build_status_by_backend_renderable` and `_build_pending_renderable` in `claude_mirror/sync.py`) launched the primary `engine.get_status()` first, waited for it to complete, then walked each mirror's `list_files_recursive()` one at a time. With three configured backends, the wallclock latency was the sum of all four operations.
+- Now they fan out via `concurrent.futures.ThreadPoolExecutor` with `(1 + N)` workers — primary status and every mirror walk run concurrently. Progress rows for each mirror are added to the live Rich table up-front so the user sees parallel progress, not a serial cascade. Each `freeze on completion` row settles independently as its backend finishes.
+- User-visible: `status --by-backend` against Drive (primary) + SFTP (mirror) now finishes when the slower of the two finishes, not when their sum finishes — typical 1.5–2× wall-clock improvement on real Tier 2 setups.
+
+### Fixed — clean error message when a backend is unreachable
+- Previously, hitting a backend with no DNS / no route / connection refused / connection reset surfaced a raw Python traceback (`httplib2.error.ServerNotFoundError: Unable to find the server at ...` etc.). Confusing for users who don't read tracebacks; the actual problem (no internet) was buried in eight lines of stack frame.
+- `_CLIGroup.invoke()` in `claude_mirror/cli.py` now catches `(OSError, ConnectionError)` (covering `socket.gaierror`, `ConnectionRefusedError`, `ConnectionResetError`, `socket.timeout`) and library-specific network exceptions (`httplib2.ServerNotFoundError`, `requests.exceptions.ConnectionError`, `urllib3.exceptions.NewConnectionError` / `MaxRetryError`, `paramiko.ssh_exception.NoValidConnectionsError`) and prints a single-block Rich message: `Could not reach the storage backend.` + the underlying error type + name + redacted message + a `Fix:` line suggesting connectivity check + retry. Exit code 1.
+- The `OSError` clause is placed AFTER the existing `except FileNotFoundError` clause in source order, since `FileNotFoundError` IS-A `OSError` and would otherwise be swallowed. Library-specific catches use a string-name allowlist on `type(e).__module__ + "." + type(e).__name__` so the dependency on those libraries stays optional. Anything not matching falls through to the existing last-resort handler.
+- Token / home-path leakage in error messages prevented by routing through `redact_error()`.
+
+### Updated docs/files
+- `README.md` (rewrite, 2323 → 586 lines).
+- `docs/README.md` (new — docs-tree index).
+- `docs/admin.md` (new — extracted + new Tier 2 section).
+- `docs/conflict-resolution.md`, `docs/cli-reference.md`, `docs/scenarios.md` (new).
+- `docs/backends/{google-drive,dropbox,onedrive,webdav,sftp}.md` (new).
+- `claude_mirror/sync.py` (parallel mirror walks).
+- `claude_mirror/cli.py` (network error handler).
+- `pyproject.toml` (version 0.5.35 → 0.5.36).
+
+---
+
 ## [0.5.35] — 2026-05-08
 
 ### Added — `claude-mirror gc --backend NAME` (per-mirror garbage collection)

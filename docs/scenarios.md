@@ -137,7 +137,7 @@ claude-mirror-install                                # installs the watcher as a
 
 After both machines are set up, the laptop pushes once to seed the Drive folder, and the desktop pulls once to bring its working copy in line. From here on, the watcher does the heavy lifting.
 
-See [`docs/backends/googledrive.md`](./backends/googledrive.md) for the GCP project / OAuth client / Pub/Sub topic creation walkthrough.
+See [`docs/backends/google-drive.md`](./backends/google-drive.md) for the GCP project / OAuth client / Pub/Sub topic creation walkthrough.
 
 ### Daily ops behaviour
 
@@ -228,7 +228,7 @@ slack_channel: "#teamproject-sync"
 
 Bring-up:
 
-1. Owner sets up the GCP project + Drive folder + Pub/Sub topic ([`docs/backends/googledrive.md`](./backends/googledrive.md)).
+1. Owner sets up the GCP project + Drive folder + Pub/Sub topic ([`docs/backends/google-drive.md`](./backends/google-drive.md)).
 2. Owner shares the Drive folder with each collaborator's Google account (Editor permission) and grants Pub/Sub Editor in IAM.
 3. Owner sends each collaborator the credentials JSON and the Drive folder ID over a secure channel (the credentials file identifies the app, not any user — it's safe to share within the team).
 4. Each collaborator drops the credentials at `~/.config/claude_mirror/team-credentials.json`, runs `claude-mirror init --wizard` (entering the shared `drive_folder_id` / `gcp_project_id` / `pubsub_topic_id`), and runs `claude-mirror auth` to authenticate as themselves.

@@ -407,10 +407,169 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
+## Multi-backend mirroring (Tier 2)
+
+A single project can be synced to multiple storage backends at the same time. Push uploads to all of them in parallel, snapshots are mirrored across all of them (configurable), and pull / status read from the primary. If a mirror fails transiently it is retried automatically on the next push; permanent failures are quarantined and surfaced via `claude-mirror status --pending` and the desktop / Slack notifiers.
+
+For deployment topologies that combine mirroring with multi-user collaboration, see [scenarios.md](scenarios.md) — Scenario D (multi-backend redundancy) and Scenario G (multi-user + multi-backend, production-realistic).
+
+### Why mirror?
+
+- **Redundancy** — if one provider has an outage, the other backends still hold a current copy of every file plus a fresh snapshot. Disaster recovery does not depend on a single vendor.
+- **Cross-platform collaboration** — one collaborator can run the project on Google Drive while another only has access to Dropbox or a self-hosted WebDAV server. The primary owner mirrors to whichever backends the team needs.
+- **Backend portability** — mirroring is the safe, non-destructive way to move a project between backends. Run it as a mirror for as long as you like, then promote the mirror to primary by swapping config paths when you're ready.
+
+### Setup walkthrough
+
+The model is: **one primary config + one extra config per mirror**, all sharing the same `project_path`. The primary config gets a `mirror_config_paths` list pointing at the mirrors.
+
+1. **Initialize the primary config** (whichever backend you want as primary — this example uses Google Drive):
+
+   ```bash
+   claude-mirror init --wizard \
+     --backend googledrive \
+     --project ~/projects/myproject
+   # Writes ~/.config/claude_mirror/myproject.yaml
+   ```
+
+2. **Initialize one config per mirror**, sharing the same `--project` path but using a different backend, folder, and token file. Use `--config` to pin the file name so it is obviously a mirror:
+
+   ```bash
+   claude-mirror init --wizard \
+     --backend dropbox \
+     --project ~/projects/myproject \
+     --config ~/.config/claude_mirror/myproject-dropbox.yaml
+
+   claude-mirror init --wizard \
+     --backend onedrive \
+     --project ~/projects/myproject \
+     --config ~/.config/claude_mirror/myproject-onedrive.yaml
+   ```
+
+3. **Edit the primary config** and add the `mirror_config_paths` field, listing each mirror's YAML file:
+
+   ```yaml
+   # ~/.config/claude_mirror/myproject.yaml
+   backend: googledrive
+   project_path: ~/projects/myproject
+   # ... drive_folder_id, gcp_project_id, etc ...
+   mirror_config_paths:
+     - ~/.config/claude_mirror/myproject-dropbox.yaml
+     - ~/.config/claude_mirror/myproject-onedrive.yaml
+   ```
+
+4. **Authenticate each backend** (each mirror has its own token file, so each needs its own auth):
+
+   ```bash
+   claude-mirror auth --config ~/.config/claude_mirror/myproject.yaml
+   claude-mirror auth --config ~/.config/claude_mirror/myproject-dropbox.yaml
+   claude-mirror auth --config ~/.config/claude_mirror/myproject-onedrive.yaml
+   ```
+
+5. **Push** — the primary config is enough; mirrors are picked up automatically:
+
+   ```bash
+   claude-mirror push
+   # Uploads to Google Drive, Dropbox, and OneDrive in parallel.
+   # Snapshots are mirrored to each backend per snapshot_on policy.
+   ```
+
+### Configuration reference
+
+The primary config gains the following optional fields. Mirror configs are ordinary single-backend configs — they don't carry any mirror-specific fields themselves.
+
+```yaml
+# Primary config — ~/.config/claude_mirror/myproject.yaml
+backend: googledrive
+project_path: ~/projects/myproject
+drive_folder_id: 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OhBlt
+# ... rest of the primary backend's normal fields ...
+
+# Mirrors — each is a full claude-mirror config in its own file,
+# sharing the same project_path as the primary.
+mirror_config_paths:
+  - ~/.config/claude_mirror/myproject-dropbox.yaml
+  - ~/.config/claude_mirror/myproject-onedrive.yaml
+
+# Snapshot mirroring policy.
+#   "primary" — snapshots only go to the primary backend
+#   "all"     — snapshots are written to every backend
+# When omitted, the default depends on snapshot_format:
+#   blobs format → "all"     (cheap, deduplicated, mirror-friendly)
+#   full  format → "primary" (one full copy per snapshot is enough)
+snapshot_on: all
+
+# Automatically re-attempt mirrors that previously ended up in
+# pending_retry state. Runs at the start of every push / sync.
+retry_on_push: true
+
+# In-process retry attempts per upload before giving up and queuing
+# the file for next-push retry. Exponential backoff: 0.8s, 1.6s, 3.2s.
+max_retry_attempts: 3
+
+# Surface mirror failures via desktop notification and Slack
+# (in addition to the per-backend status block always shown on success).
+notify_failures: true
+```
+
+### Daily usage
+
+What changes once mirroring is set up:
+
+- **`claude-mirror push`** — uploads to every backend in parallel. Output groups results by backend; the run as a whole succeeds even if one mirror has transient errors (those files end up in `pending_retry` for the next push).
+- **`claude-mirror sync`** — same conflict-resolution flow as before; the resolved file is then pushed to every backend.
+- **`claude-mirror pull`** — reads from the **primary** backend. Mirrors are write-only from claude-mirror's perspective.
+- **`claude-mirror status`** — reads from the primary. Add `--pending` for a separate table listing files with non-ok state on any mirror (File / Backend / State / Last error) AND any mirror that has files unseeded on it (typically because the mirror was added to `mirror_config_paths` after files were already pushed to the primary — see seed-mirror below). When the table is non-empty the trailing hint suggests `claude-mirror retry` or `claude-mirror seed-mirror` as appropriate. Add `--by-backend` for the **full per-file table with one column per configured backend** (primary first, mirrors in `mirror_config_paths` order) — each cell shows that backend's state for the file (`✓ ok` / `⚠ pending` / `✗ failed` / `⊘ unseeded` / `· absent`) plus a footer summary line per backend. The "is everything in sync on every mirror?" view at a glance.
+- **`claude-mirror retry`** — re-attempts mirrors stuck in `pending_retry`. Optional `--backend NAME` to retry one mirror, `--dry-run` to preview without uploading. Runs the same upload path as push, with the same error classification.
+- **`claude-mirror seed-mirror --backend NAME`** — populates a newly-added mirror with files that already exist on the primary. When you add a backend to `mirror_config_paths` for a project where files already exist, regular `push` has nothing to do (every local hash matches its manifest record), so push uploads zero files and the new mirror's folder stays empty. `seed-mirror` walks the manifest, finds every file with no recorded state on the named mirror, and uploads each one to that mirror only — the primary is never touched. Idempotent: safe to re-run; the second invocation is a no-op. Drift-safe: files whose local content has diverged from the manifest are skipped with a warning rather than seeded with mismatched content (run `push` first to reconcile primary, then re-run seed-mirror). Use `--dry-run` to preview which files would be seeded.
+- **`claude-mirror restore TIMESTAMP`** — tries the primary first, then walks `mirror_config_paths` in order until it finds the snapshot. When the snapshot is recovered from a mirror, claude-mirror prints a yellow warning identifying which backend supplied it. To force a specific backend (e.g. when the primary is down or you know which mirror has the version you want), use `claude-mirror restore TIMESTAMP --backend dropbox`.
+
+`retry_on_push: true` means most transient failures heal themselves: a brief Dropbox outage during one push gets retried automatically on the next push without you doing anything. `claude-mirror retry` is only needed when you want to force a retry without making a new push. `claude-mirror seed-mirror` is only needed once per (mirror × project) pair, the first time you add a mirror to a project that already has files on the primary.
+
+### Failure handling
+
+Each backend classifies its raw exceptions into one of six `ErrorClass` values. The class determines what claude-mirror does and what you see:
+
+| Class | What it means | What claude-mirror does | What you see |
+|---|---|---|---|
+| `TRANSIENT` | Network blip, 5xx, brief rate limit | Retries 3x in-process with exponential backoff (0.8s / 1.6s / 3.2s), then queues for next-push retry | Yellow warning; Slack `🟡 backend — N file(s) pending retry` |
+| `AUTH` | Refresh token revoked or expired | Marks affected files `failed_perm` — no further auto-retry | Red `ACTION REQUIRED` block. Run `claude-mirror auth --config <mirror config>` (or plain `claude-mirror auth` for the primary) |
+| `QUOTA` | Storage full or sustained rate limit | Marks affected files `failed_perm` | Red `ACTION REQUIRED` block. Free space on that backend or wait for quota reset, then `claude-mirror retry --backend NAME` |
+| `PERMISSION` | Folder access revoked | Marks affected files `failed_perm` | Red `ACTION REQUIRED` block. Restore folder permissions, then `claude-mirror retry --backend NAME` |
+| `FILE_REJECTED` | File too large or invalid path for this backend | Skips just that file; other files continue | Per-file warning in the per-backend status block; not retried |
+| `UNKNOWN` | Unrecognized exception | Treated like `TRANSIENT` but with a louder warning | Yellow warning + raw exception text |
+
+Slack messages include a per-backend status block, e.g.:
+
+```
+🔼 user@machine pushed 1 file in myproject
+Files changed: • memory/notes.md
+Per-backend status:
+  • 🟢 drive — pushed 1, snapshot 2026-05-05T10-15-22Z
+  • 🟡 dropbox — rate-limited (1 file pending retry)
+📚 1245 files in project
+```
+
+For permanent failures (`AUTH`, `QUOTA`, `PERMISSION`), a separate `🔴 ACTION REQUIRED` header block is prepended with a red sidebar so it stands out in the channel. Desktop notifications follow the same rule when `notify_failures: true`.
+
+### When to use Tier 2 vs running two configs by hand
+
+Tier 2 is the supported way to mirror a project. There is also an unsupported workaround — keep two completely independent configs for the same project path and run `claude-mirror push --config A` followed by `claude-mirror push --config B` yourself. That works, but:
+
+- Each push is two commands, with no shared error handling or pending-retry queue.
+- Snapshot timestamps drift between backends (each push creates its own snapshot independently).
+- `restore` cannot fall back across backends — you have to know which config to use.
+- Failures are silent unless you read both command outputs.
+
+Use Tier 2 (`mirror_config_paths`) for any real mirroring use case. Reach for the two-config workaround only if you specifically want each backend to be 100% independent (different file patterns, different exclude lists, manually triggered) and you accept the bookkeeping.
+
+---
+
 ## See also
 
 - [conflict-resolution.md](conflict-resolution.md) for resolving `sync` conflicts.
 - [cli-reference.md](cli-reference.md) for the full command list (snapshot, retention, watcher commands grouped under "Snapshots" and "Maintenance").
+- [scenarios.md](scenarios.md) for end-to-end deployment topology guides (standalone, multi-machine, multi-user, multi-backend).
 - Backend pages — backend-specific notes about how `full`-format snapshots and the watcher behave on each backend:
   - [backends/google-drive.md](backends/google-drive.md)
   - [backends/dropbox.md](backends/dropbox.md)

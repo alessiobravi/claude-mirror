@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 try:
     import dropbox
@@ -366,6 +366,7 @@ class DropboxBackend(StorageBackend):
         rel_path: str,
         root_folder_id: str,
         file_id: Optional[str] = None,
+        progress_callback: Optional[Callable[[int], None]] = None,
     ) -> str:
         """Upload a local file. Returns the full Dropbox path as the file 'ID'.
 
@@ -377,6 +378,12 @@ class DropboxBackend(StorageBackend):
         files, so we use the single-call `files_upload` path; if a
         future change moves to chunked upload sessions, the resume
         caveat still applies.
+
+        progress_callback: optional `Callable[[int], None]`. Invoked once
+        with the full payload size after the SDK call returns
+        successfully — `files_upload` is single-shot, so we have no
+        per-chunk granularity here. The callback contract is delta-
+        based, but with a single emission a delta equals the total.
         """
         if file_id:
             dest_path = file_id
@@ -395,11 +402,23 @@ class DropboxBackend(StorageBackend):
         self.dbx.files_upload(
             body, dest_path, mode=WriteMode.overwrite,
         )
+        if progress_callback is not None and body:
+            progress_callback(len(body))
         return dest_path
 
-    def download_file(self, file_id: str) -> bytes:
+    def download_file(
+        self,
+        file_id: str,
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> bytes:
         """Download file by Dropbox path. Enforces MAX_DOWNLOAD_BYTES so
-        a compromised remote or runaway response can't OOM the client."""
+        a compromised remote or runaway response can't OOM the client.
+
+        progress_callback: optional `Callable[[int], None]`. Invoked with
+        delta bytes per `iter_content` chunk so callers see a live
+        download bar even on Dropbox (which doesn't expose a per-chunk
+        progress hook on the upload side).
+        """
         meta, response = self.dbx.files_download(file_id)
         # Pre-flight: Dropbox metadata exposes content size.
         size = getattr(meta, "size", None)
@@ -408,14 +427,29 @@ class DropboxBackend(StorageBackend):
                 f"Refusing Dropbox download of {file_id!r}: size {size} "
                 f"exceeds MAX_DOWNLOAD_BYTES ({self.MAX_DOWNLOAD_BYTES})."
             )
-        content = response.content
-        # Belt-and-braces: if metadata lied, abort here.
-        if len(content) > self.MAX_DOWNLOAD_BYTES:
-            raise RuntimeError(
-                f"Dropbox download of {file_id!r} returned "
-                f"{len(content)} bytes — exceeds MAX_DOWNLOAD_BYTES."
-            )
-        return content
+        if progress_callback is None:
+            content = response.content
+            # Belt-and-braces: if metadata lied, abort here.
+            if len(content) > self.MAX_DOWNLOAD_BYTES:
+                raise RuntimeError(
+                    f"Dropbox download of {file_id!r} returned "
+                    f"{len(content)} bytes — exceeds MAX_DOWNLOAD_BYTES."
+                )
+            return content
+
+        # Streaming path with per-chunk progress emission.
+        buf = bytearray()
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            if not chunk:
+                continue
+            buf.extend(chunk)
+            if len(buf) > self.MAX_DOWNLOAD_BYTES:
+                raise RuntimeError(
+                    f"Dropbox download of {file_id!r} streamed past "
+                    f"MAX_DOWNLOAD_BYTES ({self.MAX_DOWNLOAD_BYTES}); aborting."
+                )
+            progress_callback(len(chunk))
+        return bytes(buf)
 
     def upload_bytes(
         self,

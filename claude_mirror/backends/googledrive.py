@@ -8,7 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from google.auth.exceptions import DefaultCredentialsError, RefreshError, TransportError
 from google.auth.transport.requests import Request
@@ -518,6 +518,7 @@ class GoogleDriveBackend(StorageBackend):
         rel_path: str,
         root_folder_id: str,
         file_id: Optional[str] = None,
+        progress_callback: Optional[Callable[[int], None]] = None,
     ) -> str:
         """Resumable upload with optional bandwidth throttling.
 
@@ -536,6 +537,14 @@ class GoogleDriveBackend(StorageBackend):
         `bucket.consume(chunk_size)` BEFORE each chunk goes on the wire.
         Without a cap we keep the legacy single-`.execute()` path so
         Drive's internal resumable loop runs at full speed.
+
+        progress_callback: optional `Callable[[int], None]`. Invoked with
+        the number of bytes-transferred-since-the-last-call (a delta,
+        not a cumulative count) after each upload chunk completes. When
+        unset, behaviour is identical to the legacy path — no extra
+        SDK calls, no per-chunk overhead. When set we always drive the
+        upload via the manual `next_chunk()` loop so each iteration can
+        emit a callback even on the no-throttle path.
         """
         rate = getattr(self.config, "max_upload_kbps", None)
         media = MediaFileUpload(local_path, resumable=True)
@@ -553,13 +562,14 @@ class GoogleDriveBackend(StorageBackend):
                 media_body=media,
                 fields="id, md5Checksum",
             )
-        if not rate:
+        if not rate and progress_callback is None:
             # Legacy fast path — Drive's SDK runs the resumable loop
-            # internally with no per-chunk throttle hook.
+            # internally with no per-chunk hook.
             file = request.execute()
             return file["id"]
 
-        # Throttled path — manual chunk loop.
+        # Manual chunk loop — used when either bandwidth-cap is on or
+        # the caller wants per-chunk progress callbacks.
         bucket = get_throttle(rate)
         try:
             file_size = int(os.path.getsize(local_path))
@@ -580,8 +590,19 @@ class GoogleDriveBackend(StorageBackend):
                     reserve = min(reserve, remaining)
             bucket.consume(reserve)
             status, response = request.next_chunk()
+            new_progress = last_progress
             if status is not None:
-                last_progress = int(getattr(status, "resumable_progress", last_progress))
+                new_progress = int(getattr(status, "resumable_progress", last_progress))
+            elif response is not None and file_size:
+                # Final chunk — `status` is None when the upload completes
+                # in this iteration; treat the remainder of the file as
+                # transferred so `progress_callback` covers the full file.
+                new_progress = file_size
+            if progress_callback is not None:
+                delta = max(0, new_progress - last_progress)
+                if delta:
+                    progress_callback(delta)
+            last_progress = new_progress
         return response["id"]
 
     # Hard cap on remote-file size we will load into memory. claude-mirror is
@@ -590,7 +611,17 @@ class GoogleDriveBackend(StorageBackend):
     # the process, so we refuse before downloading instead of after.
     MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024  # 1 GiB
 
-    def download_file(self, file_id: str) -> bytes:
+    def download_file(
+        self,
+        file_id: str,
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> bytes:
+        """Download a Drive file by ID.
+
+        progress_callback: optional `Callable[[int], None]`. Invoked with
+        delta bytes (since the previous call) after each `next_chunk()`
+        iteration. When unset, behaviour is unchanged.
+        """
         # Pre-flight size check via metadata — cheap, avoids streaming a huge
         # file into memory only to discover it's too big at the end.
         try:
@@ -609,8 +640,17 @@ class GoogleDriveBackend(StorageBackend):
         buffer = io.BytesIO()
         downloader = MediaIoBaseDownload(buffer, request)
         done = False
+        last_pos = 0
         while not done:
             _, done = downloader.next_chunk()
+            if progress_callback is not None:
+                # `MediaIoBaseDownload` writes bytes into `buffer`; the
+                # tell() position is the cumulative bytes downloaded.
+                cur = buffer.tell()
+                delta = max(0, cur - last_pos)
+                if delta:
+                    progress_callback(delta)
+                last_pos = cur
         return buffer.getvalue()
 
     def upload_bytes(

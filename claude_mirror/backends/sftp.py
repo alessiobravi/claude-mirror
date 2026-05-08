@@ -422,6 +422,7 @@ class SFTPBackend(StorageBackend):
         rel_path: str,
         root_folder_id: str,
         file_id: Optional[str] = None,
+        progress_callback: Optional[Callable[[int], None]] = None,
     ) -> str:
         """Upload via atomic .tmp + posix_rename.
 
@@ -442,6 +443,13 @@ class SFTPBackend(StorageBackend):
         v0.5.39+: optional bandwidth cap via `max_upload_kbps`. We
         switch from `sftp.put` to a manual block loop so the throttle
         bucket can pre-pay each block before it's written.
+
+        progress_callback: optional `Callable[[int], None]`. Invoked
+        with delta bytes per block written. Note: paramiko's native
+        `SFTPClient.put()` callback reports CUMULATIVE bytes; we keep
+        the manual block loop here (already used for throttling) so
+        the contract stays delta-based across all backends without an
+        ad-hoc bridge.
         """
         if file_id:
             dst = file_id
@@ -469,6 +477,8 @@ class SFTPBackend(StorageBackend):
                         break
                     bucket.consume(len(block))
                     dst_f.write(block)
+                    if progress_callback is not None:
+                        progress_callback(len(block))
             sftp.posix_rename(tmp, dst)
         except Exception:
             # Best-effort cleanup of the partial .tmp.
@@ -479,7 +489,11 @@ class SFTPBackend(StorageBackend):
             raise
         return dst
 
-    def download_file(self, file_id: str) -> bytes:
+    def download_file(
+        self,
+        file_id: str,
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> bytes:
         """Stream-download in 64 KiB chunks, aborting past MAX_DOWNLOAD_BYTES.
 
         Even though SFTP doesn't have the chunked-encoding-lying-about-
@@ -487,6 +501,9 @@ class SFTPBackend(StorageBackend):
         still feed an arbitrarily long stream. The streaming cap is the
         single line of defence against runaway memory growth on the
         client side.
+
+        progress_callback: optional `Callable[[int], None]`. Invoked with
+        delta bytes per read chunk for live progress.
         """
         sftp = self.sftp
         buf = bytearray()
@@ -504,6 +521,8 @@ class SFTPBackend(StorageBackend):
                             f"MAX_DOWNLOAD_BYTES ({self.MAX_DOWNLOAD_BYTES}); aborting.",
                             backend_name="sftp",
                         )
+                    if progress_callback is not None:
+                        progress_callback(len(chunk))
         except BackendError:
             raise
         return bytes(buf)

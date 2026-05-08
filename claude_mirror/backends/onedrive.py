@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 try:
     import msal
@@ -501,6 +501,7 @@ class OneDriveBackend(StorageBackend):
         rel_path: str,
         root_folder_id: str,
         file_id: Optional[str] = None,
+        progress_callback: Optional[Callable[[int], None]] = None,
     ) -> str:
         """Upload a local file. Returns relative path as file 'ID'.
 
@@ -513,6 +514,12 @@ class OneDriveBackend(StorageBackend):
         session URL between runs, so a crashed upload re-creates the
         session on retry. In-process retries via `_upload_with_retry`
         cover the common transient-network case.
+
+        progress_callback: optional `Callable[[int], None]`. For the
+        small-file (<4 MiB) PUT path, invoked once with the full body
+        size after the request succeeds. For the upload-session path,
+        invoked per chunk so the user sees a live bar. The callback
+        contract is delta-based (bytes-since-last-call).
         """
         bucket = get_throttle(getattr(self.config, "max_upload_kbps", None))
         if file_id and self._is_path_id(file_id):
@@ -537,12 +544,23 @@ class OneDriveBackend(StorageBackend):
             resp = self.session.put(url, data=content,
                                     headers={"Content-Type": "application/octet-stream"})
             resp.raise_for_status()
+            if progress_callback is not None and content:
+                progress_callback(len(content))
         else:
-            self._upload_large(dest_rel, content, bucket=bucket)
+            self._upload_large(
+                dest_rel, content,
+                bucket=bucket, progress_callback=progress_callback,
+            )
 
         return dest_rel
 
-    def _upload_large(self, dest_rel: str, content: bytes, bucket=None) -> None:
+    def _upload_large(
+        self,
+        dest_rel: str,
+        content: bytes,
+        bucket=None,
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> None:
         """Upload a large file (>4MB) using a Microsoft Graph upload session.
 
         Per Graph API spec, the `uploadUrl` returned by `createUploadSession`
@@ -576,10 +594,21 @@ class OneDriveBackend(StorageBackend):
             # Intentionally `requests.put`, not `self.session.put` — see docstring.
             resp = requests.put(upload_url, data=chunk, headers=headers)
             resp.raise_for_status()
+            if progress_callback is not None and chunk:
+                progress_callback(len(chunk))
 
-    def download_file(self, file_id: str) -> bytes:
+    def download_file(
+        self,
+        file_id: str,
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> bytes:
         """Download file by relative path. Enforces MAX_DOWNLOAD_BYTES so
-        a compromised remote or chunked-lying response can't OOM us."""
+        a compromised remote or chunked-lying response can't OOM us.
+
+        progress_callback: optional `Callable[[int], None]`. Invoked with
+        delta bytes per `iter_content` chunk so the user sees live
+        progress on large downloads.
+        """
         url = f"{self._item_url(file_id)}:/content"
         resp = self.session.get(url, stream=True)
         resp.raise_for_status()
@@ -609,6 +638,8 @@ class OneDriveBackend(StorageBackend):
                     f"OneDrive download of {file_id!r} streamed past "
                     f"MAX_DOWNLOAD_BYTES ({self.MAX_DOWNLOAD_BYTES}); aborting."
                 )
+            if progress_callback is not None:
+                progress_callback(len(chunk))
         return bytes(buf)
 
     def upload_bytes(

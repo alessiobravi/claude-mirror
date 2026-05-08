@@ -207,9 +207,12 @@ class InMemoryBackend:
         rel_path: str,
         root_folder_id: str,
         file_id: Optional[str] = None,
+        progress_callback=None,
     ) -> str:
         with open(local_path, "rb") as f:
             content = f.read()
+        if progress_callback is not None and content:
+            progress_callback(len(content))
         parent_id, filename = self.resolve_path(rel_path, root_folder_id)
         return self._write(parent_id, filename, content, file_id)
 
@@ -246,7 +249,7 @@ class InMemoryBackend:
         self.upload_calls.append((parent_id, name, len(content)))
         return nid
 
-    def download_file(self, file_id: str) -> bytes:
+    def download_file(self, file_id: str, progress_callback=None) -> bytes:
         self.download_calls.append(file_id)
         if self.download_fault is not None:
             err = self.download_fault(file_id)
@@ -254,7 +257,10 @@ class InMemoryBackend:
                 raise RuntimeError(err)
         if file_id not in self._nodes:
             raise RuntimeError(f"file not found: {file_id}")
-        return self._nodes[file_id].content
+        content = self._nodes[file_id].content
+        if progress_callback is not None and content:
+            progress_callback(len(content))
+        return content
 
     def get_file_id(self, name: str, folder_id: str) -> Optional[str]:
         n = self._find_child(folder_id, name)

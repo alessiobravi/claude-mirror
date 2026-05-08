@@ -375,6 +375,31 @@ When to set it:
 - When pushing large `_claude_mirror_blobs/` payloads on a freshly-seeded mirror — the seed-mirror operation moves the most data and benefits most from rate-limiting.
 - When sharing an upstream link with latency-sensitive workloads (gaming, VoIP) and you want claude-mirror to defer to those.
 
+### Transfer progress: live ETA + bytes/sec
+
+`push`, `pull`, `sync`, and `seed-mirror` render a Rich Progress bar with a real fill, "X.Y / Z.Z MB" cumulative byte counter, transfer rate, and ETA on every long byte-transfer phase. Sample output during a fresh-mirror seed of a 50 MB notes project:
+
+```
+Seeding         ━━━━━━━━━━━━━━━━━━━━━━━╸━━━━━━━━  31.4/50.0 MB  •  4.2 MB/s  •  0:00:07  •  0:00:04 remaining
+```
+
+The bar is sized once at the start of the phase by summing local file sizes (for upload) or remote file sizes (for download). Each backend's `upload_file` / `download_file` accepts an optional `progress_callback: Callable[[int], None]` that the engine wires to the bar; the callback is invoked with bytes-since-the-last-call deltas as each chunk completes. All five backends ship a per-chunk hook on the streaming/chunked paths, plus a single final emission for single-shot uploads (Dropbox `files_upload`, the simple PUT path on OneDrive / WebDAV).
+
+When does it show up:
+
+- **Above ~1 MB transfers** the rate + ETA columns become useful — Rich refreshes ~10 Hz, so transfers shorter than that complete before the first refresh and the user just sees the final completed state.
+- **Non-tty mode** (e.g. when redirected to a file or run under cron) — Rich auto-detects and renders a plainer, non-animated form. No flag needed.
+- **`--json` mode** silences progress entirely (the `_NoOpProgressCtx` shim swallows every Progress call) so structured-output consumers never see a progress carriage-return in their JSON stream.
+
+What still uses the simpler spinner-style phase progress (no bytes-bar):
+
+- `status` — counts files, no transfer phase.
+- Snapshot creation — copies blobs server-side or uploads many tiny manifest writes.
+- Notification publish — single small JSON event.
+- The Local / Remote rows during the status pass that precedes every push / pull / sync.
+
+This is intentional — sites without a known byte total would render an empty / pulsing bar, which adds visual noise without conveying information. The two factories (`make_phase_progress` for spinner-style phases, `make_transfer_progress` for byte-transfer phases) coexist by design.
+
 ### WebDAV chunked PUT for large files
 
 WebDAV's `upload_file` selects between two paths based on `webdav_streaming_threshold_bytes` (default `4194304`, i.e. 4 MiB):

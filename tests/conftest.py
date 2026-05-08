@@ -243,6 +243,7 @@ class FakeStorageBackend(StorageBackend):
         rel_path: str,
         root_folder_id: str,
         file_id: Optional[str] = None,
+        progress_callback=None,
     ) -> str:
         self._record("upload_file", local_path, rel_path, root_folder_id, file_id)
         if self.fail_next_upload:
@@ -250,6 +251,8 @@ class FakeStorageBackend(StorageBackend):
             raise RuntimeError("fake_backend: injected upload failure")
         with open(local_path, "rb") as f:
             content = f.read()
+        if progress_callback is not None and content:
+            progress_callback(len(content))
         parent_id, basename = self.resolve_path(rel_path, root_folder_id)
         return self._store_file(content, basename, parent_id, file_id)
 
@@ -288,14 +291,17 @@ class FakeStorageBackend(StorageBackend):
         }
         return new_id
 
-    def download_file(self, file_id: str) -> bytes:
+    def download_file(self, file_id: str, progress_callback=None) -> bytes:
         self._record("download_file", file_id)
         if self.fail_next_download:
             self.fail_next_download = False
             raise RuntimeError("fake_backend: injected download failure")
         if file_id not in self.files:
             raise FileNotFoundError(f"fake_backend: no file with id {file_id}")
-        return self.files[file_id]["content"]
+        content = self.files[file_id]["content"]
+        if progress_callback is not None and content:
+            progress_callback(len(content))
+        return content
 
     def get_file_id(self, name: str, folder_id: str) -> Optional[str]:
         self._record("get_file_id", name, folder_id)

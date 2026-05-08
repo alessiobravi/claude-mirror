@@ -238,12 +238,32 @@ class StorageBackend(ABC):
         rel_path: str,
         root_folder_id: str,
         file_id: Optional[str] = None,
+        progress_callback: Optional[Callable[[int], None]] = None,
     ) -> str:
-        """Upload a local file. If file_id given, update existing. Returns file ID."""
+        """Upload a local file. If file_id given, update existing. Returns file ID.
+
+        progress_callback: optional `Callable[[int], None]`. When provided,
+        invoked with the number of bytes-transferred-since-the-last-call
+        (a delta, not a cumulative count). Backends with chunked uploads
+        emit per-chunk; single-shot uploads emit once after success with
+        the full body size. The contract is delta-based so the surrounding
+        Rich Progress can simply call ``progress.advance(N)`` from the
+        callback. Backends MUST treat this as fully optional — passing
+        ``None`` (or omitting the kwarg) preserves the historic single-
+        shot fast path with no extra calls.
+        """
 
     @abstractmethod
-    def download_file(self, file_id: str) -> bytes:
-        """Download file content by ID."""
+    def download_file(
+        self,
+        file_id: str,
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> bytes:
+        """Download file content by ID.
+
+        progress_callback: optional `Callable[[int], None]` with the same
+        delta-based contract documented on ``upload_file``.
+        """
 
     @abstractmethod
     def upload_bytes(

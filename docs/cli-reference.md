@@ -340,15 +340,15 @@ See [README — Check sync status](../README.md#check-sync-status).
 
 ### `push`
 
-Upload locally-changed files to the remote, create a snapshot, and publish a notification to all collaborators. With Tier 2 mirrors, uploads to every backend in parallel; the run as a whole succeeds even if one mirror has transient errors. Pass file arguments to push only those specific files.
+Upload locally-changed files to the remote, create a snapshot, and publish a notification to all collaborators. With Tier 2 mirrors, uploads to every backend in parallel; the run as a whole succeeds even if one mirror has transient errors. Pass file arguments to push only those specific files. Shows live ETA + transfer rate during the upload phase — see [admin.md "Transfer progress"](admin.md#transfer-progress-live-eta--bytessec).
 
 ### `pull`
 
-Download remote-ahead files and update the local manifest. Pass file arguments to pull only specific files. Use `--output PATH` to download to a separate directory without touching local files or the manifest — useful for previewing remote changes before deciding to merge.
+Download remote-ahead files and update the local manifest. Pass file arguments to pull only specific files. Use `--output PATH` to download to a separate directory without touching local files or the manifest — useful for previewing remote changes before deciding to merge. Shows live ETA + transfer rate during the download phase — see [admin.md "Transfer progress"](admin.md#transfer-progress-live-eta--bytessec).
 
 ### `sync`
 
-Bidirectional in one command: pushes local-ahead files, pulls remote-ahead files, and prompts interactively for conflicts. Creates a snapshot and notifies collaborators after completion.
+Bidirectional in one command: pushes local-ahead files, pulls remote-ahead files, and prompts interactively for conflicts. Creates a snapshot and notifies collaborators after completion. Shows live ETA + transfer rate during the upload and download phases — see [admin.md "Transfer progress"](admin.md#transfer-progress-live-eta--bytessec).
 
 See [conflict-resolution.md](conflict-resolution.md) for what happens at the conflict prompt.
 
@@ -436,7 +436,7 @@ Re-attempt mirrors stuck in `pending_retry`. Pass `--backend NAME` to retry one 
 
 ### `seed-mirror`
 
-Populate a newly-added mirror with files that already exist on the primary. Walks the manifest, finds every file with no recorded state on `--backend NAME`, and uploads each one to that mirror only — the primary is never touched. Idempotent. Drift-safe: files whose local content has diverged from the manifest are skipped with a warning. Use `--dry-run` to preview.
+Populate a newly-added mirror with files that already exist on the primary. Walks the manifest, finds every file with no recorded state on `--backend NAME`, and uploads each one to that mirror only — the primary is never touched. Idempotent. Drift-safe: files whose local content has diverged from the manifest are skipped with a warning. Use `--dry-run` to preview. Shows live ETA + transfer rate during the seed upload — see [admin.md "Transfer progress"](admin.md#transfer-progress-live-eta--bytessec).
 
 `--backend` is optional: when omitted, seed-mirror auto-detects the candidate when exactly one configured mirror has unseeded files. If zero mirrors are unseeded it exits cleanly with "Nothing to seed"; if more than one is unseeded it prints the candidate names and asks you to specify `--backend NAME` explicitly.
 

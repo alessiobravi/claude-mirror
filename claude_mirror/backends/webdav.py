@@ -6,7 +6,7 @@ import socket
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import quote as urlquote, unquote as urlunquote
 
 import requests
@@ -580,6 +580,7 @@ class WebDAVBackend(StorageBackend):
         rel_path: str,
         root_folder_id: str,
         file_id: Optional[str] = None,
+        progress_callback: Optional[Callable[[int], None]] = None,
     ) -> str:
         """Upload a local file via PUT. Returns the relative path as file 'ID'.
 
@@ -596,6 +597,12 @@ class WebDAVBackend(StorageBackend):
         Resume behaviour: WebDAV has no native resume protocol. A
         crashed upload re-uploads from scratch on retry; in-process
         retries are covered by `_upload_with_retry`.
+
+        progress_callback: optional `Callable[[int], None]`. For the
+        streaming path, the chunk generator emits a delta per block;
+        for the small-file path, one final emission with the full body
+        size after the PUT succeeds. The callback contract is delta-
+        based (bytes-since-last-call).
         """
         if file_id:
             dest_rel = file_id
@@ -625,6 +632,8 @@ class WebDAVBackend(StorageBackend):
                         # Pace the wire per-block so the long-run rate
                         # stays honest across multi-megabyte uploads.
                         bucket.consume(len(block))
+                        if progress_callback is not None:
+                            progress_callback(len(block))
                         yield block
                 resp = self.session.put(
                     url,
@@ -637,13 +646,23 @@ class WebDAVBackend(StorageBackend):
                 body = f.read()
             bucket.consume(len(body))
             resp = self.session.put(url, data=body)
+            if progress_callback is not None and body:
+                progress_callback(len(body))
         resp.raise_for_status()
         return dest_rel
 
-    def download_file(self, file_id: str) -> bytes:
+    def download_file(
+        self,
+        file_id: str,
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> bytes:
         """Download file by relative path via GET. Enforces
         MAX_DOWNLOAD_BYTES so a compromised remote or chunked-lying
-        response can't OOM us."""
+        response can't OOM us.
+
+        progress_callback: optional `Callable[[int], None]`. Invoked with
+        delta bytes per `iter_content` chunk for live progress.
+        """
         url = self._url(file_id)
         resp = self.session.get(url, stream=True)
         resp.raise_for_status()
@@ -673,6 +692,8 @@ class WebDAVBackend(StorageBackend):
                     f"WebDAV download of {file_id!r} streamed past "
                     f"MAX_DOWNLOAD_BYTES ({self.MAX_DOWNLOAD_BYTES}); aborting."
                 )
+            if progress_callback is not None:
+                progress_callback(len(chunk))
         return bytes(buf)
 
     def upload_bytes(

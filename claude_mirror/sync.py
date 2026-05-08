@@ -21,7 +21,11 @@ from rich.progress import (
 from rich.table import Table
 from rich.text import Text
 
-from ._progress import _SharedElapsedColumn, make_phase_progress
+from ._progress import (
+    _SharedElapsedColumn,
+    make_phase_progress,
+    make_transfer_progress,
+)
 from ._constants import PARALLEL_WORKERS
 
 from .backends import StorageBackend, redact_error
@@ -424,6 +428,160 @@ class SyncEngine:
         """
         return make_phase_progress(console)
 
+    def _sum_local_bytes(self, states: list[FileSyncState]) -> int:
+        """Sum local-side bytes across the given states. Used to size the
+        Pushing transfer-progress bar. Falls back to ``os.path.getsize``
+        when ``state.local_size`` is None (a state path that the status
+        pass couldn't stat — rare but possible if a worker raced an mtime
+        change between hash and bar setup). Errors yield 0 — the bar
+        will still render, it just won't be perfectly sized."""
+        total = 0
+        for s in states:
+            if s.local_size is not None:
+                total += s.local_size
+                continue
+            try:
+                total += int(_safe_join(self._project, s.rel_path).stat().st_size)
+            except (OSError, ValueError):
+                continue
+        return total
+
+    def _sum_drive_bytes(self, states: list[FileSyncState]) -> int:
+        """Sum remote-side bytes across the given states. Used to size
+        the Pulling transfer-progress bar. ``state.drive_size`` is set
+        when the backend exposed a `size` field on its listing entry
+        (Drive does, OneDrive does, Dropbox does, WebDAV does, SFTP via
+        stat). Missing entries fall through silently."""
+        total = 0
+        for s in states:
+            if s.drive_size is not None:
+                total += s.drive_size
+        return total
+
+    def _run_transfer_phase(
+        self,
+        items: list,
+        fn: Callable,
+        description: str,
+        total_bytes: int,
+        outer_progress: Optional[Progress] = None,
+        extra_detail: Optional[Callable[[], str]] = None,
+    ) -> tuple[list, list]:
+        """Run a byte-transfer phase under a Rich transfer-progress UI.
+
+        ``fn(item, progress_callback)`` does the actual transfer for one
+        item (``progress_callback(N)`` reports N bytes transferred since
+        the last call). The callback is wired to a single batch-level
+        task whose ``total`` is ``total_bytes`` — the user sees one
+        aggregated bar with ETA + bytes/sec for the whole phase.
+
+        ``outer_progress`` (when provided) is the surrounding multi-
+        phase Progress that runs Local/Remote/Snapshot rows. Rich does
+        not allow two simultaneous Live regions, so we ``stop()`` it
+        before opening the transfer Progress and ``start()`` it again
+        afterwards. Pattern mirrors the existing conflict-resolution
+        block in ``push()`` / ``sync()``.
+
+        ``total_bytes == 0`` (or no items) short-circuits to a no-op
+        return — opening a Progress with an empty bar would just create
+        visual noise.
+
+        ``extra_detail`` is a callable returning a short status string
+        (e.g. the per-backend "googledrive: 5/5 · sftp: 2/5" breakdown
+        used by push). The string is appended to the row description
+        after each completion so a slow mirror is visible while the
+        primary bar fills.
+
+        Thread-safety: ``progress.advance()`` is documented as
+        thread-safe by Rich, so the parallel workers update the bar
+        directly without an additional ``threading.Lock`` wrapper —
+        see module docstring in ``_progress.py``.
+
+        Returns ``(succeeded, failed)`` item lists, mirroring
+        ``_parallel``'s contract so call sites can swap between the
+        two with minimal change.
+        """
+        if not items or total_bytes <= 0:
+            # Defer to the per-file _parallel path so we still record
+            # one row for "nothing to do" / file-count progress when
+            # there's no byte total to report (e.g. a manifest-only
+            # state that needs no upload).
+            if outer_progress is not None:
+                task = outer_progress.add_task(
+                    description, total=None,
+                    detail="0 file(s)", show_time=True,
+                )
+                ok, failed = self._parallel(
+                    items, fn, description=description,
+                    progress=outer_progress, task_id=task,
+                    extra_detail=extra_detail,
+                )
+                return ok, failed
+            return self._parallel(
+                items, fn, description=description,
+                extra_detail=extra_detail,
+            )
+
+        was_running = False
+        if outer_progress is not None:
+            try:
+                # Rich's Progress exposes `live.is_started`; fall back
+                # to a defensive stop() either way — calling stop on a
+                # not-started Progress is a no-op.
+                was_running = bool(getattr(outer_progress, "live", None) and outer_progress.live.is_started)
+            except Exception:
+                was_running = True
+            if was_running:
+                outer_progress.stop()
+
+        succeeded: list = []
+        failed: list = []
+        with make_transfer_progress(console) as tprog:
+            task_id = tprog.add_task(description, total=total_bytes, show_time=True)
+
+            def _advance(n: int) -> None:
+                if n <= 0:
+                    return
+                tprog.advance(task_id, n)
+
+            workers = max(1, min(self.config.parallel_workers, len(items)))
+            if workers == 1 or len(items) == 1:
+                for item in items:
+                    label = getattr(item, "rel_path", str(item))
+                    try:
+                        fn(item, _advance)
+                        succeeded.append(item)
+                    except Exception as e:
+                        tprog.console.print(f"  [red]✗ {label}: {e}[/]")
+                        failed.append(item)
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    futures = {ex.submit(fn, item, _advance): item for item in items}
+                    for future in as_completed(futures):
+                        item = futures[future]
+                        label = getattr(item, "rel_path", str(item))
+                        try:
+                            future.result()
+                            succeeded.append(item)
+                        except Exception as e:
+                            tprog.console.print(f"  [red]✗ {label}: {e}[/]")
+                            failed.append(item)
+
+            # Defensive: ensure the bar reads as complete on success even
+            # if a backend's progress_callback under-reported (e.g. a
+            # final chunk's delta got lost to a SDK quirk). Without this
+            # the user sees "5.7/6.0 MB" frozen at the end.
+            try:
+                completed_now = int(tprog.tasks[0].completed) if tprog.tasks else 0
+            except Exception:
+                completed_now = 0
+            if completed_now < total_bytes and not failed:
+                tprog.update(task_id, completed=total_bytes)
+
+        if outer_progress is not None and was_running:
+            outer_progress.start()
+        return succeeded, failed
+
     def _run_status_phase(self, progress: Progress) -> list[FileSyncState]:
         """Run get_status() inside an outer Progress, rendering Local/Remote
         as two rows that update independently. Rows are removed once the
@@ -588,10 +746,12 @@ class SyncEngine:
                         local_pushes.append(state)
 
             # Pulling
-            pull_task = progress.add_task("Pulling", total=None, detail="0 file(s)", show_time=True)
-            ok, _ = self._parallel(
-                pulls, self._pull_file, description="Pulling",
-                progress=progress, task_id=pull_task,
+            ok, _ = self._run_transfer_phase(
+                pulls,
+                fn=lambda s, cb: self._pull_file(s, progress_callback=cb),
+                description="Pulling",
+                total_bytes=self._sum_drive_bytes(pulls),
+                outer_progress=progress,
             )
             pulled.extend(s.rel_path for s in ok)
 
@@ -602,11 +762,13 @@ class SyncEngine:
             )
 
             # Pushing
-            push_task = progress.add_task("Pushing", total=None, detail="0 file(s)", show_time=True)
             self._reset_push_counters(safe_pushes)
-            ok, _ = self._parallel(
-                safe_pushes, self._push_file, description="Pushing",
-                progress=progress, task_id=push_task,
+            ok, _ = self._run_transfer_phase(
+                safe_pushes,
+                fn=lambda s, cb: self._push_file(s, progress_callback=cb),
+                description="Pushing",
+                total_bytes=self._sum_local_bytes(safe_pushes),
+                outer_progress=progress,
                 extra_detail=self._format_push_breakdown,
             )
             pushed.extend(s.rel_path for s in ok)
@@ -759,11 +921,13 @@ class SyncEngine:
 
             if force_local:
                 # Treat local as authoritative — no guard, no conflict prompts.
-                push_task = progress.add_task("Pushing", total=None, detail="0 file(s)", show_time=True)
                 self._reset_push_counters(to_push)
-                ok, _ = self._parallel(
-                    to_push, self._push_file, description="Pushing",
-                    progress=progress, task_id=push_task,
+                ok, _ = self._run_transfer_phase(
+                    to_push,
+                    fn=lambda s, cb: self._push_file(s, progress_callback=cb),
+                    description="Pushing",
+                    total_bytes=self._sum_local_bytes(to_push),
+                    outer_progress=progress,
                     extra_detail=self._format_push_breakdown,
                 )
                 pushed.extend(s.rel_path for s in ok)
@@ -778,11 +942,13 @@ class SyncEngine:
                 )
 
                 # Pushing
-                push_task = progress.add_task("Pushing", total=None, detail="0 file(s)", show_time=True)
                 self._reset_push_counters(safe_pushes)
-                ok, _ = self._parallel(
-                    safe_pushes, self._push_file, description="Pushing",
-                    progress=progress, task_id=push_task,
+                ok, _ = self._run_transfer_phase(
+                    safe_pushes,
+                    fn=lambda s, cb: self._push_file(s, progress_callback=cb),
+                    description="Pushing",
+                    total_bytes=self._sum_local_bytes(safe_pushes),
+                    outer_progress=progress,
                     extra_detail=self._format_push_breakdown,
                 )
                 pushed.extend(s.rel_path for s in ok)
@@ -913,15 +1079,17 @@ class SyncEngine:
 
             if output_dir:
                 output_path = Path(output_dir)
-                action = lambda s: self._pull_file_to(s, output_path)
+                action = lambda s, cb: self._pull_file_to(
+                    s, output_path, progress_callback=cb,
+                )
             else:
-                action = self._pull_file
+                action = lambda s, cb: self._pull_file(s, progress_callback=cb)
 
             # Pulling
-            pull_task = progress.add_task("Pulling", total=None, detail="0 file(s)", show_time=True)
-            ok, _ = self._parallel(
-                to_pull, action, description="Pulling",
-                progress=progress, task_id=pull_task,
+            ok, _ = self._run_transfer_phase(
+                to_pull, fn=action, description="Pulling",
+                total_bytes=self._sum_drive_bytes(to_pull),
+                outer_progress=progress,
             )
             pulled = [s.rel_path for s in ok]
 
@@ -1232,7 +1400,11 @@ class SyncEngine:
                 for name in self._push_counters
             )
 
-    def _push_file(self, state: FileSyncState) -> None:
+    def _push_file(
+        self,
+        state: FileSyncState,
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> None:
         # _safe_join refuses manifest keys that try to escape the project
         # root — a defence against a corrupted or malicious manifest.
         local_path = str(_safe_join(self._project, state.rel_path))
@@ -1240,11 +1412,18 @@ class SyncEngine:
         # If it fails, propagate the exception (caller treats this as a
         # failed push, no manifest update). If it succeeds, fan out to
         # mirrors using their classified retry adapter.
+        # progress_callback (when provided) flows down to the primary
+        # backend's upload_file so the transfer-progress bar advances
+        # with bytes-since-last-call deltas. Mirrors don't get a
+        # callback — the bar is sized by primary bytes only so the
+        # "X/Y MB" figure matches what `status` reports as the push
+        # cost and never overshoots 100%.
         file_id = self.storage.upload_file(
             local_path=local_path,
             rel_path=state.rel_path,
             root_folder_id=self._folder_id,
             file_id=state.drive_file_id,
+            progress_callback=progress_callback,
         )
         remote_hash = self.storage.get_file_hash(file_id)
         primary_name = (
@@ -1367,11 +1546,17 @@ class SyncEngine:
                         f"{cls.value if cls else 'error'} — {err[:80] if err else ''})[/]"
                     )
 
-    def _pull_file(self, state: FileSyncState) -> None:
+    def _pull_file(
+        self,
+        state: FileSyncState,
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> None:
         # Refuse to write outside the project root, even if the remote metadata
         # claims a relative_path with `..` segments.
         local_path = _safe_join(self._project, state.rel_path)
-        content = self.storage.download_file(state.drive_file_id)
+        content = self.storage.download_file(
+            state.drive_file_id, progress_callback=progress_callback,
+        )
         local_path.parent.mkdir(parents=True, exist_ok=True)
         local_path.write_bytes(content)
         synced_hash = Manifest.hash_bytes(content)
@@ -1394,10 +1579,17 @@ class SyncEngine:
                     last_error="local file changed via pull; mirror needs catch-up",
                 )
 
-    def _pull_file_to(self, state: FileSyncState, output_dir: Path) -> None:
+    def _pull_file_to(
+        self,
+        state: FileSyncState,
+        output_dir: Path,
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> None:
         """Download a remote file to output_dir without touching the project or manifest."""
         dest = _safe_join(output_dir, state.rel_path)
-        content = self.storage.download_file(state.drive_file_id)
+        content = self.storage.download_file(
+            state.drive_file_id, progress_callback=progress_callback,
+        )
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(content)
         console.print(f"  [blue]↓[/] {state.rel_path} → {dest}")
@@ -1723,63 +1915,85 @@ class SyncEngine:
             f"[bold]Seeding {len(unseeded)} file(s) to mirror {backend_name!r}…[/]"
         )
 
-        with self._make_phase_progress() as progress:
-            task = progress.add_task(
-                "Seed", total=len(unseeded),
-                detail=f"0/{len(unseeded)} uploaded", show_time=True,
+        # Pre-compute per-file sizes + drift state so the transfer-
+        # progress bar's `total` reflects the bytes we will actually
+        # ship. Skipped (drift / missing) files do not contribute.
+        seed_plan: list[tuple[str, str, int]] = []
+        for rel_path in sorted(unseeded.keys()):
+            try:
+                local_path = str(_safe_join(self._project, rel_path))
+            except ValueError as e:
+                result["failed"] += 1
+                console.print(
+                    f"  [red]✗[/] {rel_path}: refusing unsafe path ({e})"
+                )
+                continue
+            try:
+                local_hash = Manifest.hash_file(local_path)
+            except OSError as e:
+                result["failed"] += 1
+                console.print(
+                    f"  [red]✗[/] {rel_path}: cannot read local file ({e})"
+                )
+                continue
+            manifest_hash = unseeded[rel_path].synced_hash
+            if manifest_hash and local_hash != manifest_hash:
+                result["skipped_drift"] += 1
+                console.print(
+                    f"  [yellow]⚠[/] {rel_path}: local hash differs "
+                    "from manifest — run [bold]claude-mirror push[/] "
+                    "to reconcile, then re-run seed-mirror."
+                )
+                continue
+            try:
+                size = int(Path(local_path).stat().st_size)
+            except OSError:
+                size = 0
+            seed_plan.append((rel_path, local_hash, size))
+
+        total_bytes = sum(sz for _, _, sz in seed_plan)
+
+        if not seed_plan:
+            self.manifest.save()
+            return self._finish_seed_mirror(result, backend_name)
+
+        with make_transfer_progress(console) as tprog:
+            task = tprog.add_task(
+                "Seeding", total=max(total_bytes, 1), show_time=True,
             )
-            for rel_path in sorted(unseeded.keys()):
-                try:
-                    local_path = str(_safe_join(self._project, rel_path))
-                except ValueError as e:
-                    result["failed"] += 1
-                    console.print(
-                        f"  [red]✗[/] {rel_path}: refusing unsafe path ({e})"
-                    )
-                    progress.update(task, advance=1)
-                    continue
 
-                try:
-                    local_hash = Manifest.hash_file(local_path)
-                except OSError as e:
-                    result["failed"] += 1
-                    console.print(
-                        f"  [red]✗[/] {rel_path}: cannot read local file ({e})"
-                    )
-                    progress.update(task, advance=1)
-                    continue
+            def _advance(n: int) -> None:
+                if n > 0:
+                    tprog.advance(task, n)
 
-                # Drift sanity check — refuse to seed mismatched content.
-                # The manifest's synced_hash records what the primary has;
-                # if local has diverged, a normal push must reconcile
-                # primary first (and will fan-out to the mirror at the
-                # same time, so seed-mirror still completes correctly).
-                manifest_hash = unseeded[rel_path].synced_hash
-                if manifest_hash and local_hash != manifest_hash:
-                    result["skipped_drift"] += 1
-                    console.print(
-                        f"  [yellow]⚠[/] {rel_path}: local hash differs "
-                        "from manifest — run [bold]claude-mirror push[/] "
-                        "to reconcile, then re-run seed-mirror."
-                    )
-                    progress.update(task, advance=1)
-                    continue
-
+            for rel_path, local_hash, size in seed_plan:
+                local_path = str(_safe_join(self._project, rel_path))
                 try:
                     upload_fn = getattr(target, "_upload_with_retry", None)
                     if upload_fn:
+                        # `_upload_with_retry` does not yet thread the
+                        # progress callback (it predates PROG-ETA); fall
+                        # through with the raw upload_file when the
+                        # caller wants live byte progress, since the
+                        # retry adapter is a thin wrapper anyway.
                         new_id = upload_fn(
                             local_path=local_path,
                             rel_path=rel_path,
                             root_folder_id=target.config.root_folder,
                             file_id=None,
                         )
+                        # Retry adapter has no progress hook — emit a
+                        # single "transferred N bytes" delta after the
+                        # call returns so the bar still moves.
+                        if size:
+                            _advance(size)
                     else:
                         new_id = target.upload_file(
                             local_path=local_path,
                             rel_path=rel_path,
                             root_folder_id=target.config.root_folder,
                             file_id=None,
+                            progress_callback=_advance,
                         )
                     try:
                         remote_hash = target.get_file_hash(new_id) or local_hash
@@ -1794,15 +2008,24 @@ class SyncEngine:
                     result["seeded"] += 1
                 except (BackendError, Exception) as exc:
                     result["failed"] += 1
-                    console.print(
+                    tprog.console.print(
                         f"  [red]✗[/] {rel_path}: {redact_error(str(exc))}"
                     )
-                progress.update(
-                    task, advance=1,
-                    detail=f"{result['seeded']}/{len(unseeded)} uploaded",
-                )
+
+            # Defensive cap — if a backend's progress_callback under-
+            # reported (Dropbox single-shot path emits one delta of
+            # body length; should match exactly, but a stat/read race
+            # could leave a tiny gap), force the bar to 100% on success.
+            if not result["failed"] and total_bytes > 0:
+                tprog.update(task, completed=total_bytes)
 
         self.manifest.save()
+        return self._finish_seed_mirror(result, backend_name)
+
+    def _finish_seed_mirror(self, result: dict, backend_name: str) -> dict:
+        """Print the final seed-mirror summary line + the failure hint
+        when applicable. Extracted from ``seed_mirror`` so the success
+        path and the empty-plan early-return share the same epilogue."""
         console.print(
             f"[bold]seed-mirror complete:[/] "
             f"seeded {result['seeded']}, "

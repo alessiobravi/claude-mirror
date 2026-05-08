@@ -204,6 +204,30 @@ Version transitions render bold green; consecutive identical-hash rows render di
 claude-mirror restore <timestamp> MEMORY.md --output ~/tmp/recovery
 ```
 
+#### Filtering history by date
+
+When the snapshot set is large, scan a narrower window with `--since` and `--until`. Both flags are independent and inclusive on both bounds, and accept the same vocabulary as `forget --before`: an ISO date (`2026-04-15`), an ISO datetime (`2026-04-15T10:00:00Z`), or a relative duration (`30d` / `2w` / `3m` / `1y`):
+
+```bash
+# Everything since April 15:
+claude-mirror history MEMORY.md --since 2026-04-15
+
+# Last 30 days only:
+claude-mirror history MEMORY.md --since 30d
+
+# A specific April-2026 window:
+claude-mirror history MEMORY.md --since 2026-04-01 --until 2026-04-30
+```
+
+A `--since` later than `--until` is rejected up-front (red error, exit 1). With the filter active, an empty result echoes the parsed window back so you can see what range you queried:
+
+```
+No snapshots contain MEMORY.md
+Active filter: since=2099-01-01T00:00:00Z, until=2099-12-31T00:00:00Z.
+```
+
+The filter applies BEFORE the per-snapshot manifest scan, so it's a meaningful speed-up on large remotes — only the snapshots inside the window are downloaded.
+
 ### Inspect a snapshot's contents
 
 Before recovering, you can view exactly what's in a snapshot — every path with its SHA-256 (blobs format) or size (full format) — without downloading any file bodies:
@@ -253,6 +277,67 @@ claude-mirror restore 2026-03-05T10-30-00Z CLAUDE.md memory/notes.md
 For blobs-format snapshots, single-file restore only downloads the one blob it needs — cheap regardless of snapshot size. Use `claude-mirror inspect TIMESTAMP --paths PATTERN` first to confirm a file exists at the version you want before recovering.
 
 Restore auto-detects each snapshot's format — you don't have to know whether it was a `full` or `blobs` snapshot.
+
+#### Previewing a restore
+
+Pass `--dry-run` to see exactly what `restore` would write before committing to it. The plan is a Rich table (Path / Action / Source backend / Size) followed by a one-line summary; nothing is written to local disk:
+
+```bash
+claude-mirror restore 2026-03-05T10-30-00Z --dry-run
+claude-mirror restore 2026-03-05T10-30-00Z 'memory/**' --dry-run
+claude-mirror restore 2026-03-05T10-30-00Z --backend dropbox --dry-run
+```
+
+Each row's `Action` column is one of:
+
+- `restore` — the file would be written (every file in a healthy snapshot).
+- `missing-blob` — the manifest references a blob that's no longer on remote (typically because `claude-mirror gc --delete` ran after the snapshot was taken). The real `restore` would print a yellow warning and skip the file.
+
+The summary line ends with `Run without --dry-run to apply.` so the next step is obvious. The exit code is 0 even when every row is `missing-blob` — `--dry-run` only fails on truly fatal errors (snapshot not found on any backend, malformed timestamp). Compose with shell tools for richer review:
+
+```bash
+# Spot every file that would be touched, paginated:
+claude-mirror restore 2026-05-05T10-15-22Z --dry-run | less
+
+# Diff the plan across two competing recovery candidates:
+claude-mirror restore 2026-04-01T00-00-00Z --dry-run > /tmp/plan-april.txt
+claude-mirror restore 2026-05-01T00-00-00Z --dry-run > /tmp/plan-may.txt
+diff /tmp/plan-april.txt /tmp/plan-may.txt
+```
+
+### Comparing snapshots
+
+When you want to know what changed between two recovery points before deciding which to restore, `claude-mirror snapshot-diff TS1 TS2` shows the per-file delta. Order matters — TS1 is the "from" snapshot, TS2 is the "to" snapshot. Pass the literal keyword `latest` for either side to use the most recent snapshot:
+
+```bash
+claude-mirror snapshot-diff 2026-04-01T10-00-00Z 2026-05-01T10-00-00Z
+claude-mirror snapshot-diff 2026-04-01T10-00-00Z latest
+claude-mirror snapshot-diff 2026-04-01T10-00-00Z latest --paths 'memory/**'
+claude-mirror snapshot-diff 2026-04-01T10-00-00Z latest --all
+claude-mirror snapshot-diff 2026-04-01T10-00-00Z latest --unified CLAUDE.md
+```
+
+Each file is classified as one of:
+
+| Status | Meaning |
+|---|---|
+| `added` | present in TS2, absent in TS1 |
+| `removed` | present in TS1, absent in TS2 |
+| `modified` | present in both, content differs |
+| `unchanged` | present in both, content identical (omitted unless `--all`) |
+
+For `modified` rows, the `Changes` column shows `+N -M` line counts computed via `difflib` on the two file bodies. Files whose bytes are not valid UTF-8 are reported as `binary` — both snapshots' contents must decode as text for the line count to apply.
+
+`--paths PATTERN` filters the table by an fnmatch glob (e.g. `'memory/**'`, `'*.md'`, `'CLAUDE.md'`).
+
+`--unified PATH` switches to a standard `diff -u`-format unified diff for one specific file — composes with shell tools (`less`, `delta`, `vim -`):
+
+```bash
+claude-mirror snapshot-diff 2026-04-01T10-00-00Z latest --unified CLAUDE.md | delta
+claude-mirror snapshot-diff 2026-04-01T10-00-00Z latest --unified memory/notes.md | less -R
+```
+
+Both `blobs` and `full` snapshots are accepted, and the two snapshots may even be in different formats (the older one was `full`, the newer one is `blobs` after a `migrate-snapshots` run). For full-format snapshots, identical files between the two snapshots may show as `modified` (the per-snapshot file_id differs even when bytes match) — convert to `blobs` with `migrate-snapshots --to blobs` for content-equality classification.
 
 ---
 

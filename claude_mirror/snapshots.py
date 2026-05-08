@@ -112,6 +112,49 @@ def _human_size(n: int) -> str:
     return f"{n:.1f} TB"
 
 
+def parse_relative_or_iso_date(value: str, flag_label: str = "date") -> datetime:
+    """Parse a date string as either an ISO date ('2026-04-15'), an ISO
+    timestamp ('2026-04-15T10:00:00Z'), or a relative duration
+    ('30d', '2w', '3m', '1y'). Returns a timezone-aware UTC datetime.
+
+    Shared between `forget --before`, `history --since`, and
+    `history --until` so all three accept the same vocabulary.
+
+    flag_label: included in error messages so the user sees which flag
+    they passed (e.g. 'cannot parse "next-tuesday" as date or duration
+    for --since: ...').
+    """
+    v = (value or "").strip().lower()
+    if not v:
+        raise ValueError(f"{flag_label}: empty value")
+    # Relative form: <N><unit>  with unit in d/w/m/y
+    if v[-1] in "dwmy" and v[:-1].isdigit():
+        n = int(v[:-1])
+        unit = v[-1]
+        days = {"d": 1, "w": 7, "m": 30, "y": 365}[unit] * n
+        return datetime.now(timezone.utc) - timedelta(days=days)
+    # Absolute ISO date or datetime
+    try:
+        if "t" in v or " " in v:
+            return datetime.fromisoformat(
+                value.replace("Z", "+00:00")
+            ).astimezone(timezone.utc)
+        return datetime.strptime(v, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError as e:
+        raise ValueError(
+            f"{flag_label}: cannot parse {value!r} as date or duration. "
+            "Use 'YYYY-MM-DD' or 'Nd' / 'Nw' / 'Nm' / 'Ny' (e.g. '30d')."
+        ) from e
+
+
+def _fmt_dt_or_none(dt: Optional[datetime]) -> str:
+    """Render an optional datetime as ISO-Z or '—'. Used by user-visible
+    messages where the absent bound should be obvious."""
+    if dt is None:
+        return "—"
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 @dataclass
 class SnapshotMeta:
     timestamp: str
@@ -136,6 +179,10 @@ class SnapshotManager:
         # Tier 2: per-mirror folder ID caches so we don't re-resolve every call.
         self._mirror_snapshots_folder_ids: dict[str, str] = {}
         self._mirror_blobs_folder_ids: dict[str, str] = {}
+        # Cache of {backend_key: {sha256: blob_file_id}} populated lazily
+        # by `get_blob_content` — used by snapshot-diff to avoid re-listing
+        # the entire blobs folder for every file fetched.
+        self._blob_id_cache: dict[str, dict[str, str]] = {}
 
     # ------------------------------------------------------------------
     # Folder helpers
@@ -895,18 +942,35 @@ class SnapshotManager:
     # History — version timeline of a single path across all snapshots
     # ------------------------------------------------------------------
 
-    def history(self, path: str) -> dict:
+    def history(
+        self,
+        path: str,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+    ) -> dict:
         """Return the path's version timeline across every snapshot on
         remote. For `blobs` snapshots the SHA-256 hash gives true version
         identity (consecutive identical hashes = file unchanged). For
         `full` snapshots we can only confirm presence/absence without
         downloading each file body, so they're listed without hash.
 
+        Optional `since` / `until` are timezone-aware UTC datetimes; when
+        either is set, snapshots whose ISO-ish timestamp falls outside
+        the inclusive range `[since, until]` are filtered out before the
+        per-snapshot lookup. With neither set, every snapshot is scanned
+        (legacy behaviour preserved).
+
         Returns a dict with `path`, `entries` (newest-first), and counts
         `distinct_versions` (across blobs snapshots only) and
         `total_appearances`.
         """
         snapshots = self.list()  # already sorted newest-first
+
+        if since is not None or until is not None:
+            snapshots = [
+                s for s in snapshots
+                if self._snapshot_in_range(s.get("timestamp", ""), since, until)
+            ]
 
         blobs_snaps = [s for s in snapshots if s.get("format") == "blobs"]
         full_snaps = [s for s in snapshots if s.get("format") == "full"]
@@ -995,21 +1059,35 @@ class SnapshotManager:
             "total_appearances": len(entries),
         }
 
-    def show_history(self, path: str) -> dict:
+    def show_history(
+        self,
+        path: str,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+    ) -> dict:
         """Render the path's version timeline as a table. Returns the
-        history() dict so callers can reuse it."""
+        history() dict so callers can reuse it. `since` / `until` are
+        timezone-aware UTC datetimes that, when set, restrict the scan
+        to snapshots whose timestamp falls inside the inclusive range."""
         with make_phase_progress(console) as progress:
             task = progress.add_task(
                 "History", total=None,
                 detail=f"searching snapshots for {path}…", show_time=True,
             )
-            result = self.history(path)
+            result = self.history(path, since=since, until=until)
             progress.update(task, detail="completed")
 
         entries = result["entries"]
         if not entries:
+            range_hint = ""
+            if since is not None or until is not None:
+                range_hint = (
+                    f"\n[dim]Active filter: "
+                    f"since={_fmt_dt_or_none(since)}, "
+                    f"until={_fmt_dt_or_none(until)}.[/]"
+                )
             console.print(
-                f"[yellow]No snapshots contain[/] [cyan]{path}[/]\n"
+                f"[yellow]No snapshots contain[/] [cyan]{path}[/]{range_hint}\n"
                 f"[dim]Run [bold]claude-mirror snapshots[/] to see what's "
                 f"available, or [bold]claude-mirror inspect <ts>[/] to "
                 f"browse a specific snapshot.[/]"
@@ -1473,6 +1551,216 @@ class SnapshotManager:
             f"[green]Restore complete.[/] {ok}/{len(path_to_hash)} file(s) "
             f"written to {output_path}"
         )
+
+    # ------------------------------------------------------------------
+    # Restore planning (dry-run) + content access for diffing
+    # ------------------------------------------------------------------
+
+    def plan_restore(
+        self,
+        timestamp: str,
+        paths: Optional[list[str]] = None,
+        backend_name: Optional[str] = None,
+    ) -> dict:
+        """Return what `restore(timestamp, ...)` WOULD do without writing
+        anything. Walks the same primary-first/mirror-fallback dispatch as
+        `restore`, but stops at the manifest-load step.
+
+        Returns a dict shaped like::
+
+            {
+              "timestamp": "2026-...",
+              "format": "blobs" | "full",
+              "source_backend": "googledrive",
+              "files": [
+                {"path": "...", "action": "restore" | "missing-blob",
+                 "size": int | None, "hash": str | None},
+                ...
+              ],
+              "total_in_snapshot": int,   # before --paths filter
+              "matched": int,             # after --paths filter
+            }
+
+        Raises ValueError if the snapshot is not found on any backend or if
+        an explicit backend_name does not exist in the configured set.
+        """
+        result = self.inspect(timestamp, backend_name=backend_name)
+        fmt = result["format"]
+        all_files = result["files"]
+        total = len(all_files)
+
+        if paths:
+            files = [f for f in all_files if self._matches_paths(f["path"], paths)]
+        else:
+            files = list(all_files)
+
+        # For blobs format, additionally check which referenced blobs are
+        # actually present so we can flag "missing-blob" rows in the plan
+        # — exactly like the live restore path does at write time.
+        missing_hashes: set[str] = set()
+        if fmt == "blobs" and files:
+            backend = (
+                self._find_backend(backend_name) if backend_name else self.storage
+            )
+            # When the primary doesn't have the snapshot, inspect() falls
+            # through to a mirror — but plan_restore was given no
+            # backend_name, so we don't actually know which mirror won.
+            # For the dry-run plan, we conservatively probe the primary's
+            # blob store. If it's empty (mirror-served snapshot), every
+            # blob will look "missing" — which is fine for the dry-run
+            # display: the real restore will redo the dispatch, and the
+            # CLI banner makes clear the plan is a preview only.
+            try:
+                blobs_folder_id = self._get_blobs_folder_for(backend)
+                present = {
+                    e["name"] for e in backend.list_files_recursive(blobs_folder_id)
+                }
+            except Exception:
+                present = set()
+            for f in files:
+                h = f.get("hash") or ""
+                if h and h not in present:
+                    missing_hashes.add(h)
+
+        plan_files: list[dict] = []
+        for f in files:
+            h = f.get("hash")
+            size = f.get("size")
+            action = "restore"
+            if fmt == "blobs" and h and h in missing_hashes:
+                action = "missing-blob"
+            plan_files.append(
+                {
+                    "path": f["path"],
+                    "action": action,
+                    "size": size,
+                    "hash": h,
+                }
+            )
+
+        # Sort by path for stable display.
+        plan_files.sort(key=lambda x: x["path"])
+
+        return {
+            "timestamp": timestamp,
+            "format": fmt,
+            "source_backend": self._backend_key(self.storage),
+            "files": plan_files,
+            "total_in_snapshot": total,
+            "matched": len(plan_files),
+        }
+
+    def get_snapshot_manifest(
+        self, timestamp: str, backend_name: Optional[str] = None,
+    ) -> dict:
+        """Return a normalized view of a snapshot suitable for diffing.
+
+        Output dict::
+
+            {
+              "format":    "blobs" | "full",
+              "timestamp": "2026-...",
+              "files":     {rel_path: identifier},  # blobs → sha256, full → file_id
+              "_backend":  <StorageBackend>,        # the backend that served it
+            }
+
+        Auto-detects format and dispatches primary-first / mirror-fallback
+        the same way `inspect()` and `restore()` do. Raises ValueError if
+        the snapshot is not found on any configured backend.
+
+        The `_backend` field is private (leading underscore): callers should
+        treat it as opaque and only use it via `get_blob_content()`. It's
+        included so the diff helper can reach the same backend the manifest
+        came from rather than re-running the dispatch.
+        """
+        # Drive through inspect() so the primary-first / mirror-fallback
+        # logic stays single-sourced. Then resolve which backend served it
+        # so callers can fetch contents with `get_blob_content`.
+        view = self.inspect(timestamp, backend_name=backend_name)
+
+        # Resolve the serving backend. With an explicit name this is easy;
+        # otherwise we re-probe primary-then-mirrors with `get_file_id` /
+        # `list_folders` (cheap manifest existence checks).
+        if backend_name:
+            served_by = self._find_backend(backend_name)
+            assert served_by is not None  # inspect() already raised otherwise
+        else:
+            served_by = self._locate_snapshot_backend(timestamp)
+            if served_by is None:
+                # Should not happen — inspect() already returned a result.
+                served_by = self.storage
+
+        files: dict[str, str] = {}
+        for f in view["files"]:
+            if view["format"] == "blobs":
+                files[f["path"]] = f.get("hash") or ""
+            else:
+                files[f["path"]] = f.get("id") or ""
+
+        return {
+            "format": view["format"],
+            "timestamp": view["timestamp"],
+            "files": files,
+            "_backend": served_by,
+        }
+
+    def _locate_snapshot_backend(
+        self, timestamp: str,
+    ) -> Optional[StorageBackend]:
+        """Return the first configured backend (primary, then mirrors in
+        order) that has `timestamp`. None if no backend has it. Used by
+        `get_snapshot_manifest()` to pin the serving backend for downstream
+        content fetches."""
+        for backend in [self.storage, *self._mirrors]:
+            try:
+                snapshots_folder_id = self._get_snapshots_folder_for(backend)
+                if backend.get_file_id(
+                    f"{timestamp}{MANIFEST_SUFFIX}", snapshots_folder_id
+                ):
+                    return backend
+                if backend.list_folders(snapshots_folder_id, name=timestamp):
+                    return backend
+            except Exception:
+                continue
+        return None
+
+    def get_blob_content(
+        self,
+        identifier: str,
+        backend: Optional[StorageBackend] = None,
+        format_hint: str = "blobs",
+    ) -> bytes:
+        """Fetch the bytes for a single file from a snapshot.
+
+        For `blobs` snapshots, `identifier` is the SHA-256 hash and the
+        helper resolves it to a blob file_id by listing the backend's
+        blobs folder (cached on first call per backend).
+
+        For `full` snapshots, `identifier` is already a backend-native
+        file_id (returned in `get_snapshot_manifest`'s `files` dict for
+        full-format snapshots) and is downloaded directly.
+
+        Pass `backend=` to override the default (`self.storage`) — typically
+        the value of `manifest["_backend"]` from `get_snapshot_manifest`.
+        """
+        target = backend or self.storage
+        if format_hint == "blobs":
+            blobs_folder_id = self._get_blobs_folder_for(target)
+            cache: dict[str, str] = self._blob_id_cache.setdefault(
+                self._backend_key(target), {}
+            )
+            if not cache:
+                for entry in target.list_files_recursive(blobs_folder_id):
+                    cache[entry["name"]] = entry["id"]
+            blob_id = cache.get(identifier)
+            if not blob_id:
+                raise ValueError(
+                    f"blob {identifier[:12]}… not present on backend "
+                    f"{self._backend_key(target)}"
+                )
+            return target.download_file(blob_id)
+        else:
+            return target.download_file(identifier)
 
     # ------------------------------------------------------------------
     # Garbage collection (blobs format only)
@@ -2184,27 +2472,23 @@ class SnapshotManager:
         """Parse `--before` as either an ISO date ('2026-04-15'), an ISO
         timestamp ('2026-04-15T10:00:00Z'), or a relative duration
         ('30d', '2w', '3m', '1y'). Returns a timezone-aware UTC datetime."""
-        v = value.strip().lower()
-        if not v:
-            raise ValueError("before: empty value")
-        # Relative form: <N><unit>  with unit in d/w/m/y
-        if v[-1] in "dwmy" and v[:-1].isdigit():
-            n = int(v[:-1])
-            unit = v[-1]
-            days = {"d": 1, "w": 7, "m": 30, "y": 365}[unit] * n
-            return datetime.now(timezone.utc) - timedelta(days=days)
-        # Absolute ISO date or datetime
-        try:
-            if "t" in v.lower() or " " in v:
-                return datetime.fromisoformat(
-                    value.replace("Z", "+00:00")
-                ).astimezone(timezone.utc)
-            return datetime.strptime(v, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        except ValueError as e:
-            raise ValueError(
-                f"--before: cannot parse {value!r} as date or duration. "
-                "Use 'YYYY-MM-DD' or 'Nd' / 'Nw' / 'Nm' / 'Ny' (e.g. '30d')."
-            ) from e
+        return parse_relative_or_iso_date(value, flag_label="--before")
+
+    def _snapshot_in_range(
+        self,
+        timestamp: str,
+        since: Optional[datetime],
+        until: Optional[datetime],
+    ) -> bool:
+        """True if `timestamp` falls inside the inclusive `[since, until]`
+        window. Used by `history(since=, until=)` to filter the snapshot
+        list. Both bounds are optional; pass None to disable that side."""
+        ts = self._parse_snapshot_ts(timestamp)
+        if since is not None and ts < since:
+            return False
+        if until is not None and ts > until:
+            return False
+        return True
 
     def _forget_one(self, snap: dict) -> None:
         """Delete a single snapshot's on-remote artifacts. Format-specific:

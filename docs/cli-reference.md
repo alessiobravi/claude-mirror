@@ -37,10 +37,11 @@ claude-mirror watch-all   [--config PATH ...]   (default: all configs in ~/.conf
 claude-mirror reload
 claude-mirror snapshots         [--config PATH]
 claude-mirror inspect           TIMESTAMP [--paths GLOB] [--config PATH]
-claude-mirror history           PATH [--config PATH]
+claude-mirror history           PATH [--since DATE/DURATION] [--until DATE/DURATION] [--config PATH]
+claude-mirror snapshot-diff     TS1 TS2 [--all] [--paths GLOB] [--unified PATH] [--config PATH]
 claude-mirror retry             [--backend NAME] [--dry-run] [--config PATH]
 claude-mirror seed-mirror       --backend NAME [--dry-run] [--config PATH]   # populate a freshly-added mirror with files already on the primary
-claude-mirror restore           TIMESTAMP [PATH ...] [--backend NAME] [--output PATH] [--config PATH]
+claude-mirror restore           TIMESTAMP [PATH ...] [--backend NAME] [--output PATH] [--dry-run/--no-dry-run] [--config PATH]
 claude-mirror forget            TIMESTAMP... | --before DATE/DURATION | --keep-last N | --keep-days N
                               [--delete] [--yes] [--config PATH]   # dry-run by default; --delete to actually delete
 claude-mirror prune             [--keep-last N] [--keep-daily N] [--keep-monthly N] [--keep-yearly N]
@@ -155,11 +156,15 @@ Show the manifest of a snapshot — every path with its SHA-256 (blobs format) o
 
 ### `history`
 
-Scan every snapshot's manifest and report which ones contain `PATH`. For `blobs` snapshots, the SHA-256 lets it label distinct versions (v1, v2, ...) so you can spot when the file actually changed. The version timeline highlights transitions in bold green.
+Scan every snapshot's manifest and report which ones contain `PATH`. For `blobs` snapshots, the SHA-256 lets it label distinct versions (v1, v2, ...) so you can spot when the file actually changed. The version timeline highlights transitions in bold green. Pass `--since DATE/DURATION` and/or `--until DATE/DURATION` (inclusive on both bounds, independent, both optional) to restrict the scan to a window — accepts ISO dates (`2026-04-15`), ISO datetimes (`2026-04-15T10:00:00Z`), or relative durations (`30d` / `2w` / `3m` / `1y`). A `--since` later than `--until` exits 1 with a red error. See [admin.md — Filtering history by date](admin.md#filtering-history-by-date).
+
+### `snapshot-diff`
+
+Show what changed between two snapshots. `TS1` is the "from" snapshot; `TS2` is the "to" snapshot — order matters. Pass the literal keyword `latest` for either side to use the most recent snapshot. Default output classifies each file as `added` / `removed` / `modified` (omitting `unchanged` rows; pass `--all` to include them). For `modified` rows the `Changes` column shows `+N -M` line counts via difflib (`binary` if either body is non-UTF-8). `--paths PATTERN` filters the table by an fnmatch glob. `--unified PATH` switches to standard `diff -u` output for one specific file (composes with `less` / `delta` / shell redirection). Both `blobs` and `full` snapshots accepted, including a mix of formats. See [admin.md — Comparing snapshots](admin.md#comparing-snapshots).
 
 ### `restore`
 
-Restore one or more files (or the whole snapshot) from `TIMESTAMP`. With Tier 2, falls back to mirrors in `mirror_config_paths` order if the snapshot is missing on the primary; pass `--backend NAME` to force a specific source. Use `--output PATH` to restore to a safe inspection directory instead of overwriting the project. Auto-detects the snapshot's format.
+Restore one or more files (or the whole snapshot) from `TIMESTAMP`. With Tier 2, falls back to mirrors in `mirror_config_paths` order if the snapshot is missing on the primary; pass `--backend NAME` to force a specific source. Use `--output PATH` to restore to a safe inspection directory instead of overwriting the project. Pass `--dry-run` to preview every file the restore would write (Path / Action / Source backend / Size) without touching local disk; the summary ends with `Run without --dry-run to apply.`. Default is `--no-dry-run` (existing behaviour). Auto-detects the snapshot's format. See [admin.md — Previewing a restore](admin.md#previewing-a-restore).
 
 ### `forget`
 

@@ -3210,8 +3210,14 @@ def snapshots(config_path: str) -> None:
                    "'dropbox'), bypassing the primary-first fallback chain. "
                    "Useful when the primary is down or you know which "
                    "mirror has the version you want.")
+@click.option("--dry-run/--no-dry-run", "dry_run", default=False,
+              help="Preview every file the restore would write (Path / "
+                   "Action / Source backend / Size) without touching local "
+                   "disk. Exits 0 after printing the plan. Default: "
+                   "--no-dry-run (the actual restore runs as before).")
 @click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
-def restore(timestamp: str, paths: tuple, output: str, backend_name: str, config_path: str) -> None:
+def restore(timestamp: str, paths: tuple, output: str, backend_name: str,
+            dry_run: bool, config_path: str) -> None:
     """
     Restore a snapshot to a local directory.
 
@@ -3228,10 +3234,17 @@ def restore(timestamp: str, paths: tuple, output: str, backend_name: str, config
       claude-mirror restore 2026-05-05T10-15-22Z 'memory/**' --output ~/tmp/recovery
       claude-mirror restore 2026-05-05T10-15-22Z '*.md'
       claude-mirror restore 2026-05-05T10-15-22Z --backend dropbox
+      claude-mirror restore 2026-05-05T10-15-22Z --dry-run
 
     By default, files are restored to the original project path (with
     a confirmation prompt). Use --output to restore to a separate
     directory instead — useful for inspecting before overwriting.
+
+    Pass --dry-run to preview the file list without writing anything to
+    local disk. The plan shows every file the restore would touch
+    (Path / Action / Source backend / Size); files referencing blobs
+    that are no longer present on remote are flagged as
+    `missing-blob`. Re-run without --dry-run to apply.
 
     For blobs-format snapshots, only the requested files' blobs are
     downloaded (no whole-tree fetch). For full-format snapshots, only
@@ -3246,6 +3259,19 @@ def restore(timestamp: str, paths: tuple, output: str, backend_name: str, config
     config = Config.load(_resolve_config(config_path))
     storage, mirrors = _create_storage_set(config)
     snap = SnapshotManager(config, storage, mirrors=mirrors)
+
+    if dry_run:
+        try:
+            plan = snap.plan_restore(
+                timestamp,
+                paths=list(paths) if paths else None,
+                backend_name=backend_name or None,
+            )
+        except ValueError as e:
+            console.print(f"[red]{e}[/]")
+            sys.exit(1)
+        _render_restore_plan(plan, paths=list(paths) if paths else None)
+        return
 
     target = output or config.project_path
     if target == config.project_path:
@@ -3268,6 +3294,54 @@ def restore(timestamp: str, paths: tuple, output: str, backend_name: str, config
         timestamp, target,
         paths=list(paths) if paths else None,
         backend_name=backend_name or None,
+    )
+
+
+def _render_restore_plan(plan: dict, paths: Optional[list]) -> None:
+    """Print a Rich table for `claude-mirror restore --dry-run`. Columns:
+    Path / Action / Source backend / Size. Ends with a one-line summary."""
+    files = plan["files"]
+    fmt = plan["format"]
+    timestamp = plan["timestamp"]
+    source = plan["source_backend"]
+
+    if not files:
+        if paths:
+            console.print(
+                f"[yellow]Dry-run:[/] no files in snapshot {timestamp} match "
+                f"{', '.join(repr(p) for p in paths)}.\n"
+                f"[dim]Total files in snapshot: {plan['total_in_snapshot']}.[/]"
+            )
+        else:
+            console.print(
+                f"[yellow]Dry-run:[/] snapshot {timestamp} is empty."
+            )
+        return
+
+    table = Table(
+        show_header=True, header_style="bold",
+        title=f"Restore plan — snapshot {timestamp} (format={fmt})",
+    )
+    table.add_column("Path")
+    table.add_column("Action")
+    table.add_column("Source backend")
+    table.add_column("Size", justify="right")
+
+    for f in files:
+        size = f.get("size") or 0
+        size_str = _human_size(size) if size else "[dim]?[/]"
+        action = f["action"]
+        if action == "missing-blob":
+            action_cell = "[red]missing-blob[/]"
+        else:
+            action_cell = "[green]restore[/]"
+        table.add_row(f["path"], action_cell, source, size_str)
+
+    console.print(table)
+    n = len(files)
+    console.print(
+        f"[bold]Would restore {n} file(s) from snapshot {timestamp}. "
+        f"Run without --dry-run to apply.[/]"
     )
 
 
@@ -3524,9 +3598,18 @@ def gc(do_delete: bool, dry_run: bool, skip_confirm: bool,
 
 @cli.command()
 @click.argument("path")
+@click.option("--since", "since", default="",
+              help="Filter to snapshots taken on or after this point in time. "
+                   "Accepts an ISO date (2026-04-15), an ISO datetime "
+                   "(2026-04-15T10:00:00Z), or a relative duration: "
+                   "Nd / Nw / Nm / Ny  (e.g. 30d, 2w, 3m, 1y).")
+@click.option("--until", "until", default="",
+              help="Filter to snapshots taken on or before this point in time. "
+                   "Same accepted forms as --since: ISO date, ISO datetime, "
+                   "or Nd / Nw / Nm / Ny relative duration.")
 @click.option("--config", "config_path", default="",
               help="Config file path. Auto-detected from cwd if omitted.")
-def history(path: str, config_path: str) -> None:
+def history(path: str, since: str, until: str, config_path: str) -> None:
     """Show every snapshot that contains PATH, grouped by version.
 
     Walks every snapshot's manifest and reports which ones contain the
@@ -3540,6 +3623,15 @@ def history(path: str, config_path: str) -> None:
     Examples:
       claude-mirror history memory/MOC-Session.md
       claude-mirror history CLAUDE.md
+      claude-mirror history memory/notes.md --since 2026-04-15
+      claude-mirror history memory/notes.md --since 30d
+      claude-mirror history memory/notes.md --since 2026-04-01 --until 2026-04-30
+
+    Pass --since DATE / --until DATE (independently optional) to scan
+    only snapshots whose timestamp falls inside the inclusive
+    [since, until] window. Both flags accept the same vocabulary as
+    `forget --before` — an ISO date, an ISO datetime, or a relative
+    duration of the form Nd / Nw / Nm / Ny.
 
     The output table is newest-first. Each version transition is shown
     in bold green so version changes are easy to spot. Use the timestamp
@@ -3551,7 +3643,28 @@ def history(path: str, config_path: str) -> None:
     config = Config.load(_resolve_config(config_path))
     storage = _create_storage(config)
     snap = SnapshotManager(config, storage)
-    snap.show_history(path)
+
+    from .snapshots import parse_relative_or_iso_date
+
+    since_dt = None
+    until_dt = None
+    try:
+        if since:
+            since_dt = parse_relative_or_iso_date(since, flag_label="--since")
+        if until:
+            until_dt = parse_relative_or_iso_date(until, flag_label="--until")
+    except ValueError as e:
+        console.print(f"[red]{e}[/]")
+        sys.exit(1)
+
+    if since_dt is not None and until_dt is not None and since_dt > until_dt:
+        console.print(
+            f"[red]--since ({since}) is later than --until ({until}); "
+            "no snapshots can match an empty range.[/]"
+        )
+        sys.exit(1)
+
+    snap.show_history(path, since=since_dt, until=until_dt)
 
 
 @cli.command()
@@ -3595,6 +3708,298 @@ def inspect(timestamp: str, path_filter: str, config_path: str, backend_name: st
         )
     except ValueError:
         sys.exit(1)
+
+
+@cli.command("snapshot-diff")
+@click.argument("ts1", metavar="TS1")
+@click.argument("ts2", metavar="TS2")
+@click.option("--all", "show_all", is_flag=True, default=False,
+              help="Include `unchanged` rows in the output. Default: omit "
+                   "unchanged files (only added / removed / modified shown).")
+@click.option("--paths", "path_filter", default="",
+              help="Filter to files whose path matches this fnmatch glob "
+                   "(e.g. 'memory/**', '*.md', 'CLAUDE.md').")
+@click.option("--unified", "unified_path", default="",
+              help="Print a standard unified diff (`diff -u` format) for "
+                   "exactly ONE file at the given relative path. Composes "
+                   "with shell tools — `claude-mirror snapshot-diff TS1 TS2 "
+                   "--unified PATH | less`.")
+@click.option("--config", "config_path", default="",
+              help="Config file path. Auto-detected from cwd if omitted.")
+def snapshot_diff(ts1: str, ts2: str, show_all: bool, path_filter: str,
+                  unified_path: str, config_path: str) -> None:
+    """Show what changed between two snapshots.
+
+    TS1 is the "from" snapshot and TS2 is the "to" snapshot — order
+    matters. Pass the literal keyword `latest` for either to use the
+    most recent snapshot on remote.
+
+    \b
+    Examples:
+      claude-mirror snapshot-diff 2026-04-01T10-00-00Z 2026-05-01T10-00-00Z
+      claude-mirror snapshot-diff 2026-04-01T10-00-00Z latest
+      claude-mirror snapshot-diff 2026-04-01T10-00-00Z latest --paths 'memory/**'
+      claude-mirror snapshot-diff 2026-04-01T10-00-00Z latest --all
+      claude-mirror snapshot-diff 2026-04-01T10-00-00Z latest --unified CLAUDE.md
+
+    Each file is classified as one of:
+
+    \b
+      added       present in TS2, absent in TS1
+      removed     present in TS1, absent in TS2
+      modified    present in both, content differs (blobs: hash differs;
+                  full: file body differs)
+      unchanged   present in both, content identical (omitted unless --all)
+
+    For modified rows, the `Changes` column shows `+N -M` line counts
+    via difflib on the two file bodies. Files whose bytes are not valid
+    UTF-8 are reported as `binary` (no line count) — both snapshots
+    must be text for the count to apply.
+
+    Pass --paths PATTERN to filter the table by an fnmatch glob, or
+    --unified PATH to print a standard `diff -u` for one file
+    (suppresses the table — designed to compose with `less`, `delta`,
+    `vim -`, etc.).
+
+    Both blobs-format and full-format snapshots are accepted, and the
+    two snapshots may even be in different formats (the older one was
+    full, the newer one is blobs after a migrate).
+    """
+    config = Config.load(_resolve_config(config_path))
+    storage, mirrors = _create_storage_set(config)
+    snap = SnapshotManager(config, storage, mirrors=mirrors)
+
+    # Resolve `latest` against the actual snapshot list.
+    def _resolve(ref: str) -> str:
+        if ref != "latest":
+            return ref
+        listing = snap.list()
+        if not listing:
+            console.print(
+                "[red]Cannot resolve 'latest': no snapshots found on remote.[/]"
+            )
+            sys.exit(1)
+        return listing[0]["timestamp"]
+
+    try:
+        resolved_ts1 = _resolve(ts1)
+        resolved_ts2 = _resolve(ts2)
+        manifest1 = snap.get_snapshot_manifest(resolved_ts1)
+        manifest2 = snap.get_snapshot_manifest(resolved_ts2)
+    except ValueError as e:
+        console.print(f"[red]{e}[/]")
+        sys.exit(1)
+
+    if unified_path:
+        _emit_unified_diff(snap, manifest1, manifest2, unified_path)
+        return
+
+    _render_snapshot_diff(
+        snap,
+        manifest1, manifest2,
+        resolved_ts1, resolved_ts2,
+        show_all=show_all,
+        path_filter=path_filter or None,
+    )
+
+
+def _classify_files(
+    manifest1: dict, manifest2: dict,
+) -> dict[str, list[str]]:
+    """Bucket every path into added/removed/modified/unchanged based on
+    the per-format identifier in the two manifest dicts."""
+    f1 = manifest1["files"]
+    f2 = manifest2["files"]
+    all_paths = sorted(set(f1) | set(f2))
+    buckets: dict[str, list[str]] = {
+        "added": [], "removed": [], "modified": [], "unchanged": [],
+    }
+    for p in all_paths:
+        in1, in2 = p in f1, p in f2
+        if in1 and not in2:
+            buckets["removed"].append(p)
+        elif in2 and not in1:
+            buckets["added"].append(p)
+        elif f1[p] == f2[p]:
+            # blobs: same hash. full: same file_id (rare — only after a
+            # no-op snapshot). Treat as unchanged.
+            buckets["unchanged"].append(p)
+        else:
+            buckets["modified"].append(p)
+    return buckets
+
+
+def _line_diff_counts(
+    snap: SnapshotManager,
+    manifest1: dict, manifest2: dict, path: str,
+) -> tuple[Optional[int], Optional[int], bool]:
+    """For a `modified` file, fetch both blob bodies and return
+    `(plus_count, minus_count, is_binary)`. Returns `(None, None, True)`
+    if either body fails UTF-8 decode."""
+    import difflib
+
+    ident1 = manifest1["files"][path]
+    ident2 = manifest2["files"][path]
+    try:
+        body1 = snap.get_blob_content(
+            ident1,
+            backend=manifest1.get("_backend"),
+            format_hint=manifest1["format"],
+        )
+        body2 = snap.get_blob_content(
+            ident2,
+            backend=manifest2.get("_backend"),
+            format_hint=manifest2["format"],
+        )
+    except Exception:
+        return None, None, True
+
+    try:
+        text1 = body1.decode("utf-8").splitlines()
+        text2 = body2.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        return None, None, True
+
+    plus = minus = 0
+    for line in difflib.unified_diff(text1, text2, lineterm=""):
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            plus += 1
+        elif line.startswith("-"):
+            minus += 1
+    return plus, minus, False
+
+
+def _render_snapshot_diff(
+    snap: SnapshotManager,
+    manifest1: dict, manifest2: dict,
+    ts1: str, ts2: str,
+    show_all: bool,
+    path_filter: Optional[str],
+) -> None:
+    """Print the Path / Status / Changes table for `snapshot-diff`."""
+    import fnmatch as _fnmatch
+
+    buckets = _classify_files(manifest1, manifest2)
+
+    def _filter(paths: list[str]) -> list[str]:
+        if not path_filter:
+            return paths
+        return [p for p in paths if _fnmatch.fnmatch(p, path_filter)]
+
+    added = _filter(buckets["added"])
+    removed = _filter(buckets["removed"])
+    modified = _filter(buckets["modified"])
+    unchanged = _filter(buckets["unchanged"]) if show_all else []
+
+    if not (added or removed or modified or unchanged):
+        if path_filter:
+            console.print(
+                f"[yellow]No files differ between {ts1} and {ts2} "
+                f"matching {path_filter!r}.[/]"
+            )
+        else:
+            console.print(
+                f"[green]Snapshots {ts1} and {ts2} are identical[/] "
+                f"(every file's content hash matches)."
+            )
+        return
+
+    table = Table(
+        show_header=True, header_style="bold",
+        title=f"snapshot-diff   {ts1}  →  {ts2}",
+    )
+    table.add_column("Path")
+    table.add_column("Status")
+    table.add_column("Changes")
+
+    for p in added:
+        table.add_row(p, "[green]added[/]", "[dim]—[/]")
+    for p in removed:
+        table.add_row(p, "[red]removed[/]", "[dim]—[/]")
+    for p in modified:
+        plus, minus, is_binary = _line_diff_counts(
+            snap, manifest1, manifest2, p,
+        )
+        if is_binary:
+            changes_cell = "[dim]binary[/]"
+        else:
+            changes_cell = f"[green]+{plus}[/] [red]-{minus}[/]"
+        table.add_row(p, "[yellow]modified[/]", changes_cell)
+    for p in unchanged:
+        table.add_row(p, "[dim]unchanged[/]", "[dim]—[/]")
+
+    console.print(table)
+    summary_parts = []
+    if added:
+        summary_parts.append(f"[green]{len(added)} added[/]")
+    if removed:
+        summary_parts.append(f"[red]{len(removed)} removed[/]")
+    if modified:
+        summary_parts.append(f"[yellow]{len(modified)} modified[/]")
+    if unchanged:
+        summary_parts.append(f"[dim]{len(unchanged)} unchanged[/]")
+    console.print("Summary: " + ", ".join(summary_parts))
+
+
+def _emit_unified_diff(
+    snap: SnapshotManager,
+    manifest1: dict, manifest2: dict,
+    path: str,
+) -> None:
+    """Print a standard `diff -u`-format unified diff for ONE file
+    between two snapshots. Composes with shell tools — exits 1 if the
+    file is not present in either snapshot or one body is binary."""
+    import difflib
+
+    f1 = manifest1["files"]
+    f2 = manifest2["files"]
+    in1, in2 = path in f1, path in f2
+    if not in1 and not in2:
+        console.print(
+            f"[red]{path}: not present in either snapshot {manifest1['timestamp']} "
+            f"or {manifest2['timestamp']}.[/]"
+        )
+        sys.exit(1)
+
+    def _fetch(manifest: dict) -> bytes:
+        if path not in manifest["files"]:
+            return b""
+        return snap.get_blob_content(
+            manifest["files"][path],
+            backend=manifest.get("_backend"),
+            format_hint=manifest["format"],
+        )
+
+    try:
+        body1 = _fetch(manifest1)
+        body2 = _fetch(manifest2)
+    except Exception as e:
+        console.print(f"[red]Could not fetch {path}: {e}[/]")
+        sys.exit(1)
+
+    try:
+        text1 = body1.decode("utf-8").splitlines(keepends=True)
+        text2 = body2.decode("utf-8").splitlines(keepends=True)
+    except UnicodeDecodeError:
+        console.print(
+            f"[red]{path}: content is not UTF-8 text in one or both "
+            f"snapshots; cannot produce a unified diff.[/]"
+        )
+        sys.exit(1)
+
+    diff = difflib.unified_diff(
+        text1, text2,
+        fromfile=f"{path}@{manifest1['timestamp']}",
+        tofile=f"{path}@{manifest2['timestamp']}",
+        lineterm="",
+    )
+    # Use click.echo (NOT console.print) so we emit plain text to stdout
+    # without Rich markup interpretation — composes with `less`, `delta`,
+    # redirection, etc.
+    for line in diff:
+        click.echo(line)
 
 
 @cli.command()

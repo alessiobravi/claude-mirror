@@ -40,7 +40,7 @@ claude-mirror inspect           TIMESTAMP [--paths GLOB] [--config PATH]
 claude-mirror history           PATH [--since DATE/DURATION] [--until DATE/DURATION] [--config PATH]
 claude-mirror snapshot-diff     TS1 TS2 [--all] [--paths GLOB] [--unified PATH] [--config PATH]
 claude-mirror retry             [--backend NAME] [--dry-run] [--config PATH]
-claude-mirror seed-mirror       --backend NAME [--dry-run] [--config PATH]   # populate a freshly-added mirror with files already on the primary
+claude-mirror seed-mirror       [--backend NAME] [--dry-run] [--config PATH]   # populate a freshly-added mirror with files already on the primary; auto-detects when exactly one mirror is unseeded
 claude-mirror restore           TIMESTAMP [PATH ...] [--backend NAME] [--output PATH] [--dry-run/--no-dry-run] [--config PATH]
 claude-mirror forget            TIMESTAMP... | --before DATE/DURATION | --keep-last N | --keep-days N
                               [--delete] [--yes] [--config PATH]   # dry-run by default; --delete to actually delete
@@ -422,6 +422,8 @@ Re-attempt mirrors stuck in `pending_retry`. Pass `--backend NAME` to retry one 
 ### `seed-mirror`
 
 Populate a newly-added mirror with files that already exist on the primary. Walks the manifest, finds every file with no recorded state on `--backend NAME`, and uploads each one to that mirror only — the primary is never touched. Idempotent. Drift-safe: files whose local content has diverged from the manifest are skipped with a warning. Use `--dry-run` to preview.
+
+`--backend` is optional: when omitted, seed-mirror auto-detects the candidate when exactly one configured mirror has unseeded files. If zero mirrors are unseeded it exits cleanly with "Nothing to seed"; if more than one is unseeded it prints the candidate names and asks you to specify `--backend NAME` explicitly.
 
 See [README — Multi-backend mirroring (Tier 2)](../README.md#multi-backend-mirroring-tier-2) for the full Tier 2 walkthrough.
 

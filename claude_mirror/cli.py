@@ -3912,9 +3912,11 @@ def retry(backend_filter: str, dry_run: bool, config_path: str) -> None:
 
 
 @cli.command("seed-mirror")
-@click.option("--backend", "backend_name", required=True,
+@click.option("--backend", "backend_name", default="",
               help="Mirror backend to seed (e.g. 'sftp'). Must match a "
-                   "configured mirror's `backend` field. Required.")
+                   "configured mirror's `backend` field. Optional: when "
+                   "omitted, seed-mirror auto-detects the candidate if "
+                   "exactly one configured mirror has unseeded files.")
 @click.option("--dry-run", is_flag=True, default=False,
               help="List which files would be seeded without uploading anything.")
 @click.option("--config", "config_path", default="",
@@ -3933,6 +3935,7 @@ def seed_mirror(backend_name: str, dry_run: bool, config_path: str) -> None:
 
     \b
     Examples:
+      claude-mirror seed-mirror                           # auto-detect when only one mirror is unseeded
       claude-mirror seed-mirror --backend sftp
       claude-mirror seed-mirror --backend sftp --dry-run
       claude-mirror seed-mirror --backend dropbox --config ~/.config/claude_mirror/work.yaml
@@ -3956,6 +3959,34 @@ def seed_mirror(backend_name: str, dry_run: bool, config_path: str) -> None:
             "project YAML."
         )
         sys.exit(1)
+    # Auto-detect the target backend when --backend is not supplied: if
+    # exactly one configured mirror has unseeded files, infer it; zero
+    # → clean exit; multiple → ask the user to disambiguate.
+    if not backend_name:
+        candidates = []
+        for mirror in engine._mirrors:
+            name = (getattr(mirror, "backend_name", "") or "")
+            if not name:
+                continue
+            if engine.manifest.unseeded_for_backend(name):
+                candidates.append(name)
+        if not candidates:
+            console.print(
+                "[green]✓ No mirrors have unseeded files. Nothing to seed.[/]"
+            )
+            return
+        if len(candidates) > 1:
+            names_sorted = sorted(candidates)
+            quoted = ", ".join(f"`{n}`" for n in names_sorted)
+            console.print(
+                f"[red]Multiple mirrors have unseeded files: {quoted}. "
+                "Specify `--backend NAME` to choose.[/]"
+            )
+            sys.exit(1)
+        backend_name = candidates[0]
+        console.print(
+            f"[dim]Auto-detected unseeded mirror: `{backend_name}`[/]"
+        )
     try:
         summary = engine.seed_mirror(
             backend_name=backend_name,

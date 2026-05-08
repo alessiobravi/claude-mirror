@@ -474,7 +474,7 @@ claude-mirror update --apply --yes   # skip the confirmation prompt
 | Opt out (per-shell) | (off) | `export CLAUDE_MIRROR_NO_UPDATE_CHECK=1` |
 | Opt out (permanent) | (off) | Add the export to your `.zshrc` / `.bashrc` |
 
-The check fetches `https://raw.githubusercontent.com/alessiobravi/claude-mirror/main/pyproject.toml`. Only the `version` line is parsed. The HTTP request includes a `User-Agent: claude-mirror/<version> update-check` header — no telemetry data is sent.
+The check looks at PyPI first (`https://pypi.org/pypi/claude-mirror/json`, the most authoritative source for installability — a release isn't real until the wheel is on PyPI), falls back to the GitHub Contents API (`https://api.github.com/repos/alessiobravi/claude-mirror/contents/pyproject.toml`) when PyPI is unreachable, and finally to the raw CDN (`https://raw.githubusercontent.com/alessiobravi/claude-mirror/main/pyproject.toml`) when both are unavailable. Each fallback only runs if the prior fails. Every request includes a `User-Agent: claude-mirror/<version> update-check` header — no telemetry data is sent.
 
 ---
 

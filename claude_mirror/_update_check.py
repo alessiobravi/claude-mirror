@@ -37,20 +37,29 @@ from typing import Optional
 _CACHE_FILE = Path.home() / ".config" / "claude_mirror" / ".update_check.json"
 # How often the background thread re-fetches the upstream version.
 _CHECK_INTERVAL_HOURS = 24
-# Primary: GitHub API. Authoritative — the API hits the canonical Git
-# blob store directly, bypassing the raw.githubusercontent.com CDN
-# entirely. Subject to a 60 requests/hour rate limit per unauthenticated
-# IP, which is generous for our 1/day cache TTL (and even for manual
-# check-update calls). Returns JSON with base64-encoded content.
+# Primary: PyPI JSON API. Most authoritative for the user-relevant
+# question — "is a release actually installable right now?" A GitHub
+# tag can land seconds before the wheel finishes uploading to PyPI;
+# during that gap a GitHub-sourced check would tell users to upgrade
+# to a version they cannot yet `pipx install`. Hitting PyPI directly
+# avoids that race entirely. JSON response; `info.version` holds the
+# latest stable version string.
+_PYPI_URL = "https://pypi.org/pypi/claude-mirror/json"
+# Fallback 1: GitHub Contents API. Authoritative for the source tree —
+# the API hits the canonical Git blob store directly, bypassing the
+# raw.githubusercontent.com CDN entirely. Subject to a 60 requests/hour
+# rate limit per unauthenticated IP, which is generous for our 1/day
+# cache TTL (and even for manual check-update calls). Returns JSON
+# with base64-encoded content. Used only when PyPI is unavailable.
 _API_URL = (
     "https://api.github.com/repos/alessiobravi/claude-mirror/contents/pyproject.toml"
 )
-# Fallback: raw CDN URL with cache-busting. Used only when the API is
-# unavailable (rate-limited, 5xx, network filtering of api.github.com).
-# Cache-busting via `?t=<unix_seconds>` + no-cache headers gives us the
-# best chance of getting fresh content from the CDN, but isn't as
-# authoritative as the API path — CDN edges can still serve stale
-# content for a few minutes after a push.
+# Fallback 2: raw CDN URL with cache-busting. Used only when both PyPI
+# and the GitHub API are unavailable (rate-limited, 5xx, network
+# filtering). Cache-busting via `?t=<unix_seconds>` + no-cache headers
+# gives us the best chance of getting fresh content from the CDN, but
+# isn't as authoritative as the API path — CDN edges can still serve
+# stale content for a few minutes after a push.
 _PYPROJECT_URL = (
     "https://raw.githubusercontent.com/alessiobravi/claude-mirror/main/pyproject.toml"
 )
@@ -182,6 +191,42 @@ def _save_cache(data: dict) -> None:
         pass
 
 
+def _fetch_via_pypi() -> Optional[str]:
+    """Authoritative fetch via the PyPI JSON API.
+
+    Hits pypi.org/pypi/claude-mirror/json and parses `info.version` from
+    the response. This is the primary source because PyPI is the only
+    service that knows whether a release is *actually installable* — a
+    GitHub tag can land seconds before the wheel finishes uploading,
+    and during that race a GitHub-sourced version check would tell the
+    user to `pipx upgrade` to a version PyPI doesn't yet serve.
+
+    No rate limit at the volumes claude-mirror generates (one fetch per
+    machine per day on the cache path, plus the occasional manual
+    `check-update`).
+    """
+    try:
+        req = urllib.request.Request(
+            _PYPI_URL,
+            headers={
+                "User-Agent": f"claude-mirror/{_get_current_version()} update-check",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=_FETCH_TIMEOUT_SECONDS) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        info = data.get("info") or {}
+        version_str = info.get("version")
+        if not isinstance(version_str, str):
+            return None
+        version_str = version_str.strip()
+        return version_str or None
+    except (urllib.error.URLError, OSError, ValueError, UnicodeDecodeError):
+        return None
+    except Exception:
+        return None
+
+
 def _fetch_via_api() -> Optional[str]:
     """Authoritative fetch via the GitHub API.
 
@@ -253,21 +298,44 @@ def _fetch_via_raw_with_busting() -> Optional[str]:
         return None
 
 
-def _fetch_remote_version() -> Optional[str]:
-    """Fetch the upstream version from GitHub.
+def _fetch_remote_version_with_source() -> tuple[Optional[str], Optional[str]]:
+    """Fetch the upstream version from the most authoritative source
+    available. Returns `(version, source_name)` or `(None, None)` if
+    every source failed.
 
-    Tries the authoritative API path first; falls back to the raw URL
-    with cache-busting if the API fails for any reason (rate limit,
-    network issue, etc.). Returns None on any total failure.
+    Source chain (each fallback only runs when the prior raised /
+    returned None):
+      1. PyPI JSON API — the only source that answers
+         "is this release installable right now?"
+      2. GitHub Contents API — authoritative for the source tree
+         (no CDN edge propagation lag), 60 req/h unauth limit.
+      3. raw.githubusercontent.com — universally available CDN, with
+         cache-busting query string + no-cache headers.
 
-    Sends a User-Agent identifying the running claude-mirror version so
-    the maintainer can correlate version-update lag with installed-base
-    drift via standard server logs (no telemetry sent — just the UA).
+    Each fetcher sends a User-Agent identifying the running claude-mirror
+    version so the maintainer can correlate version-update lag with
+    installed-base drift via standard server logs (no telemetry sent —
+    just the UA).
     """
-    result = _fetch_via_api()
-    if result is not None:
-        return result
-    return _fetch_via_raw_with_busting()
+    sources = (
+        ("pypi", _fetch_via_pypi),
+        ("github_api", _fetch_via_api),
+        ("raw_cdn", _fetch_via_raw_with_busting),
+    )
+    for name, fetcher in sources:
+        version_str = fetcher()
+        if version_str:
+            return version_str, name
+    return None, None
+
+
+def _fetch_remote_version() -> Optional[str]:
+    """Backwards-compatible thin wrapper: returns just the version
+    string (or None) from the layered source chain. Callers that want
+    diagnostic visibility into which source answered should use
+    `_fetch_remote_version_with_source()` directly."""
+    version_str, _source = _fetch_remote_version_with_source()
+    return version_str
 
 
 def _is_strictly_newer(remote: str, current: str) -> bool:
@@ -322,7 +390,7 @@ def _do_background_check() -> None:
         now = datetime.now(timezone.utc)
         if (now - last_dt) < timedelta(hours=_CHECK_INTERVAL_HOURS):
             return  # cache fresh
-        latest = _fetch_remote_version()
+        latest, source = _fetch_remote_version_with_source()
         if not latest:
             # Update last_checked anyway so we don't hammer GitHub when
             # offline — but keep the previously cached latest_version so
@@ -332,6 +400,10 @@ def _do_background_check() -> None:
             return
         cache["last_checked"] = now.isoformat().replace("+00:00", "Z")
         cache["latest_version"] = latest
+        # Record which source answered, for diagnostic visibility (e.g.
+        # in a future `claude-mirror check-update --verbose`).
+        if source:
+            cache["last_source"] = source
         _save_cache(cache)
     except Exception:
         # Daemon thread must never raise — would just print a noisy
@@ -429,7 +501,7 @@ def force_check_now() -> Optional[str]:
     string (or None on failure). Updates the cache."""
     if _is_disabled():
         return None
-    latest = _fetch_remote_version()
+    latest, source = _fetch_remote_version_with_source()
     if not latest:
         return None
     cache = _load_cache()
@@ -437,5 +509,7 @@ def force_check_now() -> Optional[str]:
         "+00:00", "Z"
     )
     cache["latest_version"] = latest
+    if source:
+        cache["last_source"] = source
     _save_cache(cache)
     return latest

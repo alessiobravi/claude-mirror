@@ -857,11 +857,17 @@ def _maybe_run_drive_smoke_test(
     credentials_file: str,
     token_file: str,
     drive_folder_id: str,
-) -> None:
+) -> Optional[Any]:
     """Offer to authenticate now and run a `drive.files.list` smoke test
     against `drive_folder_id` BEFORE the wizard returns and the YAML is
     written. Default Yes; on No we skip silently — the user may be
     configuring offline.
+
+    Returns the OAuth credentials object on smoke-test pass so a
+    follow-up step (e.g. `--auto-pubsub-setup`, since v0.5.47) can
+    reuse them without prompting the user for a second OAuth flow.
+    Returns None on every other path (user declined, auth raised,
+    smoke test failed and user declined retry).
 
     On smoke-test failure we print the classified reason and ask whether
     to retry the auth flow. Three failure paths:
@@ -882,7 +888,7 @@ def _maybe_run_drive_smoke_test(
         "and folder-not-shared errors)",
         default=True,
     ):
-        return
+        return None
 
     # Build a minimal in-memory Config for the backend — we reuse the
     # full GoogleDriveBackend.authenticate() so the OAuth flow, scopes,
@@ -909,7 +915,7 @@ def _maybe_run_drive_smoke_test(
                 f"[yellow]Skipping smoke test. Run `claude-mirror auth` "
                 f"after the YAML is saved to retry.[/]"
             )
-            return
+            return None
 
         result = _byo_wizard.run_drive_smoke_test(creds, drive_folder_id)
         if result.ok:
@@ -917,7 +923,7 @@ def _maybe_run_drive_smoke_test(
                 "[green]✓ Drive smoke test passed.[/] "
                 "Auth complete; folder is reachable."
             )
-            return
+            return creds
 
         console.print(
             f"\n[yellow]⚠ Drive smoke test failed.[/]\n"
@@ -933,17 +939,135 @@ def _maybe_run_drive_smoke_test(
                 "written. Fix the issue and run `claude-mirror auth` "
                 "(or push) to verify.[/]"
             )
-            return
+            return None
         # Loop: retry auth + smoke test.
 
 
-def _run_wizard(backend_default: str = "googledrive") -> dict:
+def _maybe_auto_setup_pubsub(
+    *,
+    creds: Any,
+    gcp_project_id: str,
+    pubsub_topic_id: str,
+    machine_name: str,
+) -> None:
+    """Run the v0.5.47 `--auto-pubsub-setup` step: idempotently create
+    the Pub/Sub topic + per-machine subscription + IAM grant for Drive's
+    push-notification service account, using the OAuth credentials we
+    just acquired in the smoke-test phase.
+
+    Renders a Rich-formatted summary of what changed (or was already in
+    place) so the user sees exactly which resources the wizard touched.
+    Failures are printed as yellow warnings — the wizard does NOT abort;
+    the YAML still writes, and the user can either fix the underlying
+    cause and re-run `init --auto-pubsub-setup`, or fix it via the GCP
+    console and re-run `doctor` to verify.
+    """
+    console.print("\n[bold]Pub/Sub auto-setup:[/]")
+    try:
+        result = _byo_wizard.auto_setup_pubsub(
+            creds=creds,
+            gcp_project_id=gcp_project_id,
+            pubsub_topic_id=pubsub_topic_id,
+            machine_name=machine_name,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive: never abort wizard
+        console.print(
+            f"  [yellow]⚠ Pub/Sub auto-setup raised "
+            f"({type(exc).__name__}): {exc}[/]\n"
+            f"  [yellow]Skipping. The YAML will still be written; fix "
+            f"the underlying cause and re-run "
+            f"[bold]claude-mirror init --auto-pubsub-setup[/] or "
+            f"configure the topic via the GCP console.[/]"
+        )
+        return
+
+    if result.skipped:
+        # Pub/Sub OAuth scope wasn't granted — print one yellow line
+        # and stop. The smoke test already confirmed the Drive scope
+        # works; the user just opted out of real-time notifications.
+        console.print(f"  [yellow]⚠[/] {result.reason}")
+        return
+
+    topic_path = (
+        f"projects/{gcp_project_id}/topics/{pubsub_topic_id}"
+    )
+    safe_machine = (
+        (machine_name or "").replace(".", "-").replace(" ", "-").lower()
+    )
+    subscription_id = f"{pubsub_topic_id}-{safe_machine}"
+
+    # Topic line
+    if result.topic_created:
+        console.print(
+            f"  [green]✓[/] Topic created                       "
+            f"[dim]{topic_path}[/]"
+        )
+    else:
+        console.print(
+            f"  [green]✓[/] Topic exists                        "
+            f"[dim]{topic_path}[/]"
+        )
+
+    # Subscription line
+    if result.subscription_created:
+        console.print(
+            f"  [green]✓[/] Subscription created for {machine_name}  "
+            f"[dim]{subscription_id}[/]"
+        )
+    else:
+        console.print(
+            f"  [green]✓[/] Subscription exists for {machine_name}   "
+            f"[dim]{subscription_id}[/]"
+        )
+
+    # IAM grant line
+    if result.iam_grant_added:
+        console.print(
+            f"  [green]✓[/] IAM grant added                     "
+            f"[dim]{_DRIVE_PUBSUB_PUBLISHER_SA} → "
+            f"roles/pubsub.publisher[/]"
+        )
+    else:
+        console.print(
+            f"  [green]✓[/] IAM grant already present           "
+            f"[dim]{_DRIVE_PUBSUB_PUBLISHER_SA} → "
+            f"roles/pubsub.publisher[/]"
+        )
+
+    if result.failures:
+        console.print(
+            "\n  [yellow]⚠ Pub/Sub auto-setup had partial failures:[/]"
+        )
+        for step, msg in result.failures:
+            console.print(f"    [yellow]•[/] [bold]{step}[/]: {msg}")
+        console.print(
+            "  [yellow]The YAML will still be written. Fix the "
+            "underlying cause and re-run "
+            "[bold]claude-mirror init --auto-pubsub-setup[/], or "
+            "configure the missing piece via the GCP console and "
+            "verify with [bold]claude-mirror doctor --backend "
+            "googledrive[/].[/]"
+        )
+
+
+def _run_wizard(
+    backend_default: str = "googledrive",
+    *,
+    auto_pubsub_setup: bool = False,
+) -> dict:
     """Interactive wizard that collects all init parameters. Returns a dict of values.
 
     `backend_default` is the storage backend pre-filled in the first prompt.
     The caller passes the value of the `--backend` CLI flag so that
     `claude-mirror init --wizard --backend sftp` shows `[sftp]` as the
     default rather than the unconditional `[googledrive]`.
+
+    `auto_pubsub_setup` (since v0.5.47) — when True AND the wizard's
+    smoke test passes AND the chosen backend is googledrive, the
+    wizard chains the smoke test directly into the v0.5.47 auto-setup
+    helper, creating the Pub/Sub topic, per-machine subscription, and
+    Drive's IAM grant on the topic without a second OAuth flow. Off by
+    default (additive behaviour); ignored on non-googledrive backends.
     """
     console.print("\n[bold cyan]claude-mirror setup wizard[/]\n")
     console.print("Press Enter to accept the [dim]default[/] shown in brackets.\n")
@@ -1379,11 +1503,36 @@ def _run_wizard(backend_default: str = "googledrive") -> dict:
     # project, and folder ID typos / missing share. Failure here does
     # NOT block the YAML write — the user might be configuring offline,
     # or behind an eventual-consistency provider. We just print a warning.
+    smoke_creds: Optional[Any] = None
     if backend == "googledrive":
-        _maybe_run_drive_smoke_test(
+        smoke_creds = _maybe_run_drive_smoke_test(
             credentials_file=credentials_file,
             token_file=token_file,
             drive_folder_id=drive_folder_id,
+        )
+
+    # ── Auto-create Pub/Sub topic + subscription + IAM grant (v0.5.47) ──
+    # Only runs when the user passed `--auto-pubsub-setup` AND the
+    # smoke test returned a working OAuth credential bundle AND the
+    # YAML actually configures Pub/Sub (gcp_project_id + topic ID set).
+    # Idempotent — safe to re-run on every `init`. Failures don't abort
+    # the wizard; the YAML still writes.
+    if (
+        auto_pubsub_setup
+        and backend == "googledrive"
+        and smoke_creds is not None
+        and gcp_project_id
+        and pubsub_topic_id
+    ):
+        _maybe_auto_setup_pubsub(
+            creds=smoke_creds,
+            gcp_project_id=gcp_project_id,
+            pubsub_topic_id=pubsub_topic_id,
+            machine_name=Config(
+                project_path=project_path,
+                backend="googledrive",
+                file_patterns=["**/*.md"],
+            ).machine_name,
         )
 
     return dict(
@@ -1473,6 +1622,13 @@ def _run_wizard(backend_default: str = "googledrive") -> dict:
               help="Path to write the config file. Defaults to ~/.config/claude_mirror/<project>.yaml.")
 @click.option("--wizard", is_flag=True, default=False,
               help="Launch interactive setup wizard instead of specifying flags.")
+@click.option("--auto-pubsub-setup", "auto_pubsub_setup", is_flag=True, default=False,
+              help="After Drive OAuth completes, automatically create the "
+                   "Pub/Sub topic, per-machine subscription, and IAM grant "
+                   "(apps-storage-noreply@google.com -> roles/pubsub.publisher) "
+                   "on the topic. Requires the Pub/Sub OAuth scope to have "
+                   "been granted at auth time. Skipped silently if scope was "
+                   "not granted, or on a non-googledrive backend.")
 def init(
     project: str,
     backend_opt: str,
@@ -1506,6 +1662,7 @@ def init(
     token_file: str,
     config_path: str,
     wizard: bool,
+    auto_pubsub_setup: bool,
 ) -> None:
     """Initialize claude-mirror for a project.
 
@@ -1517,7 +1674,10 @@ def init(
     backend = backend_opt
 
     if wizard:
-        values = _run_wizard(backend_default=backend_opt)
+        values = _run_wizard(
+            backend_default=backend_opt,
+            auto_pubsub_setup=auto_pubsub_setup,
+        )
         backend          = values["backend"]
         project_path     = values["project_path"]
         drive_folder_id  = values["drive_folder_id"]
@@ -1756,6 +1916,34 @@ def init(
         console.print(f"[green]SFTP host:[/]           {sftp_host}:{sftp_port}")
         console.print(f"[green]SFTP folder:[/]         {sftp_folder}")
         console.print("\nRun [bold]claude-mirror auth[/] to verify the SFTP connection.")
+
+    # ── Flag-driven (non-wizard) auto-pubsub-setup path (v0.5.47) ──
+    # The wizard branch already ran the smoke test + auto-setup above
+    # via _run_wizard. The flag-only path (no --wizard) skipped that
+    # smoke test entirely; honour --auto-pubsub-setup here by running
+    # it now. Skipped silently on non-googledrive backends so the same
+    # CLI invocation works for callers walking every backend through
+    # the same flag list. The smoke test itself runs the OAuth flow,
+    # so the user does NOT need to run `claude-mirror auth` first.
+    if (
+        auto_pubsub_setup
+        and not wizard
+        and backend == "googledrive"
+        and gcp_project_id
+        and pubsub_topic_id
+    ):
+        smoke_creds = _maybe_run_drive_smoke_test(
+            credentials_file=credentials_file,
+            token_file=token_file,
+            drive_folder_id=drive_folder_id,
+        )
+        if smoke_creds is not None:
+            _maybe_auto_setup_pubsub(
+                creds=smoke_creds,
+                gcp_project_id=gcp_project_id,
+                pubsub_topic_id=pubsub_topic_id,
+                machine_name=config.machine_name,
+            )
 
     # Auto-reload the watcher if it is running
     _try_reload_watcher()

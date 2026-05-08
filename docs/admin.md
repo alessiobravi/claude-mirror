@@ -969,6 +969,10 @@ The Pub/Sub admin SDK (`google.cloud.pubsub_v1`) is lazy-imported inside the dee
 - Token file missing — the generic Check 3 above already emitted a failure for this; doctor doesn't repeat it in the deep section.
 - Pub/Sub OAuth scope not granted — see the second row of the table above.
 
+#### Fixing a missing topic / subscription / IAM grant
+
+If `doctor` reports a missing Pub/Sub topic, missing per-machine subscription, or missing IAM grant for Drive's service account, re-run `claude-mirror init --auto-pubsub-setup --config <path>` to fix all three in one step. The auto-setup helper (added in v0.5.47, documented in [backends/google-drive.md](backends/google-drive.md#auto-create-pubsub-topic--subscription--iam-grant---auto-pubsub-setup-since-v0547)) is idempotent: anything that already exists is left in place, anything missing is created using the OAuth credentials acquired by the wizard's smoke test. Re-running `doctor` afterwards should now report all six checks green.
+
 ### Sample successful output
 
 ```

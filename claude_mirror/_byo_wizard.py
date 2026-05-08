@@ -30,8 +30,9 @@ from __future__ import annotations
 import json as _json
 import re
 import webbrowser
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import click
 
@@ -366,3 +367,311 @@ def _classify_smoke_failure(exc: BaseException, folder_id: str) -> str:
     # Network / transport / unknown — return the exception text so the
     # user can see what went wrong and decide whether to retry.
     return f"Smoke test failed: {text}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Auto-create Pub/Sub topic + subscription + IAM grant (since v0.5.47)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Once the user has authenticated and granted both Drive AND Pub/Sub OAuth
+# scopes, claude-mirror has the credentials to create Pub/Sub resources
+# itself. The three steps are:
+#
+#   1. Create the topic at projects/{gcp_project_id}/topics/{pubsub_topic_id}
+#   2. Create a per-machine subscription at the canonical
+#      `{topic}-{machine_safe}` name pattern (lifted from
+#      `Config.subscription_id`).
+#   3. Grant `roles/pubsub.publisher` to Drive's push-notification
+#      service account on the topic. THIS is the killer detail — about
+#      70% of self-serve Drive setups silently miss this grant. The
+#      service-account constant lives in `cli.py` as
+#      `_DRIVE_PUBSUB_PUBLISHER_SA` and is imported here lazily so this
+#      module stays import-light at the top of the file.
+#
+# All three steps are idempotent: AlreadyExists / a binding that's
+# already in the policy is treated as success-already-converged. The
+# function returns a structured `AutoSetupResult` so the wizard can emit
+# a nicely-formatted Rich table without re-running the inspections.
+#
+# `pubsub_v1` is lazy-imported INSIDE the function so callers who never
+# pass `--auto-pubsub-setup` pay no extra import cost.
+
+
+# Pub/Sub OAuth scope identifier — duplicated from cli.py to keep this
+# module import-light. The string is part of Google's stable public
+# OAuth surface; it doesn't change.
+_PUBSUB_OAUTH_SCOPE = "https://www.googleapis.com/auth/pubsub"
+
+
+@dataclass
+class AutoSetupResult:
+    """Structured result of `auto_setup_pubsub`.
+
+    Field semantics (load-bearing for the wizard's output formatter):
+
+      * skipped       — True iff we declined to run any Pub/Sub admin
+                        calls (e.g. the Pub/Sub OAuth scope was not
+                        granted at auth time). When True, `reason` is
+                        the user-facing yellow info line.
+      * topic_created — True iff `create_topic` returned a fresh topic
+                        on this run. False means the topic already
+                        existed (AlreadyExists swallowed) — DO NOT
+                        report it as "created" in that case.
+      * subscription_created — same semantics for the per-machine
+                        subscription.
+      * iam_grant_added — True iff this run actually appended the
+                        `roles/pubsub.publisher` binding for Drive's
+                        service account to the topic policy. False
+                        means the binding was already present.
+      * failures      — list of `(step_name, error_message)` tuples for
+                        any step that raised. The wizard prints these
+                        as yellow warnings BUT does not abort — the
+                        YAML still writes; the user can fix the
+                        underlying cause and re-run later.
+    """
+
+    skipped: bool = False
+    reason: str = ""
+    topic_created: bool = False
+    subscription_created: bool = False
+    iam_grant_added: bool = False
+    failures: list[tuple[str, str]] = field(default_factory=list)
+
+
+def auto_setup_pubsub(
+    creds: Any,
+    gcp_project_id: str,
+    pubsub_topic_id: str,
+    machine_name: str,
+) -> AutoSetupResult:
+    """Idempotently create the Pub/Sub topic + per-machine subscription
+    + IAM grant for Drive's service account.
+
+    Parameters mirror the values the wizard already has in scope:
+      * `creds`            — OAuth credentials returned by the Drive
+                             backend's `authenticate()` call. Must have
+                             the Pub/Sub scope; if missing, the function
+                             returns `skipped=True` without making any
+                             RPC.
+      * `gcp_project_id`   — GCP project that owns the topic.
+      * `pubsub_topic_id`  — Topic short ID (NOT the full path).
+      * `machine_name`     — Used to build the subscription suffix via
+                             the same dot/space → dash transform as
+                             `Config.subscription_id`. Each machine
+                             gets its own subscription so notifications
+                             fan out independently per-host.
+
+    Returns an `AutoSetupResult`; the caller is responsible for
+    rendering it (the wizard prints a Rich table; tests inspect the
+    fields directly).
+    """
+    result = AutoSetupResult()
+
+    # ── Step 0: Verify the Pub/Sub OAuth scope was granted at auth time
+    # The smoke test we just ran needed only the Drive scope; Pub/Sub
+    # admin calls (create_topic / set_iam_policy) require the dedicated
+    # Pub/Sub scope. A user who skipped that scope at the consent screen
+    # sees ONE friendly skip-line here rather than a cascade of opaque
+    # PermissionDenied / Unauthenticated errors deeper in the SDK.
+    granted_scopes = list(getattr(creds, "scopes", None) or [])
+    if _PUBSUB_OAUTH_SCOPE not in granted_scopes:
+        result.skipped = True
+        result.reason = (
+            "Pub/Sub scope not granted; re-run claude-mirror auth with "
+            "the Pub/Sub scope to enable auto-setup."
+        )
+        return result
+
+    # ── Lazy-import the Pub/Sub admin SDK + the constants we need
+    # Cost is paid only on the auto-setup path. The publisher service
+    # account name is imported from cli.py to avoid duplication; if cli
+    # is partially imported (e.g. very early in startup) we fall back
+    # to the literal string so the wizard still works.
+    from google.cloud import pubsub_v1  # noqa: PLC0415
+    from google.api_core import exceptions as gax_exceptions  # noqa: PLC0415
+
+    try:
+        from claude_mirror.cli import _DRIVE_PUBSUB_PUBLISHER_SA  # noqa: PLC0415
+    except ImportError:  # pragma: no cover — defensive only
+        _DRIVE_PUBSUB_PUBLISHER_SA = "apps-storage-noreply@google.com"
+
+    publisher = pubsub_v1.PublisherClient(credentials=creds)
+    subscriber = pubsub_v1.SubscriberClient(credentials=creds)
+
+    topic_path = f"projects/{gcp_project_id}/topics/{pubsub_topic_id}"
+
+    # Subscription ID derivation MUST match `Config.subscription_id`
+    # exactly so `doctor` and the watcher both find the subscription
+    # this function created. The pattern is `{topic_id}-{machine_safe}`
+    # where machine_safe = machine_name.replace(".", "-").replace(" ", "-").lower().
+    safe_machine = (
+        (machine_name or "").replace(".", "-").replace(" ", "-").lower()
+    )
+    subscription_id = f"{pubsub_topic_id}-{safe_machine}"
+    subscription_path = (
+        f"projects/{gcp_project_id}/subscriptions/{subscription_id}"
+    )
+
+    # ── Step 1: Create the topic (idempotent)
+    topic_create_failed = False
+    try:
+        publisher.create_topic(name=topic_path)
+        result.topic_created = True
+    except gax_exceptions.AlreadyExists:
+        # Pre-existing topic — converged state, not an error.
+        result.topic_created = False
+    except gax_exceptions.PermissionDenied as exc:
+        topic_create_failed = True
+        result.failures.append((
+            "create_topic",
+            f"Permission denied creating topic in project "
+            f"{gcp_project_id}: {exc}",
+        ))
+    except gax_exceptions.GoogleAPICallError as exc:  # broader API errors
+        topic_create_failed = True
+        result.failures.append(("create_topic", str(exc)))
+
+    # ── Step 2: Create the per-machine subscription (idempotent)
+    # If the topic step failed outright, attempting the subscription
+    # would just produce a confusing "topic does not exist" error on
+    # top of the already-reported permission failure. Skip in that
+    # case to keep the failure list focused on root causes.
+    if not topic_create_failed:
+        try:
+            subscriber.create_subscription(
+                name=subscription_path,
+                topic=topic_path,
+            )
+            result.subscription_created = True
+        except gax_exceptions.AlreadyExists:
+            result.subscription_created = False
+        except gax_exceptions.PermissionDenied as exc:
+            result.failures.append((
+                "create_subscription",
+                f"Permission denied creating subscription "
+                f"{subscription_id}: {exc}",
+            ))
+        except gax_exceptions.GoogleAPICallError as exc:
+            result.failures.append(("create_subscription", str(exc)))
+
+    # ── Step 3: IAM grant for Drive's service account on the topic
+    # Read-modify-write on the topic IAM policy. Idempotent: if the
+    # binding already includes our service account, leave the policy
+    # alone (don't even call set_iam_policy — pointless RPC + risk of
+    # etag conflict). On etag-conflict (the proto's `Aborted` exception)
+    # retry ONCE with a fresh read; second failure surfaces as a clean
+    # error in `result.failures` rather than a stack trace.
+    if not topic_create_failed:
+        expected_member = f"serviceAccount:{_DRIVE_PUBSUB_PUBLISHER_SA}"
+        attempted = 0
+        max_attempts = 2
+        last_exc: Optional[BaseException] = None
+        while attempted < max_attempts:
+            attempted += 1
+            try:
+                policy = publisher.get_iam_policy(
+                    request={"resource": topic_path}
+                )
+                if _binding_already_present(policy, expected_member):
+                    # Converged state — no write needed.
+                    result.iam_grant_added = False
+                    last_exc = None
+                    break
+                _append_publisher_binding(policy, expected_member)
+                publisher.set_iam_policy(
+                    request={"resource": topic_path, "policy": policy}
+                )
+                result.iam_grant_added = True
+                last_exc = None
+                break
+            except gax_exceptions.Aborted as exc:
+                # etag mismatch — someone (us, on a parallel machine?)
+                # mutated the policy between our get and set. Retry
+                # once with a fresh read.
+                last_exc = exc
+                continue
+            except gax_exceptions.PermissionDenied as exc:
+                last_exc = exc
+                result.failures.append((
+                    "iam_grant",
+                    f"Permission denied updating topic IAM policy: "
+                    f"{exc}",
+                ))
+                last_exc = None  # already recorded
+                break
+            except gax_exceptions.GoogleAPICallError as exc:
+                last_exc = exc
+                result.failures.append(("iam_grant", str(exc)))
+                last_exc = None  # already recorded
+                break
+        if last_exc is not None:
+            # Exhausted retries on Aborted — surface it cleanly.
+            result.failures.append((
+                "iam_grant",
+                f"Topic IAM policy update kept conflicting after "
+                f"{max_attempts} attempts: {last_exc}",
+            ))
+
+    return result
+
+
+def _binding_already_present(policy: Any, expected_member: str) -> bool:
+    """Return True iff `policy` already contains a `roles/pubsub.publisher`
+    binding whose `members` list includes `expected_member`. The proto's
+    `bindings` field is repeated; each binding has `role` and `members`
+    attributes."""
+    for binding in getattr(policy, "bindings", []) or []:
+        role = getattr(binding, "role", "")
+        if role != "roles/pubsub.publisher":
+            continue
+        members = list(getattr(binding, "members", []) or [])
+        if expected_member in members:
+            return True
+    return False
+
+
+def _append_publisher_binding(policy: Any, expected_member: str) -> None:
+    """Mutate `policy` in place: ensure a `roles/pubsub.publisher`
+    binding exists and includes `expected_member`. If a binding for
+    that role already exists (without our member), append the member
+    to its `members` list. Otherwise, append a new binding object.
+
+    The Pub/Sub IAM proto's `Policy.bindings` is a repeated message
+    field — both list-style append (`policy.bindings.append(...)`) and
+    raw `Binding(role=..., members=[...])` construction work. We use
+    the SDK's `Binding` class when available so the appended object
+    matches the proto schema exactly.
+    """
+    # Try to extend an existing binding for the same role first — that
+    # keeps the policy compact and avoids a duplicate-role binding.
+    for binding in getattr(policy, "bindings", []) or []:
+        if getattr(binding, "role", "") == "roles/pubsub.publisher":
+            members = getattr(binding, "members", None)
+            if members is None:
+                # Some proto shapes use a tuple/list — assign fresh.
+                binding.members = [expected_member]
+            elif expected_member not in list(members):
+                # `members` is a RepeatedField — supports `.append`.
+                try:
+                    members.append(expected_member)
+                except AttributeError:  # pragma: no cover — list shape
+                    binding.members = list(members) + [expected_member]
+            return
+
+    # No existing binding for the role — add a fresh one. Two common
+    # shapes are supported by the SDK: a `Binding` proto class and a
+    # plain dict-like. We append a dict; the SDK accepts that and
+    # converts it on serialization. Tests can inject a list bindings
+    # field and assert the appended dict.
+    new_binding = {
+        "role": "roles/pubsub.publisher",
+        "members": [expected_member],
+    }
+    bindings = getattr(policy, "bindings", None)
+    if bindings is None:
+        policy.bindings = [new_binding]
+    else:
+        try:
+            bindings.append(new_binding)
+        except AttributeError:  # pragma: no cover — read-only shape
+            policy.bindings = list(bindings) + [new_binding]

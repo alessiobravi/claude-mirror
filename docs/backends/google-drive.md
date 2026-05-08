@@ -123,6 +123,41 @@ keep_yearly:  5      # plus one snapshot per year for the last 5 years
 
 If you prefer to script the wizard or are configuring offline, all three behaviours are skippable: decline the auto-open prompt, decline the smoke-test prompt, and the wizard collapses back to the pre-v0.5.46 question-only flow.
 
+### Auto-create Pub/Sub topic + subscription + IAM grant (`--auto-pubsub-setup`, since v0.5.47)
+
+Pass `--auto-pubsub-setup` on `claude-mirror init` and the wizard will, after the smoke test passes, idempotently create three Pub/Sub resources using the OAuth credentials you just acquired:
+
+1. The Pub/Sub **topic** at `projects/<gcp_project_id>/topics/<pubsub_topic_id>`.
+2. A **per-machine subscription** named `<pubsub_topic_id>-<machine_safe>` (the canonical pattern from `Config.subscription_id` — `machine_safe` lower-cases the hostname and rewrites dots and spaces to dashes).
+3. The **IAM grant** that lets Drive's push-notification service account (`apps-storage-noreply@google.com`) publish change events to your topic — `roles/pubsub.publisher`. This is the highest-value piece of the flag: about 70% of self-serve Drive setups silently miss this grant, see Pub/Sub appearing to work locally, and never receive notifications from collaborators.
+
+Most users want this flag. It eliminates the entire "why aren't notifications arriving" failure mode without requiring the user to click through the GCP console for the IAM binding.
+
+Sample output on a fresh project:
+
+```
+Pub/Sub auto-setup:
+  ✓ Topic created                       projects/myproject-prod/topics/claude-mirror-myproject
+  ✓ Subscription created for laptop     claude-mirror-myproject-laptop
+  ✓ IAM grant added                     apps-storage-noreply@google.com -> roles/pubsub.publisher
+```
+
+Sample output when re-running on the same machine (idempotent — every step short-circuits cleanly):
+
+```
+Pub/Sub auto-setup:
+  ✓ Topic exists                        projects/myproject-prod/topics/claude-mirror-myproject
+  ✓ Subscription exists for laptop      claude-mirror-myproject-laptop
+  ✓ IAM grant already present           apps-storage-noreply@google.com -> roles/pubsub.publisher
+```
+
+Requirements and edge cases:
+
+- **The Pub/Sub OAuth scope must have been granted** at auth time (the Google sign-in screen lists Drive AND Pub/Sub — leave both checked). If the scope is missing, the helper prints one yellow info line (`Pub/Sub scope not granted; re-run claude-mirror auth with the Pub/Sub scope to enable auto-setup.`) and skips. The YAML still writes; the user can re-run `claude-mirror auth` to add the scope and then `claude-mirror init --auto-pubsub-setup --config <path>` to land the resources.
+- **Failures don't abort the wizard.** If the OAuth credentials lack `pubsub.topics.create` (the user is on a GCP project they don't own), each step records its own line in `result.failures`; the wizard prints those as yellow warnings, but the YAML still writes. The user can either fix the underlying cause and re-run, or finish the missing step in the GCP console and verify with `claude-mirror doctor --backend googledrive`.
+- **Silent on non-Drive backends.** Passing `--auto-pubsub-setup` on `--backend dropbox` (or any other) is a no-op — `init` walks every backend through the same flag list and the flag only takes effect on Drive.
+- **Off by default.** Existing scripts and CI invocations that don't pass the flag see the v0.5.46 behaviour unchanged.
+
 ## Daily ops notes
 
 - **Push notifications** — Cloud Pub/Sub streaming pull (persistent gRPC connection). Typical end-to-end latency from a collaborator's `push` to your `watch` notification is sub-second.

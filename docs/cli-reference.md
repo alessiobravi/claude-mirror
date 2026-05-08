@@ -23,6 +23,7 @@ claude-mirror init        [--wizard]
                         [--poll-interval SECS]
                         [--slack/--no-slack] [--slack-webhook-url URL] [--slack-channel CHAN]
                         [--token-file PATH] [--patterns GLOB ...] [--exclude GLOB ...] [--config PATH]
+                        [--auto-pubsub-setup]      # googledrive only: auto-create Pub/Sub topic + per-machine subscription + IAM grant after auth
 claude-mirror auth        [--check] [--config PATH]
 claude-mirror status      [--short] [--config PATH]
 claude-mirror status --pending                  [--config PATH]
@@ -291,6 +292,8 @@ claude-mirror inbox --json | jq -r '.result.events[] | "[\(.timestamp)] \(.user)
 ### `init`
 
 Create a new project config in `~/.config/claude_mirror/<project>.yaml`. Pass `--wizard` for an interactive walkthrough that prompts for the backend and its required fields, or pass `--backend NAME` plus the backend-specific flags for a non-interactive setup. Auto-derives the token file path from the credentials file (Google Drive) or project name (other backends).
+
+`--auto-pubsub-setup` (Drive only, since v0.5.47): after the post-auth smoke test passes, idempotently create the Pub/Sub topic, the per-machine subscription, and the IAM grant for Drive's push-notification service account (`apps-storage-noreply@google.com` -> `roles/pubsub.publisher`) on the topic. Skipped silently if the Pub/Sub OAuth scope wasn't granted at auth time, and on every non-googledrive backend. See [backends/google-drive.md](backends/google-drive.md#auto-create-pubsub-topic--subscription--iam-grant---auto-pubsub-setup-since-v0547) for sample output and edge cases.
 
 See [README — Step 1: Initialize](../README.md#step-1-initialize) for the wizard transcripts and the full flag table, and the per-backend pages for what each backend needs:
 - [backends/google-drive.md](backends/google-drive.md)

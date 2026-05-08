@@ -578,6 +578,143 @@ Use Tier 2 (`mirror_config_paths`) for any real mirroring use case. Reach for th
 
 ---
 
+## Doctor
+
+`claude-mirror doctor` is the end-to-end self-test for a project's configuration. It runs every common check that could explain a failed `push`, `pull`, `sync`, or `auth`, and reports each result with a concrete fix command pointing at the right next action — `claude-mirror auth --config ...`, `chmod 600 KEY`, "verify the folder ID in the provider's web UI", and so on. With Tier 2 mirroring configured, every mirror in `mirror_config_paths` gets the same check sequence applied automatically, so one `doctor` invocation diagnoses the whole multi-backend setup.
+
+### Check matrix
+
+The implementation runs the following checks in order. Every per-backend check repeats for each entry in `mirror_config_paths`. The `--backend NAME` flag filters the per-backend loop to one backend; the primary-config parse (Check 1) always runs.
+
+#### Configuration
+
+| Check | Backends | Failure looks like |
+|---|---|---|
+| Primary config file exists and parses as YAML | all | `config file not found: PATH` or `config file does not parse: PATH` — exits early; later checks are meaningless without a config |
+| Each Tier 2 mirror config in `mirror_config_paths` loads and parses | all (Tier 2 only) | `mirror config does not load: PATH` — recorded as a failure but the run continues so the primary's other checks still report |
+
+#### Credentials
+
+| Check | Backends | Failure looks like |
+|---|---|---|
+| OAuth credentials file referenced by `credentials_file` exists on disk | googledrive, dropbox, onedrive | `credentials file missing: PATH` — fix is to re-download `credentials.json` from the provider's developer console |
+| Credentials check skipped (inline in YAML) | webdav, sftp | info-only line, never a failure |
+
+#### Tokens / inline auth material
+
+| Check | Backends | Failure looks like |
+|---|---|---|
+| Token file exists, parses as JSON, and contains a `refresh_token` | googledrive, dropbox, onedrive | `token file missing` / `token file corrupt` / `token has no refresh_token` — fix is `claude-mirror auth --config PATH` (consent screen must be shown to issue a new refresh token) |
+| `webdav_username` and `webdav_password` are non-empty in the YAML | webdav | `WebDAV credentials missing in config: PATH` |
+| `sftp_host`, `sftp_username`, `sftp_folder`, plus at least one of `sftp_key_file` or `sftp_password` are set | sftp | `SFTP config incomplete (missing FIELDS): PATH` |
+
+#### Connectivity
+
+A single light read call is made against the configured root: `list_folders` for cloud backends, `sftp.stat(sftp_folder)` for SFTP. Exceptions are classified through the backend's own `classify_error` so the fix-hint matches what actually went wrong rather than dumping a raw stack trace.
+
+| Failure class | What triggers it | Fix-hint shown |
+|---|---|---|
+| AUTH | OAuth `invalid_grant`, HTTP 401, `RefreshError`, SSH auth failure | `claude-mirror auth --config PATH` to re-authenticate |
+| PERMISSION | HTTP 403, `forbidden`, server-side ACL denial | re-auth or check folder sharing in the provider's web UI; for SFTP, your account lacks access to `sftp_folder` |
+| FILE_REJECTED + 404 / "not found" | Folder ID is wrong (Drive, Dropbox, OneDrive); `sftp_folder` does not exist on the server | verify the folder in the provider's web UI and update the YAML; for SFTP, server-side `mkdir` or change `sftp_folder` |
+| TRANSIENT | `TimeoutError`, `ConnectionError`, `TransportError`, "timed out" / "connection" in the message | check internet connectivity (and any corporate proxy / VPN); for SFTP, check `ping HOST` and that the configured port is open |
+| anything else | unrecognised exception | inspect the error and re-run `auth` if it looks auth-related |
+
+#### SFTP-specific auxiliary checks
+
+These run regardless of connectivity outcome so every fixable issue is surfaced in one pass.
+
+| Check | Failure looks like |
+|---|---|
+| SSH key file is readable by the current user | `SSH key file not readable: PATH` — fix is `chmod 600 PATH` |
+| `known_hosts` file exists when `sftp_strict_host_check: true` (default) | `known_hosts file missing: PATH` — fix is `ssh USER@HOST` once to populate it, or set `sftp_strict_host_check: false` for closed-LAN setups |
+| `sftp_strict_host_check: false` advisory | yellow warning (not a failure) — host fingerprints will not be verified |
+| Plaintext password stored in YAML advisory | yellow warning (not a failure) — recommend switching to key-based auth for any internet-reachable server |
+
+#### Project path
+
+| Check | Backends | Failure looks like |
+|---|---|---|
+| `project_path` exists locally | all | `project_path does not exist: PATH` — fix is to update the YAML |
+| `project_path` is a directory (not a regular file or symlink to a non-dir) | all | `project_path is not a directory: PATH` |
+
+#### Manifest integrity
+
+The manifest auto-recovers from a corrupt file by moving it aside, which would otherwise mask the issue from the user. Doctor reads the file directly and reports parse failures.
+
+| Check | Failure looks like |
+|---|---|
+| `.claude_mirror_manifest.json` parses as JSON (if the file exists at all) | `manifest is corrupt: PATH` — fix is `rm PATH && claude-mirror sync --config PATH` |
+| Manifest absent | info-only line — first sync will create it |
+
+### Sample successful output
+
+```
+claude-mirror doctor — /home/alice/.config/claude_mirror/myproject.yaml
+
+  ✓ config file parses: /home/alice/.config/claude_mirror/myproject.yaml
+
+── checking googledrive backend (/home/alice/.config/claude_mirror/myproject.yaml)
+  ✓ credentials file exists: /home/alice/.config/claude_mirror/credentials.json
+  ✓ token file present with refresh_token: /home/alice/.config/claude_mirror/myproject-token.json
+  ✓ backend connectivity ok (list_folders on root succeeded)
+  ✓ project_path exists: /home/alice/projects/myproject
+  ✓ manifest parses: /home/alice/projects/myproject/.claude_mirror_manifest.json
+
+── checking dropbox backend (/home/alice/.config/claude_mirror/myproject-dropbox.yaml)
+  ✓ credentials file exists: /home/alice/.config/claude_mirror/dropbox-credentials.json
+  ✓ token file present with refresh_token: /home/alice/.config/claude_mirror/dropbox-myproject-token.json
+  ✓ backend connectivity ok (list_folders on root succeeded)
+  ✓ project_path exists: /home/alice/projects/myproject
+  ✓ manifest parses: /home/alice/projects/myproject/.claude_mirror_manifest.json
+
+✓ All checks passed.
+```
+
+### Sample failure output
+
+```
+claude-mirror doctor — /home/alice/.config/claude_mirror/myproject.yaml
+
+  ✓ config file parses: /home/alice/.config/claude_mirror/myproject.yaml
+
+── checking googledrive backend (/home/alice/.config/claude_mirror/myproject.yaml)
+  ✓ credentials file exists: /home/alice/.config/claude_mirror/credentials.json
+  ✗ token file has no refresh_token: /home/alice/.config/claude_mirror/myproject-token.json
+      Fix: run claude-mirror auth --config /home/alice/.config/claude_mirror/myproject.yaml (consent screen must be shown to issue a new refresh_token).
+  ✗ backend connectivity failed (RefreshError): invalid_grant: Token has been expired or revoked.
+      Fix: token revoked or refresh failed. Run claude-mirror auth --config /home/alice/.config/claude_mirror/myproject.yaml to re-authenticate.
+  ✓ project_path exists: /home/alice/projects/myproject
+  ✓ manifest parses: /home/alice/projects/myproject/.claude_mirror_manifest.json
+
+✗ 2 issue(s) found. Fix the items above and re-run claude-mirror doctor.
+```
+
+### Exit codes
+
+- `0` — every check passed.
+- `1` — at least one check failed.
+
+This composes cleanly with shell scripts and CI: `claude-mirror doctor && claude-mirror push` will only push if the configuration is healthy, and a CI job that runs `claude-mirror doctor` on each agent surfaces broken setups before they cause noisy push / sync failures downstream.
+
+### Common invocations
+
+```bash
+claude-mirror doctor                                              # auto-detect config from cwd
+claude-mirror doctor --config ~/.config/claude_mirror/work.yaml   # specific config
+claude-mirror doctor --backend dropbox                            # only check the dropbox backend (Tier 2)
+```
+
+The `--backend` filter is case-insensitive and accepts `googledrive`, `dropbox`, `onedrive`, `webdav`, or `sftp`. The primary config is always parsed; only the per-backend loop is filtered. Skipped backends print a dim `── skipped: NAME (PATH) — does not match --backend FILTER` line so the output stays self-explanatory.
+
+### Where to go next
+
+- Credentials issues (missing `credentials.json`, OAuth client setup) — see the backend setup pages: [backends/google-drive.md](backends/google-drive.md), [backends/dropbox.md](backends/dropbox.md), [backends/onedrive.md](backends/onedrive.md), [backends/webdav.md](backends/webdav.md), [backends/sftp.md](backends/sftp.md).
+- Manifest corruption or surprising sync state — see [conflict-resolution.md](conflict-resolution.md) for how the manifest interacts with the conflict-detection flow.
+- Full flag list — [cli-reference.md#doctor](cli-reference.md#doctor).
+
+---
+
 ## See also
 
 - [conflict-resolution.md](conflict-resolution.md) for resolving `sync` conflicts.

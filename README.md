@@ -520,7 +520,7 @@ For end-to-end self-test (config + creds + connectivity + backends + manifest sa
 claude-mirror doctor
 ```
 
-See [docs/admin.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md) for related operational guidance and [docs/cli-reference.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/cli-reference.md) for the full flag list.
+See [docs/admin.md#doctor](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md#doctor) for the full check matrix and output interpretation.
 
 ---
 

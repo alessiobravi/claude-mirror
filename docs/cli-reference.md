@@ -46,6 +46,7 @@ claude-mirror forget            TIMESTAMP... | --before DATE/DURATION | --keep-l
 claude-mirror prune             [--keep-last N] [--keep-daily N] [--keep-monthly N] [--keep-yearly N]
                               [--delete] [--yes] [--config PATH]   # dry-run by default; reads keep_* from config
 claude-mirror gc                [--backend NAME] [--delete] [--yes] [--config PATH]   # dry-run by default; --delete to actually delete; --backend targets a specific mirror (Tier 2)
+claude-mirror doctor            [--backend NAME] [--config PATH]   # end-to-end self-test: config + credentials + connectivity + project + manifest
 claude-mirror migrate-snapshots --to {blobs|full} [--dry-run] [--keep-source] [--no-update-config] [--config PATH]
 claude-mirror log               [--limit N] [--config PATH]
 claude-mirror inbox       [--config PATH]
@@ -203,6 +204,12 @@ See [README — Multi-backend mirroring (Tier 2)](../README.md#multi-backend-mir
 ### `gc`
 
 Delete blobs no longer referenced by any manifest (only relevant for `blobs`-format snapshots). Dry-run by default. Pass `--delete` plus a typed `YES` confirmation (or `--yes` to skip the prompt) to actually delete. Pass `--backend NAME` to gc a specific mirror's blob store (Tier 2). Refuses to run if no manifests exist on remote.
+
+### `doctor`
+
+End-to-end self-test of a project's configuration: config file parses, credentials / token files present, backend connectivity, `project_path` exists, manifest is valid. Each check repeats per backend including Tier 2 mirrors. Exits 0 on all-pass, 1 on any failure. Pass `--config PATH` to point at a specific config (auto-detected from cwd otherwise) or `--backend NAME` to limit checks to one backend (`googledrive` / `dropbox` / `onedrive` / `webdav` / `sftp`).
+
+See [admin.md#doctor](admin.md#doctor) for the full check matrix, sample output, and fix-hint interpretation.
 
 ### `find-config`
 

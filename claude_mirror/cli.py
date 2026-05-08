@@ -574,6 +574,58 @@ class _CLIGroup(click.Group):
                 )
                 sys.exit(1)
             raise
+        except (OSError, ConnectionError) as e:
+            # Catches socket.gaierror (DNS lookup failure),
+            # ConnectionRefusedError, ConnectionResetError, socket.timeout
+            # — all of these subclass OSError. The earlier
+            # `except FileNotFoundError` clause caught file-not-found
+            # cases (also OSError subclass) so by the time we get here,
+            # any OSError is genuinely a network/IO failure rather than a
+            # missing-file config issue. Convert the 100-line traceback
+            # into a clean message + fix hint.
+            import errno
+            errno_str = errno.errorcode.get(getattr(e, "errno", 0), "")
+            console.print(
+                "\n[red bold]Could not reach the storage backend.[/]\n"
+                f"[dim]Underlying error:[/] {type(e).__name__}"
+                + (f" ({errno_str})" if errno_str else "")
+                + f": {redact_error(str(e))}\n\n"
+                "[yellow]Fix:[/] check your network connectivity, then retry. "
+                "If the problem persists, run [bold]claude-mirror doctor[/] "
+                "to diagnose the configured backend."
+            )
+            sys.exit(1)
+        except Exception as e:
+            # Last-resort handler for library-specific network errors that
+            # do NOT subclass OSError. We match by type-name string so a
+            # missing vendor package doesn't break the handler at import.
+            #
+            # Known cases to catch cleanly:
+            #   * httplib2.error.ServerNotFoundError — Drive DNS-failed wrapper
+            #   * requests.exceptions.ConnectionError — Dropbox/OneDrive/WebDAV
+            #   * urllib3 connection errors
+            #   * paramiko SSH connection errors
+            type_name = type(e).__module__ + "." + type(e).__name__
+            network_indicators = (
+                "httplib2.error.ServerNotFoundError",
+                "httplib2.ServerNotFoundError",
+                "requests.exceptions.ConnectionError",
+                "urllib3.exceptions.NewConnectionError",
+                "urllib3.exceptions.MaxRetryError",
+                "paramiko.ssh_exception.NoValidConnectionsError",
+            )
+            if any(ind in type_name for ind in network_indicators):
+                console.print(
+                    "\n[red bold]Could not reach the storage backend.[/]\n"
+                    f"[dim]Underlying error:[/] {type_name}: {redact_error(str(e))}\n\n"
+                    "[yellow]Fix:[/] check your network connectivity, then retry. "
+                    "If the problem persists, run [bold]claude-mirror doctor[/] "
+                    "to diagnose the configured backend."
+                )
+                sys.exit(1)
+            # Non-network unknown exception — let Click handle it normally
+            # (exit 1, traceback only if --traceback is set).
+            raise
 
 
 @click.group(cls=_CLIGroup)

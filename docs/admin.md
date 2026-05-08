@@ -417,6 +417,14 @@ Use `claude-mirror watch-all` to watch every project in a single process. It aut
 claude-mirror watch-all
 ```
 
+For cron-driven setups that prefer a polling tick over a long-running daemon, the single-project `watch` command supports `--once`. One cron line, no service to manage:
+
+```cron
+*/5 * * * * /usr/local/bin/claude-mirror watch --once --quiet --config ~/.config/claude_mirror/myproject.yaml
+```
+
+Each `--once` run does exactly one polling cycle, dispatches any inbox events, then exits 0. A persistent watermark in `~/.config/claude_mirror/watch_once_state/` ensures successive runs only surface events that arrived since the previous tick — the very first run after install captures the current log tail and emits nothing, so a fresh cron install does not flood you with weeks of historical events. `--quiet` suppresses the startup banner so cron emails only contain real news. See `claude-mirror watch --help` for the full flag list.
+
 To watch a specific subset:
 
 ```bash
@@ -572,6 +580,49 @@ Add to `~/.claude/settings.json`:
   }
 }
 ```
+
+## `.claude_mirror_ignore` — project-tree exclusions
+
+Drop a `.claude_mirror_ignore` file at the project root for gitignore-style per-project exclusions that complement the YAML `exclude_patterns` list. The file is optional — if absent, behaviour is unchanged.
+
+```text
+# Lines beginning with `#` are comments. Blank lines are skipped.
+
+# Glob patterns (gitignore subset)
+*.log
+secret.env
+**/*.bak
+
+# Anchored at project root (leading `/`)
+/build
+/dist/
+
+# Directory-only rules (trailing `/`)
+node_modules/
+__pycache__/
+
+# Re-include with `!` (last matching rule wins)
+docs/drafts/*.md
+!docs/drafts/published.md
+```
+
+Syntax summary:
+
+- `*` matches any characters except `/`.
+- `**` matches any number of path segments (gitignore-style, matches zero or more).
+- `?` matches a single character except `/`.
+- `[abc]` is a character class; `[!abc]` negates the class (gitignore convention, rewritten internally to `[^abc]`).
+- A trailing `/` makes the rule directory-only — it matches only when the rule resolves to a parent directory of the candidate path.
+- A leading `/` anchors the rule at the project root; without it the rule matches anywhere in the tree.
+- A leading `!` is a re-include — the last matching rule wins, so a `!` rule re-includes a path that an earlier rule excluded.
+
+Precedence: rules from `.claude_mirror_ignore` apply IN ADDITION to YAML `exclude_patterns` — both layers must vote "keep" for a file to be eligible. A path excluded by either system is filtered out before hashing or upload.
+
+Reload: the file is parsed once per command invocation. Edit it, run any subsequent `claude-mirror status` / `push` / `sync` and the new rules apply. The background watcher re-reads it on its existing config-reload cadence (`SIGHUP`), so you do not need to restart `watch-all`.
+
+The `.claude_mirror_ignore` file itself is auto-excluded from sync — the rules do not propagate to other machines unless you explicitly add the file to `file_patterns` (which you almost certainly should not). This mirrors the gitignore convention.
+
+For broader selective-sync guidance — picking what to mirror in the first place — see [Scenario F in scenarios.md](scenarios.md#f-selective-sync).
 
 ## Multi-backend mirroring (Tier 2)
 

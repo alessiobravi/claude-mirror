@@ -90,5 +90,60 @@ class PubSubNotifier(NotificationBackend):
             except Exception:
                 pass
 
+    def watch_once(self, callback: Callable[[SyncEvent], None]) -> None:
+        """Run one synchronous Pub/Sub pull and dispatch the batch.
+
+        Used by `claude-mirror watch --once` for cron-driven setups.
+        Calls `subscriber.pull(...)` with `return_immediately=True`
+        and a small `max_messages` cap — each cron tick processes at
+        most that many pending messages and returns. Unprocessed
+        messages stay on the subscription for the next tick.
+
+        Unlike the polling and longpoll backends, Pub/Sub already
+        provides a per-subscription cursor server-side (acks consume
+        messages off the queue), so no separate watermark file is
+        required.
+        """
+        max_messages = 100
+        try:
+            response = self._subscriber.pull(
+                request={
+                    "subscription": self._subscription_path,
+                    "max_messages": max_messages,
+                    "return_immediately": True,
+                },
+                timeout=10,
+            )
+        except Exception:
+            # Network/auth blip — surface zero events; the next cron
+            # tick will retry. We deliberately do not raise: cron-driven
+            # operation should not turn a transient blip into a non-zero
+            # exit and an emailed failure.
+            return
+
+        ack_ids: list[str] = []
+        for received in response.received_messages:
+            try:
+                event = SyncEvent.from_json(received.message.data.decode("utf-8"))
+                if event.machine != self.config.machine_name:
+                    callback(event)
+                ack_ids.append(received.ack_id)
+            except Exception:
+                # Malformed payload — skip, do not ack, let the broker
+                # redeliver and dead-letter through its own policy.
+                continue
+
+        if ack_ids:
+            try:
+                self._subscriber.acknowledge(
+                    request={
+                        "subscription": self._subscription_path,
+                        "ack_ids": ack_ids,
+                    }
+                )
+            except Exception:
+                # Same rationale as above — swallow on cron path.
+                pass
+
     def close(self) -> None:
         self._subscriber.close()

@@ -121,7 +121,13 @@ You will be prompted to confirm each component before anything is written. To re
 claude-mirror-install --uninstall
 ```
 
-After install, `claude-mirror <TAB>` lists all commands; `claude-mirror init --backend <TAB>` shows the five valid backends. Verify desktop notifications with `claude-mirror test-notify`.
+After install, `claude-mirror <TAB>` lists all commands; `claude-mirror init --backend <TAB>` shows the five valid backends. Tab-completion is supported on zsh, bash, fish, and PowerShell — the installer auto-detects your shell from `$SHELL` (or defaults to PowerShell on Windows). To install PowerShell completion manually:
+
+```powershell
+claude-mirror completion powershell | Out-File -Encoding utf8 -Append $PROFILE.CurrentUserAllHosts
+```
+
+Verify desktop notifications with `claude-mirror test-notify`.
 
 ### Updating
 
@@ -252,10 +258,13 @@ claude-mirror pull --output DIR         # preview to DIR without touching local 
 claude-mirror diff path/to/file.md      # colourised unified diff (remote → local)
 claude-mirror sync                      # full bidirectional with conflict prompts
 claude-mirror watch                     # foreground watcher; system notification on remote pushes
+claude-mirror watch --once --quiet      # single polling cycle (cron-friendly: */5 * * * * ...)
 claude-mirror watch-all                 # watch every config in ~/.config/claude_mirror/
 claude-mirror log                       # who pushed what, when, across machines
 claude-mirror inbox                     # show + clear pending notifications
 ```
+
+Per-project gitignore-style exclusions: drop a `.claude_mirror_ignore` at the project root for `**`/`!negation`/`/anchored`/`dir/` rules that complement YAML `exclude_patterns`. Full syntax in [docs/admin.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md#claude_mirror_ignore--project-tree-exclusions).
 
 Snapshot, restore, and admin commands (`history`, `snapshots`, `restore`, `prune`, `gc`, `forget`, `doctor`, `seed-mirror`, `migrate-state`) live in [docs/cli-reference.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/cli-reference.md), with operational guidance in [docs/admin.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md).
 

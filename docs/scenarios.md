@@ -432,6 +432,10 @@ Or at any time later by editing the YAML directly. Changes take effect on the ne
 - **Don't put credentials or .env in a watched tree.** Selective sync prevents accidental upload **only** if the pattern is set correctly. Belt-and-suspenders: keep secrets outside the project tree.
 - **Composes with every other scenario.** Add patterns to a Tier 2 setup, a multi-user team, a single-machine standalone — same fields, same semantics.
 
+### `.claude_mirror_ignore` (gitignore-style alternative)
+
+For per-project exclusions that read like a `.gitignore`, drop a `.claude_mirror_ignore` file at the project root. Unlike YAML `exclude_patterns` (which uses `fnmatch`), the ignore file uses gitignore syntax — including `**` for any-depth directory matches, leading `/` for root-anchored rules, trailing `/` for directory-only rules, and `!` for re-includes. Both systems run side by side; a file is excluded if EITHER layer says so. The file itself is auto-excluded from sync, so its rules don't propagate to other machines unless you explicitly opt in. Full reference: [`docs/admin.md`](./admin.md#claude_mirror_ignore--project-tree-exclusions).
+
 ---
 
 ## G. Multi-user + multi-backend (production-realistic)

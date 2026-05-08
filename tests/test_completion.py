@@ -68,13 +68,14 @@ def test_completion_uppercase_shell_argument_normalised():
 
 
 def test_completion_invalid_shell_rejected():
-    """Unsupported shells (powershell, sh, csh, etc.) error cleanly with the choice list."""
-    result = CliRunner().invoke(cli, ["completion", "powershell"])
+    """Unsupported shells (sh, csh, ksh, etc.) error cleanly with the choice list."""
+    result = CliRunner().invoke(cli, ["completion", "csh"])
     assert result.exit_code != 0
     # Click renders the available choices in the error message
     assert "bash" in result.output
     assert "zsh" in result.output
     assert "fish" in result.output
+    assert "powershell" in result.output
 
 
 def test_completion_help_lists_shells():
@@ -82,10 +83,11 @@ def test_completion_help_lists_shells():
     result = CliRunner().invoke(cli, ["completion", "--help"])
     assert result.exit_code == 0
     out = result.output
-    # The docstring documents zsh / bash / fish setup
+    # The docstring documents zsh / bash / fish / powershell setup
     assert "zsh" in out
     assert "bash" in out
     assert "fish" in out
+    assert "powershell" in out.lower()
     # And the obvious eval form
     assert "eval" in out
 

@@ -2662,11 +2662,33 @@ def delete(files: tuple, config_path: str, local: bool) -> None:
 
 @cli.command()
 @click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
-def watch(config_path: str) -> None:
+@click.option(
+    "--once/--no-once",
+    default=False,
+    help=(
+        "Run a single polling cycle instead of the long-running watch loop. "
+        "Useful for cron-driven setups: `*/5 * * * * claude-mirror watch --once --quiet`. "
+        "Default --no-once preserves the existing foreground-daemon behaviour."
+    ),
+)
+@click.option(
+    "--quiet/--no-quiet",
+    default=False,
+    help=(
+        "Suppress the 'Watching ...' banner and the 'Watcher stopped.' line. "
+        "Per-event notification lines are still printed. Pairs with --once "
+        "for cron jobs that should only emit output when there is news."
+    ),
+)
+def watch(config_path: str, once: bool, quiet: bool) -> None:
     """
-    Watch for remote changes via Pub/Sub streaming subscription.
+    Watch for remote changes via the configured notification backend.
     Sends a system notification when collaborators push updates.
-    Press Ctrl+C to stop.
+
+    Default mode: foreground long-running daemon — press Ctrl+C to stop.
+
+    With --once: run exactly one polling cycle, dispatch any events
+    surfaced, exit 0. Pairs with --quiet for cron-driven setups.
     """
     config = Config.load(_resolve_config(config_path))
     storage = _create_storage(config)
@@ -2699,8 +2721,13 @@ def watch(config_path: str) -> None:
         console.print("\n[dim]Stopping watcher...[/]")
         stop_event.set()
 
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
+    if not once:
+        # Signal handlers only matter for the long-running daemon path —
+        # `--once` returns of its own accord after a single cycle, and
+        # installing a SIGINT handler in cron-driven runs would mask
+        # the user's expected Ctrl+C-during-test behaviour for nothing.
+        signal.signal(signal.SIGINT, _handle_signal)
+        signal.signal(signal.SIGTERM, _handle_signal)
 
     if config.backend == "googledrive":
         sub_info = config.subscription_id
@@ -2712,16 +2739,29 @@ def watch(config_path: str) -> None:
         sub_info = f"polling every {config.poll_interval}s"
     else:
         sub_info = config.backend
-    console.print(f"\n[bold]claude-mirror v{_get_version()}[/]")
-    console.print(
-        f"[green]Watching for updates[/] (project: [bold]{config.project_path}[/])\n"
-        f"Backend: [dim]{config.backend}[/] ({sub_info})\n"
-        "Press [bold]Ctrl+C[/] to stop."
-    )
 
-    notifier.watch(on_event, stop_event)
+    if not quiet:
+        console.print(f"\n[bold]claude-mirror v{_get_version()}[/]")
+        if once:
+            console.print(
+                f"[green]Running one polling cycle[/] "
+                f"(project: [bold]{config.project_path}[/])\n"
+                f"Backend: [dim]{config.backend}[/] ({sub_info})"
+            )
+        else:
+            console.print(
+                f"[green]Watching for updates[/] (project: [bold]{config.project_path}[/])\n"
+                f"Backend: [dim]{config.backend}[/] ({sub_info})\n"
+                "Press [bold]Ctrl+C[/] to stop."
+            )
+
+    if once:
+        notifier.watch_once(on_event)
+    else:
+        notifier.watch(on_event, stop_event)
     notifier.close()
-    console.print("[dim]Watcher stopped.[/]")
+    if not quiet and not once:
+        console.print("[dim]Watcher stopped.[/]")
 
 
 def _make_watch_callback(cfg: Config, n: Notifier) -> Callable:
@@ -4531,10 +4571,107 @@ def log(config_path: str, limit: int) -> None:
 #   eval "$(claude-mirror completion zsh)"
 # ──────────────────────────────────────────────────────────────────────────
 
+# PowerShell completion source template. Click 8.3 ships native completion
+# classes for bash / zsh / fish but NOT PowerShell, so we define one here
+# (subclassing click.shell_completion.ShellComplete) using the same
+# `<NAME>_complete` env-var protocol the other shells use. The script
+# registers an ArgumentCompleter via PowerShell's Register-ArgumentCompleter
+# cmdlet — invoked once when the user dot-sources the script (or it lands
+# in their `$PROFILE`), live for every subsequent claude-mirror tab-press.
+_POWERSHELL_COMPLETION_SOURCE = """\
+Register-ArgumentCompleter -Native -CommandName %(prog_name)s -ScriptBlock {
+    param($wordToComplete, $commandAst, $cursorPosition)
+
+    $env:%(complete_var)s = "powershell_complete"
+    $env:COMP_WORDS = $commandAst.ToString()
+    $env:COMP_CWORD = $cursorPosition
+
+    & %(prog_name)s | ForEach-Object {
+        $parts = $_ -split ',', 3
+        $type = $parts[0]
+        $value = $parts[1]
+        $help = if ($parts.Length -ge 3) { $parts[2] } else { '' }
+
+        if ($type -eq 'plain') {
+            [System.Management.Automation.CompletionResult]::new(
+                $value, $value, 'ParameterValue', $help
+            )
+        }
+        elseif ($type -eq 'file' -or $type -eq 'dir') {
+            [System.Management.Automation.CompletionResult]::new(
+                $value, $value, 'ProviderItem', $value
+            )
+        }
+    }
+
+    Remove-Item Env:\\%(complete_var)s -ErrorAction SilentlyContinue
+    Remove-Item Env:\\COMP_WORDS -ErrorAction SilentlyContinue
+    Remove-Item Env:\\COMP_CWORD -ErrorAction SilentlyContinue
+}
+"""
+
+
+def _build_powershell_complete_class():
+    """Return a `PowerShellComplete` ShellComplete subclass.
+
+    Defined as a function so Click's `ShellComplete` import only happens
+    when `completion powershell` is actually invoked — keeping the
+    `claude-mirror --help` import time unchanged for the common path.
+    """
+    from click.shell_completion import ShellComplete, CompletionItem
+
+    class PowerShellComplete(ShellComplete):
+        """Click shell-completion adapter for PowerShell.
+
+        Click 8.3 does not ship a native PowerShell adapter, so we
+        define one matching the same ``<COMPLETE_VAR>_source`` /
+        ``<COMPLETE_VAR>_complete`` env-var protocol the bundled
+        adapters use. Discoverable as `claude-mirror completion
+        powershell`.
+        """
+
+        name = "powershell"
+        source_template = _POWERSHELL_COMPLETION_SOURCE
+
+        def get_completion_args(self) -> tuple[list[str], str]:
+            """Pull the partial command line out of the env vars set by
+            the source-template script. Mirrors the bash/zsh strategy:
+            the shell hands us the full word vector + cursor position;
+            we slice on cursor position to compute (args, incomplete).
+            """
+            import shlex
+
+            words_str = os.environ.get("COMP_WORDS", "")
+            try:
+                cwords = shlex.split(words_str, posix=False)
+            except ValueError:
+                cwords = words_str.split()
+            # Drop the program name itself from the front so `args` is
+            # the list of completed args, matching the contract the
+            # other ShellComplete adapters fulfil.
+            args = cwords[1:] if len(cwords) > 1 else []
+            # PowerShell hands us the cursor position — for the
+            # purposes of completion, the incomplete is whatever sits
+            # after the last separator; lift it off the args list.
+            if args and not words_str.endswith(" "):
+                incomplete = args.pop()
+            else:
+                incomplete = ""
+            return args, incomplete
+
+        def format_completion(self, item: "CompletionItem") -> str:
+            """Format one completion item into the ``type,value,help``
+            string the source-template script splits on.
+            """
+            return f"{item.type},{item.value},{item.help or ''}"
+
+    return PowerShellComplete
+
+
 @cli.command()
 @click.argument(
     "shell",
-    type=click.Choice(["bash", "zsh", "fish"], case_sensitive=False),
+    type=click.Choice(["bash", "zsh", "fish", "powershell"], case_sensitive=False),
 )
 def completion(shell: str) -> None:
     """Emit shell tab-completion source for claude-mirror.
@@ -4553,6 +4690,10 @@ def completion(shell: str) -> None:
       # fish — write to the completions dir
       claude-mirror completion fish > ~/.config/fish/completions/claude-mirror.fish
 
+    \b
+      # PowerShell — append to your profile
+      claude-mirror completion powershell | Out-File -Encoding utf8 -Append $PROFILE.CurrentUserAllHosts
+
     After restarting your shell, `claude-mirror <TAB>` completes commands
     and `claude-mirror push <TAB>` completes flag names. High-value flags
     (--config, --backend) also complete their values.
@@ -4563,6 +4704,7 @@ def completion(shell: str) -> None:
         "bash": BashComplete,
         "zsh": ZshComplete,
         "fish": FishComplete,
+        "powershell": _build_powershell_complete_class(),
     }
     cls = shell_classes[shell.lower()]
     comp = cls(

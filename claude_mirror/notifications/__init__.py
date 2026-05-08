@@ -33,6 +33,27 @@ class NotificationBackend(ABC):
     def watch(self, callback: Callable[[SyncEvent], None], stop_event: threading.Event) -> None:
         """Block and listen for events, calling callback for each. Stop when stop_event is set."""
 
+    def watch_once(self, callback: Callable[[SyncEvent], None]) -> None:
+        """Run exactly one polling/listen cycle and return.
+
+        Used by `claude-mirror watch --once` for cron-driven setups where
+        a long-lived watcher daemon is undesirable. Each backend
+        overrides this with the cheapest single-cycle equivalent of its
+        normal watch loop:
+
+          * Polling backend → one log fetch, dispatch new events, return.
+          * Dropbox longpoll → one short longpoll, dispatch, return.
+          * Pub/Sub → one synchronous pull, dispatch, return.
+
+        The default implementation falls back to `watch()` with a stop
+        event already set so backends that don't override it still
+        terminate quickly (they may emit zero events, which is the
+        correct result for "no changes since last run").
+        """
+        stop = threading.Event()
+        stop.set()
+        self.watch(callback, stop)
+
     @abstractmethod
     def close(self) -> None:
         """Release resources."""

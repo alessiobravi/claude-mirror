@@ -77,6 +77,42 @@ class PollingNotifier(NotificationBackend):
                 callback, last_seen_key,
             )
 
+    def watch_once(self, callback: Callable[[SyncEvent], None]) -> None:
+        """Run exactly one polling cycle and return.
+
+        Used by `claude-mirror watch --once` for cron-driven setups.
+        Reads a persistent watermark (last-seen event key) from
+        `~/.config/claude_mirror/watch_once_state/...json` so successive
+        runs only dispatch events that arrived since the previous
+        invocation.
+
+        Bootstrap rule: on the very first `--once` run for a project we
+        do NOT surface every historical event from the log (that would
+        flood the user with weeks of past events the moment they first
+        wire up cron). Instead we capture the current log tail as the
+        initial watermark and dispatch nothing — subsequent runs then
+        flow normally.
+        """
+        from .._watch_once_state import (
+            load_watermark, save_watermark, FIRST_RUN_SENTINEL,
+        )
+
+        key = ("poll", self.config.machine_name, self.config.project_path)
+        watermark = load_watermark(key)
+        if watermark is FIRST_RUN_SENTINEL:
+            current_tail = self._get_last_log_key()
+            # Record current tail (or an empty marker if log is empty).
+            save_watermark(key, current_tail if current_tail is not None else ("", "", "", ()))
+            return
+        # watermark is either a real event-key tuple or the empty marker
+        # ("", "", "", ()) which `_dispatch_new_events` will treat as
+        # "key not found → re-dispatch from top". Translate the empty
+        # marker back to None to opt into the rotation-safe branch.
+        last_seen = None if watermark == ("", "", "", ()) else watermark
+        new_last = self._dispatch_new_events(callback, last_seen)
+        if new_last is not None and new_last != last_seen:
+            save_watermark(key, new_last)
+
     def close(self) -> None:
         """No persistent resources to release."""
 

@@ -426,22 +426,43 @@ _completion_activation_pending: bool = False
 
 
 def _detect_shell() -> Optional[str]:
-    """Return 'zsh', 'bash', 'fish', or None if we can't / shouldn't auto-install.
+    """Return 'zsh', 'bash', 'fish', 'powershell', or None.
 
     Resolution order:
-      1. SHELL env var basename.
-      2. /etc/passwd login shell (rare fallback; only if SHELL is unset).
-      3. Platform default (zsh on macOS, bash on Linux).
+      1. SHELL env var basename — pick zsh/bash/fish/pwsh as available.
+      2. On Windows (or when no SHELL is set and PSModulePath is
+         present), fall back to powershell — Windows users running
+         claude-mirror-install from a PowerShell prompt should get
+         PowerShell completion auto-installed.
+      3. Platform default for Unix-likes (zsh on macOS, bash on Linux).
 
     Returns None for unsupported shells (sh/dash/csh/etc.) — better to
     skip the auto-install than write something that won't work.
+
+    PowerShell is intentionally lower priority than the Unix shells on
+    macOS / Linux: a user who runs zsh as their login shell but has
+    pwsh installed should still get zsh completion, not pwsh.
     """
     shell_env = os.environ.get("SHELL", "")
     name = Path(shell_env).name if shell_env else ""
+    # Strip a trailing ".exe" — Windows binaries land on $SHELL on a
+    # few hybrid setups (Git Bash + WSL) with the executable suffix
+    # still attached.
+    if name.endswith(".exe"):
+        name = name[: -len(".exe")]
     if name in ("zsh", "bash", "fish"):
         return name
-    # Mac default is zsh since Catalina; Linux default is bash.
+    # `pwsh` is the canonical PowerShell 7+ binary name on every OS;
+    # `powershell` is Windows PowerShell 5.1. Both map to the same
+    # completion source.
+    if name in ("pwsh", "powershell"):
+        return "powershell"
+    # If SHELL is unset, prefer Unix defaults on Unix and PowerShell on
+    # Windows. Windows almost never sets SHELL, so checking platform
+    # first is the right move.
     if not name:
+        if platform.system() == "Windows":
+            return "powershell"
         return "zsh" if platform.system() == "Darwin" else "bash"
     # Anything else (sh, dash, csh, tcsh, ksh) — punt.
     return None
@@ -452,6 +473,9 @@ def _completion_target(shell: str) -> Optional[Path]:
 
     For zsh + bash we append to the interactive rc file. For fish we use
     the dedicated completions directory (fish auto-loads from there).
+    For powershell we target `$PROFILE.CurrentUserAllHosts` — the
+    canonical "runs in every host" profile path on every OS pwsh
+    supports.
     """
     home = Path.home()
     if shell == "zsh":
@@ -465,6 +489,19 @@ def _completion_target(shell: str) -> Optional[Path]:
         return home / ".bashrc"
     if shell == "fish":
         return home / ".config" / "fish" / "completions" / "claude-mirror.fish"
+    if shell == "powershell":
+        # PowerShell 7+ resolves $PROFILE.CurrentUserAllHosts to a
+        # platform-specific path:
+        #   * Windows: %USERPROFILE%/Documents/PowerShell/profile.ps1
+        #   * macOS:   ~/.config/powershell/profile.ps1
+        #   * Linux:   ~/.config/powershell/profile.ps1
+        # On Windows we honour the Documents/PowerShell convention; on
+        # Unix-like systems we use the XDG-style location pwsh itself
+        # ships with. Either way, the file we target gets dot-sourced
+        # automatically on every interactive shell start.
+        if platform.system() == "Windows":
+            return home / "Documents" / "PowerShell" / "profile.ps1"
+        return home / ".config" / "powershell" / "profile.ps1"
     return None
 
 
@@ -482,7 +519,7 @@ def install_completion() -> None:
     if shell is None:
         _warn(
             f"Shell '{Path(os.environ.get('SHELL', '')).name or 'unknown'}' "
-            "is not supported (only zsh / bash / fish). Skipping."
+            "is not supported (only zsh / bash / fish / powershell). Skipping."
         )
         return
 
@@ -510,6 +547,44 @@ def install_completion() -> None:
         ).stdout
         rc.write_text(completion_script)
         _ok(f"Fish completion installed at {rc}.")
+        _completion_activation_pending = True
+        return
+
+    # PowerShell uses `#` comment markers and an `Invoke-Expression` of
+    # the live `claude-mirror completion powershell` output, mirroring
+    # the eval-into-rc pattern used for zsh/bash but with PowerShell
+    # idioms. The marker block is identical in shape — same begin/end
+    # tokens — so `_replace_completion_block` reuses cleanly.
+    if shell == "powershell":
+        invoke_line = (
+            f"Invoke-Expression (& {_find_binary()} completion powershell | Out-String)"
+        )
+        block = "\n".join([_COMPLETION_MARK_BEGIN, invoke_line, _COMPLETION_MARK_END])
+
+        existing = rc.read_text() if rc.exists() else ""
+        if _COMPLETION_MARK_BEGIN in existing:
+            if invoke_line in existing:
+                _skip("Tab-completion already installed and current.")
+                return
+            if not _confirm("Tab-completion is installed but stale — update?"):
+                _skip()
+                return
+            new_content = _replace_completion_block(existing, block)
+            rc.parent.mkdir(parents=True, exist_ok=True)
+            rc.write_text(new_content)
+            _ok(f"Tab-completion refreshed in {rc}.")
+            _completion_activation_pending = True
+            return
+
+        if not _confirm(f"Add tab-completion to {rc}?"):
+            _skip()
+            return
+
+        sep = "" if existing.endswith("\n") or not existing else "\n"
+        rc.parent.mkdir(parents=True, exist_ok=True)
+        with rc.open("a") as f:
+            f.write(f"{sep}\n{block}\n")
+        _ok(f"Tab-completion installed in {rc}.")
         _completion_activation_pending = True
         return
 

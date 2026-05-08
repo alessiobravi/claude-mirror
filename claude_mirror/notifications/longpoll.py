@@ -110,6 +110,34 @@ class DropboxLongPollNotifier(NotificationBackend):
             if longpoll.backoff:
                 stop_event.wait(longpoll.backoff)
 
+    def watch_once(self, callback: Callable[[SyncEvent], None]) -> None:
+        """Run a single sync-log fetch + dispatch and return.
+
+        Used by `claude-mirror watch --once` for cron-driven setups.
+        Unlike the streaming `watch()` loop, this never opens a longpoll
+        connection — the event log is the source of truth, and the
+        watermark file in `watch_once_state/` lets successive runs only
+        surface events that arrived since the previous invocation.
+
+        First-run bootstrap: capture the current log tail and dispatch
+        nothing, so the very first cron tick after install does not
+        flood the user with weeks of historical events.
+        """
+        from .._watch_once_state import (
+            load_watermark, save_watermark, FIRST_RUN_SENTINEL,
+        )
+
+        key = ("longpoll", self.config.machine_name, self.config.project_path)
+        watermark = load_watermark(key)
+        if watermark is FIRST_RUN_SENTINEL:
+            current_tail = self._get_last_log_key()
+            save_watermark(key, current_tail if current_tail is not None else ("", "", "", ()))
+            return
+        last_seen = None if watermark == ("", "", "", ()) else watermark
+        new_last = self._dispatch_new_events(callback, last_seen)
+        if new_last is not None and new_last != last_seen:
+            save_watermark(key, new_last)
+
     def close(self) -> None:
         """No persistent resources to release."""
 

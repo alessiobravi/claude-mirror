@@ -28,6 +28,7 @@ from .backends import StorageBackend, redact_error
 from .config import Config
 from .events import SyncEvent, SyncLog, SYNC_LOG_NAME, LOGS_FOLDER
 from .hash_cache import HashCache
+from .ignore import IgnoreSet, IGNORE_FILENAME
 from .manifest import Manifest
 from .merge import MergeHandler
 from .notifications import NotificationBackend
@@ -145,6 +146,15 @@ class SyncEngine:
             self._exclude_re = None
             self._exclude_prefixes = ()
 
+        # Project-tree gitignore-style rules from `.claude_mirror_ignore`.
+        # Loaded once per command invocation (engine instance lifetime).
+        # Independent of `exclude_patterns`: both layers must vote "keep"
+        # for a file to be eligible. Returns None if the file is absent
+        # or contains no usable rules — keeping the hot path branch-free.
+        self._ignore_set: Optional[IgnoreSet] = IgnoreSet.from_file(
+            self._project / IGNORE_FILENAME
+        )
+
     # ------------------------------------------------------------------
     # File discovery
     # ------------------------------------------------------------------
@@ -152,21 +162,46 @@ class SyncEngine:
     def _is_excluded(self, rel_path: str) -> bool:
         """Return True if rel_path matches any exclude pattern.
 
-        Uses pre-compiled state built in __init__:
-          * self._exclude_re — a single regex union of every exclude pattern
-            in both `pattern` and `pattern/*` forms (matches the first two
-            checks of the legacy implementation).
-          * self._exclude_prefixes — `tuple(f"{p}/" for p in patterns)`, used
-            with str.startswith to mirror the legacy `rel_path.startswith
-            (f"{pattern}/")` check (preserves directory-prefix exclusion for
-            patterns whose own glob form would not otherwise match a nested
-            child path).
+        Combines two independent layers (both must vote "keep" for the
+        path to pass):
+
+          1. YAML `exclude_patterns` — the legacy fnmatch-based
+             exclusion list, pre-compiled in __init__:
+              * self._exclude_re — a single regex union of every exclude
+                pattern in both `pattern` and `pattern/*` forms.
+              * self._exclude_prefixes — `tuple(f"{p}/" for p in patterns)`,
+                used with str.startswith to mirror the legacy
+                `rel_path.startswith(f"{pattern}/")` check.
+          2. `.claude_mirror_ignore` — gitignore-style rules loaded once
+             per engine instance from the project root. The file itself
+             is auto-excluded so the rules do not propagate to other
+             machines unless the user explicitly wants them to.
         """
-        if self._exclude_re is None:
-            return False
-        if self._exclude_re.match(rel_path):
+        # Layer 2a: auto-exclude the ignore-rules file itself, even when
+        # no .claude_mirror_ignore file exists at the moment of the call —
+        # this keeps the auto-exclusion semantics consistent regardless
+        # of whether the user has added the file yet.
+        if rel_path == IGNORE_FILENAME:
             return True
-        return rel_path.startswith(self._exclude_prefixes)
+
+        # Layer 1: YAML exclude_patterns.
+        if self._exclude_re is not None:
+            if self._exclude_re.match(rel_path):
+                return True
+            if rel_path.startswith(self._exclude_prefixes):
+                return True
+
+        # Layer 2b: .claude_mirror_ignore rules. Defensive `getattr`
+        # so engines built via the bare `SyncEngine.__new__` path used
+        # by the perf-smoke and parity tests (which skip the regular
+        # __init__ to focus on a single concern) don't blow up — for
+        # those engines, no ignore set is configured, which is exactly
+        # the right behaviour anyway.
+        ignore_set = getattr(self, "_ignore_set", None)
+        if ignore_set is not None and ignore_set.is_excluded(rel_path):
+            return True
+
+        return False
 
     def _local_files(self) -> list[str]:
         """Return relative paths of all local files matching configured patterns.

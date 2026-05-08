@@ -81,7 +81,8 @@ def test_completion_target_fish_points_at_completions_dir():
 
 
 def test_completion_target_unknown_shell_returns_none():
-    assert _completion_target("powershell") is None
+    assert _completion_target("csh") is None
+    assert _completion_target("ksh") is None
     assert _completion_target("") is None
 
 

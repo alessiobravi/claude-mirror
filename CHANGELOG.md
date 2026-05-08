@@ -6,7 +6,7 @@ All notable changes to claude-mirror.
 
 ## [0.5.34] — 2026-05-08
 
-Two bug fixes for the v0.5.33 SFTP / Tier 2 surface, both surfaced by real-world use the day after release.
+A wave of fixes and additions to the v0.5.33 Tier 2 + SFTP surfaces, all surfaced by real-world use of the SFTP backend the day after it shipped. Highlights: `seed-mirror`, `status --by-backend`, live-verifying status views, paramiko channel-multiplex perf fix, Ctrl+C-safe manifest persistence.
 
 ### Fixed — `init --wizard --backend X` now respects the `--backend` flag
 - **Bug**: `claude-mirror init --wizard --backend sftp` displayed `Storage backend [googledrive]:` regardless of what was passed to `--backend`. Pre-fix the wizard ignored the CLI flag entirely; users had to re-type the backend name into the prompt.
@@ -31,6 +31,54 @@ Two bug fixes for the v0.5.33 SFTP / Tier 2 surface, both surfaced by real-world
 ### Fixed — `status --pending` now surfaces unseeded mirrors
 - Pre-fix `status --pending` only listed files in `pending_retry` / `failed_perm` state. Files that had **no recorded state at all** for a configured mirror (the bug above) were silently invisible — the user saw "✓ All mirrors are caught up" while a mirror folder was empty.
 - Post-fix `status --pending` adds an "Unseeded mirrors" table when any configured mirror has files with no recorded state, with the suggested fix command (`claude-mirror seed-mirror --backend NAME`) inline. The pre-fix happy-path message only shows when both pending state AND unseeded state are clean.
+
+### Fixed — `--by-backend` and `--pending` now live-poll every backend
+- Pre-fix both views were manifest-only. The manifest is a per-machine local cache — in any multi-user / multi-machine setup it produced wrong answers (machine A pushes; machine B pulls; B's manifest doesn't know mirror state for those files; B's `--pending` says "unseeded" even though SFTP is fully populated). Plus same-machine drift cases (file deleted directly on SFTP via SSH) were invisible.
+- Post-fix both views walk every configured backend via `list_files_recursive` once per invocation, then cross-reference with the manifest. New derived state "deleted out-of-band" surfaces files where manifest says `state="ok"` but the live listing disagrees.
+- Cell semantics for `--by-backend` updated: live-presence + manifest state combine for the final cell. Mutually-exclusive `--by-backend` and `--pending` flags error cleanly when both passed.
+- Speed cost: `--pending` is now slower (was ~ms manifest read; now ~5–30s for multi-thousand-file projects across 2 backends). Slower right answer beats fast wrong answer.
+
+### Fixed — `--by-backend` and `--pending` live-walks honor `exclude_patterns`
+- Pre-fix the live walks didn't filter by `exclude_patterns`, so files the user had explicitly excluded showed up as `⊘ unseeded` orphans on mirrors. For example: `git/cortex-demo/.git/objects/...` excluded by `git/cortex-demo/.git/**` still surfaced as 442 phantom unseeded files on the SFTP column.
+- Post-fix both renderers apply `engine._is_excluded(rel_path)` to every entry returned by `list_files_recursive` — same filter the engine's own `get_status()` applies.
+
+### Fixed — `--by-backend` matches plain `status`'s classifications
+- Pre-fix `--by-backend` only checked file PRESENCE on each backend, not content hashes. A locally-modified file that had been pushed showed as `✓ ok` everywhere even though the user had unpushed local changes. Plus the file universe was built from `manifest ∪ live-remote`, missing local-only files that hadn't been pushed yet.
+- Post-fix `--by-backend` routes through `engine.get_status()` for the file universe and primary state — same path plain `status` uses for its 3-way diff. The `Status` enum maps directly to per-cell labels (`IN_SYNC` → `✓ ok`, `LOCAL_AHEAD` → `↑ local ahead`, `DRIVE_AHEAD` → `↓ drive ahead`, `NEW_LOCAL` → `+ new local`, `CONFLICT` → `⚠ conflict`). When the primary's status is non-IN_SYNC due to local divergence (`LOCAL_AHEAD`, `NEW_LOCAL`, `CONFLICT`), the mirror inherits the same status — mirrors are write-replicas, they trail primary identically.
+- Mirror-only orphan files (present on a mirror but not local AND not on primary — e.g. from out-of-band restores) get rendered as a "mirror-only" extra section with `✗ orphan` cells.
+
+### Added — Per-backend push progress UX
+- The "Pushing X/N" Progress row now appends a per-backend breakdown: `Pushing 3/5 (googledrive: 5/5 · sftp: 3/5) 0:01:17`. With Tier 2 fan-out, the file-level counter only advances when ALL backends finish a file, so 5 files × 2 backends with one slow backend used to look stuck at "Pushing 1/5". The breakdown shows which backend is the actual bottleneck.
+- Implementation: thread-safe `_push_counters` dict on the engine, populated by `_bump_push_counter(backend_name)` calls inside `_push_file` (after primary upload) and `_fan_out_to_mirrors._push_one` (after each mirror). `_parallel` gains an optional `extra_detail` callable that's appended to the detail string after each completion.
+
+### Fixed — Snapshot mirror-root resolution (snapshots actually land on the mirror)
+- Pre-fix bug in `snapshots.py:_root_folder_for`: it only checked `getattr(mirror, "root_folder", None)` for the mirror's root folder. Real backends (SFTPBackend, all of them) carry their root via `mirror.config.root_folder` — a property that dispatches on backend type. Without `.root_folder` directly on the mirror instance, the lookup fell through to `self.config.root_folder` — i.e. the PRIMARY's folder ID. Snapshot fan-out then called e.g. `sftp.mkdir("1BxiMVs.../...")` treating the Drive folder ID as an SFTP path. Either silently failed or created garbage in the user's home dir; either way, no `_claude_mirror_*` directories in the actual project folder on the mirror.
+- Fix: prefer `getattr(mirror, "config", None).root_folder` first, fall back to `getattr(mirror, "root_folder", ...)` for legacy / test backends. 2 regression tests in `tests/test_snapshots.py` pin the config-first resolution + the legacy-attribute fallback.
+
+### Fixed — Phase rows stay visible during mirror walks
+- Pre-fix the `--by-backend` renderer called `progress.remove_task` on the Local + primary tasks immediately after `engine.get_status()` returned. The Local + primary rows would render their final state for an instant ("Local: all 1255 file(s) cached — done"), then vanish the moment SFTP listing started.
+- Fix: replace the `remove_task` calls with `progress.update(..., total=1, completed=1)`. Spinner stops, row stays visible at its final detail. Mirror rows append below.
+
+### Fixed — Manifest persists before snapshot phase (Ctrl+C safety)
+- Pre-fix `engine.push()` and `engine.sync()` called `self.manifest.save()` only at the very end of the with-progress block, AFTER the Snapshot and Notify phases. Per-file `manifest.update(...)` calls inside `_push_file` and `_fan_out_to_mirrors` updated the IN-MEMORY dict but never reached disk if the run was interrupted during snapshot creation — exactly the most likely interrupt point on a fresh mirror with thousands of unique blobs to upload. Symptom: `Ctrl+C` during a long snapshot, run `claude-mirror push` again → SAME files re-pushed, wasting bandwidth.
+- Fix: add a `self.manifest.save()` call right after the Conflicts phase, BEFORE Snapshot. The file-level upload bookkeeping persists to disk as soon as the uploads complete; only the snapshot create itself is at risk on interrupt (and snapshot create is naturally retryable on the next push since the snapshot format is content-addressed). The existing save() at the end of the block stays — captures any state changes from snapshot/notify phases.
+
+### Performance — Per-thread SFTPClient channels (no more parallel-upload stalls)
+- User-reported symptom: snapshot fan-out to a fresh SFTP mirror with 1255 unique blobs and `parallel_workers=5` took 10+ minutes with only ONE finalized blob. paramiko effectively serialized all worker threads to a single SFTP channel; 4 of 5 workers stalled indefinitely.
+- Root cause: `SFTPBackend` stored a single `self._sftp` SFTPClient on the instance and every worker thread shared it. paramiko's SFTPClient is technically thread-safe (each operation gets a unique request ID, dispatcher routes responses), but operations multiplex through ONE request/response channel — under concurrent load (5 simultaneous put + posix_rename calls) the channel queue stalls and only one transfer can be in flight at a time.
+- Fix: replace `self._sftp` with `self._tls = threading.local()`. `_connect()` lazily opens a NEW SFTPClient per worker thread, multiplexed over the SHARED `self._client` SSH connection. paramiko's Transport supports many SFTP channels per SSH session by design — TCP handshake cost paid once; each worker's channel runs independently from there.
+- Benchmark against the maintainer's live SFTP server (192.168.236.4): sequential put+rename 21ms each; 5 parallel workers complete in 64ms total (vs ~105ms ideal serial). 1.64x speedup, no stalls.
+- Projected impact on the user's 1255-blob fan-out: pre-fix stalled indefinitely; post-fix completes in ~16 seconds.
+- Tests: `tests/test_sftp_backend.py` `_wire_fake` helper updated to set `backend._tls.sftp = fake_sftp` instead of `backend._sftp`. Same contract for the calling thread; `fake_ssh.open_sftp.return_value = fake_sftp` so any code path opening a fresh channel still gets the fake.
+
+### Fixed — Per-file `↑ {path}` prints no longer interleave with live region
+- Visual bug surfaced under heavy multi-thread output: 10+ `console.print("↑ {file}")` calls from worker threads (5 primary + 5 mirror per push) interleaved with the live multi-row Progress region's redraw, causing Rich-cursor drift that visibly DUPLICATED the "Guard checks" / "Pushing" phase rows on some terminals.
+- Fix: route the per-file ↑ messages through a thread-safe `self._push_log_buffer` list instead of calling `console.print` directly. The live region only manages its own rows during push (no interleaved console output to fight Rich's cursor math). After the `with progress` block exits AND the manifest save completes, `_flush_push_log()` emits every buffered line via `console.print` — same content, just below the cleaned-up summary instead of interleaved.
+- Tradeoff: the user no longer sees real-time per-file feedback during the upload. The Progress detail row's per-backend breakdown (`gdrive: 3/5 · sftp: 2/5`) covers the live-progress need; the per-file lines emit as a clean batch after the run finishes.
+
+### Fixed — Yellow markup contained to the literal "unseeded" word
+- Pre-fix the `status --pending` unseeded-mirrors explanation paragraph used `[dim]A mirror is [yellow]unseeded[/dim][dim] when files exist...` which closes `[dim]` while `[yellow]` is still open. Rich kept yellow applied through the rest of the paragraph.
+- Fix: corrected nesting `[dim]A mirror is [yellow]unseeded[/yellow] when files exist...[/dim]`.
 
 ---
 

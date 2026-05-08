@@ -148,13 +148,35 @@ class SnapshotManager:
 
     def _root_folder_for(self, backend: StorageBackend) -> str:
         """Resolve the root folder reference for `backend`. The primary
-        uses `self.config.root_folder`; mirrors expose their own root
-        via a `root_folder` attribute (string) or a callable, depending
-        on how the mirror was constructed by `cli.py`. Falls back to
-        the primary config's root_folder if no mirror-specific value
-        is available."""
+        uses `self.config.root_folder`; for a mirror we prefer the
+        mirror's OWN config (mirror.config.root_folder, which dispatches
+        on backend type to return drive_folder_id / sftp_folder /
+        dropbox_folder / etc.). Falls back to legacy attribute lookups
+        for mirrors constructed without an embedded config.
+
+        Bug history: pre-fix, this method only checked `getattr(backend,
+        "root_folder", ...)` and fell through to `self.config.root_folder`
+        when missing. SFTPBackend (and anything else not exposing
+        `.root_folder` as a top-level attribute) silently inherited the
+        PRIMARY's root_folder — a Drive folder ID — as its parent path.
+        Snapshot fan-out then called e.g. sftp.mkdir("1BxiMVs.../...")
+        which either silently failed or created garbage paths under the
+        user's home directory, leaving the mirror's actual project
+        folder without any `_claude_mirror_snapshots/` or
+        `_claude_mirror_blobs/` directories.
+        """
         if backend is self.storage:
             return self.config.root_folder
+        # Preferred path — the mirror carries its own Config and that
+        # Config's `root_folder` property knows the backend-specific
+        # field to read (sftp_folder, drive_folder_id, etc.).
+        backend_config = getattr(backend, "config", None)
+        if backend_config is not None:
+            rf = getattr(backend_config, "root_folder", None)
+            if isinstance(rf, str) and rf:
+                return rf
+        # Legacy fallback for backends constructed without an embedded
+        # config (test fakes, custom subclasses).
         rf = getattr(backend, "root_folder", None)
         if callable(rf):
             try:
@@ -163,9 +185,10 @@ class SnapshotManager:
                 pass
         elif isinstance(rf, str) and rf:
             return rf
-        # Last-resort: use primary's root_folder. Most backends ignore the
-        # caller-supplied parent for path-based APIs (Dropbox, OneDrive,
-        # WebDAV) and resolve from their own configured base folder.
+        # Last resort — primary's root_folder. Reaching here means the
+        # mirror has no usable config AND no `root_folder` attribute,
+        # which is an unusual setup; the snapshot fan-out will likely
+        # write to a wrong path on this backend.
         return self.config.root_folder
 
     def _get_snapshots_folder_for(self, backend: StorageBackend) -> str:

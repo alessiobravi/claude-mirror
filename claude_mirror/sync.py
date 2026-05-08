@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import Enum
@@ -101,6 +102,16 @@ class SyncEngine:
         # Pub/Sub publish futures collected during a command and resolved at the end —
         # avoids inline blocking on broker ack for each event we publish.
         self._pending_publish_futures: list = []
+        # Per-backend push-progress counters. _push_file and
+        # _fan_out_to_mirrors increment these as each backend completes
+        # its upload for a given file; the running total is rendered in
+        # the "Pushing X/N" Progress row's detail string so the user can
+        # see at a glance whether SFTP is the bottleneck or whether the
+        # primary is also slow. Reset by `push()` before each invocation;
+        # protected by a lock because uploads run in a ThreadPoolExecutor.
+        self._push_counter_lock = threading.Lock()
+        self._push_counters: dict[str, int] = {}
+        self._push_counter_total: int = 0
         # Pre-compile exclude patterns into a single regex + a directory-prefix
         # tuple. _is_excluded is a hot path: status/push/pull each invoke it
         # once per local file, so on a 5K-file project with 10 exclude patterns
@@ -547,9 +558,11 @@ class SyncEngine:
 
             # Pushing
             push_task = progress.add_task("Pushing", total=None, detail="0 file(s)", show_time=True)
+            self._reset_push_counters(safe_pushes)
             ok, _ = self._parallel(
                 safe_pushes, self._push_file, description="Pushing",
                 progress=progress, task_id=push_task,
+                extra_detail=self._format_push_breakdown,
             )
             pushed.extend(s.rel_path for s in ok)
 
@@ -693,9 +706,11 @@ class SyncEngine:
             if force_local:
                 # Treat local as authoritative — no guard, no conflict prompts.
                 push_task = progress.add_task("Pushing", total=None, detail="0 file(s)", show_time=True)
+                self._reset_push_counters(to_push)
                 ok, _ = self._parallel(
                     to_push, self._push_file, description="Pushing",
                     progress=progress, task_id=push_task,
+                    extra_detail=self._format_push_breakdown,
                 )
                 pushed.extend(s.rel_path for s in ok)
             else:
@@ -710,9 +725,11 @@ class SyncEngine:
 
                 # Pushing
                 push_task = progress.add_task("Pushing", total=None, detail="0 file(s)", show_time=True)
+                self._reset_push_counters(safe_pushes)
                 ok, _ = self._parallel(
                     safe_pushes, self._push_file, description="Pushing",
                     progress=progress, task_id=push_task,
+                    extra_detail=self._format_push_breakdown,
                 )
                 pushed.extend(s.rel_path for s in ok)
 
@@ -945,6 +962,7 @@ class SyncEngine:
         description: str = "Working",
         progress: Optional[Progress] = None,
         task_id: Optional[int] = None,
+        extra_detail: Optional[Callable[[], str]] = None,
     ) -> tuple[list, list]:
         """Run fn(item) for each item in parallel with a live progress bar.
         Returns (succeeded, failed) item lists.
@@ -954,7 +972,25 @@ class SyncEngine:
         live displays). Otherwise a transient Progress is created locally.
         If `task_id` is also provided, that pre-existing task is reused
         and updated rather than creating a new one.
+
+        `extra_detail` (optional callable) returns a short string that
+        gets appended to the row's detail after each completion — used
+        by the push pipeline to render per-backend breakdowns like
+        "(googledrive: 5/5 · sftp: 1/5)" so the user can see which
+        backend is the bottleneck during a multi-backend fan-out.
         """
+        def _decorate(detail: str) -> str:
+            """Append the extra_detail breakdown when the caller provided one."""
+            if extra_detail is None:
+                return detail
+            try:
+                extra = extra_detail()
+            except Exception:
+                extra = ""
+            if not extra:
+                return detail
+            return f"{detail}  ({extra})"
+
         if not items:
             if progress is not None and task_id is not None:
                 progress.update(task_id, total=0, completed=0,
@@ -968,14 +1004,14 @@ class SyncEngine:
             try:
                 fn(item)
                 if progress is not None and task_id is not None:
-                    progress.update(task_id, advance=1, detail="completed")
+                    progress.update(task_id, advance=1, detail=_decorate("completed"))
                 return [item], []
             except Exception as e:
                 label = getattr(item, "rel_path", str(item))
                 out = progress.console if progress is not None else console
                 out.print(f"  [red]✗ {label}: {e}[/]")
                 if progress is not None and task_id is not None:
-                    progress.update(task_id, advance=1, detail="failed")
+                    progress.update(task_id, advance=1, detail=_decorate("failed"))
                 return [], [item]
 
         succeeded, failed = [], []
@@ -1023,14 +1059,14 @@ class SyncEngine:
                     progress.update(
                         task_id,
                         advance=1,
-                        detail=f"{done}/{len(items)}",
+                        detail=_decorate(f"{done}/{len(items)}"),
                     )
             if owns_task:
                 progress.remove_task(task_id)
             else:
                 # Caller owns the row; mark it completed so the final state is
                 # readable rather than a stale per-item count.
-                progress.update(task_id, detail="completed")
+                progress.update(task_id, detail=_decorate("completed"))
         finally:
             if owns_progress:
                 progress.stop()
@@ -1079,6 +1115,41 @@ class SyncEngine:
             progress.update(task_id, detail="completed")
         return safe, conflicts
 
+    def _reset_push_counters(self, items: list) -> None:
+        """Initialise the per-backend completion counters before a push
+        run. Total is the file count; one counter per configured backend
+        (primary + every mirror). Initial values are 0 so the first
+        rendered detail reads "googledrive: 0/N · sftp: 0/N"."""
+        primary_name = (
+            getattr(self.storage, "backend_name", "") or self.config.backend
+        )
+        names = [primary_name] + [
+            (getattr(b, "backend_name", "") or "mirror") for b in self._mirrors
+        ]
+        with self._push_counter_lock:
+            self._push_counter_total = len(items)
+            self._push_counters = {name: 0 for name in names}
+
+    def _bump_push_counter(self, backend_name: str) -> None:
+        """Increment the per-backend completion counter and refresh the
+        active push Progress row's detail string. Thread-safe — called
+        from worker threads."""
+        with self._push_counter_lock:
+            self._push_counters[backend_name] = (
+                self._push_counters.get(backend_name, 0) + 1
+            )
+
+    def _format_push_breakdown(self) -> str:
+        """Build the per-backend "name: X/N" breakdown string consumed
+        by `_parallel`'s extra_detail callback. Read under lock so a
+        concurrent _bump can't produce a partial dict view."""
+        with self._push_counter_lock:
+            total = self._push_counter_total
+            return " · ".join(
+                f"{name}: {self._push_counters.get(name, 0)}/{total}"
+                for name in self._push_counters
+            )
+
     def _push_file(self, state: FileSyncState) -> None:
         # _safe_join refuses manifest keys that try to escape the project
         # root — a defence against a corrupted or malicious manifest.
@@ -1103,6 +1174,7 @@ class SyncEngine:
             synced_remote_hash=remote_hash or state.local_hash,
             backend_name=primary_name,
         )
+        self._bump_push_counter(primary_name)
         console.print(f"  [cyan]↑[/] {state.rel_path}")
 
         # Tier 2: fan out to write-replica mirrors. Failures are recorded
@@ -1163,6 +1235,7 @@ class SyncEngine:
                     synced_remote_hash=remote_hash,
                     state="ok",
                 )
+                self._bump_push_counter(name)
                 return (name, True, None, None)
             except BackendError as be:
                 # Already classified — record per-class state.

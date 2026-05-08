@@ -333,6 +333,61 @@ def _make_manager(cfg, backend, mirrors=None) -> SnapshotManager:
     return SnapshotManager(cfg, backend, mirrors=mirrors)
 
 
+# Regression test for the SFTP-mirror-snapshot bug: pre-fix,
+# _root_folder_for(mirror) checked only `getattr(mirror, "root_folder",
+# None)` and fell through to `self.config.root_folder` (i.e. the primary's
+# root). For backends that carry their root via `config.root_folder`
+# (SFTP, all the real backends) this meant snapshot fan-out used the
+# PRIMARY's folder ID as the parent path on the mirror — silently
+# breaking blob/snapshot dir creation on every mirror.
+
+class _MirrorConfigStub:
+    """Minimal Config-like stub that exposes a `root_folder` property —
+    matching the production backends' shape where the embedded Config
+    knows the backend-specific field to return."""
+    def __init__(self, root_folder: str) -> None:
+        self.root_folder = root_folder
+
+
+def test_root_folder_for_mirror_prefers_mirror_config_over_primary(make_config):
+    """When the mirror exposes its own config with a `root_folder`
+    property (SFTP / Drive / Dropbox / OneDrive / WebDAV all do this),
+    SnapshotManager._root_folder_for(mirror) MUST return that mirror's
+    root, not the primary's. Pre-fix it returned the primary's."""
+    cfg = make_config(drive_folder_id="PRIMARY_ROOT")
+    primary = InMemoryBackend(name="primary", root_folder="PRIMARY_ROOT")
+    mirror = InMemoryBackend(name="sftp", root_folder="MIRROR_ROOT")
+    # Attach a config to the mirror — same contract as real backends:
+    # mirror.config.root_folder dispatches on backend type to return
+    # the correct field (sftp_folder, dropbox_folder, etc.).
+    mirror.config = _MirrorConfigStub("MIRROR_ROOT")
+
+    mgr = SnapshotManager(cfg, primary, mirrors=[mirror])
+
+    assert mgr._root_folder_for(primary) == "PRIMARY_ROOT"
+    assert mgr._root_folder_for(mirror) == "MIRROR_ROOT", (
+        "Mirror's root_folder must come from mirror.config.root_folder, "
+        "not fall through to the primary's root — pre-fix bug caused "
+        "every mirror's snapshot fan-out to write to a wrong path."
+    )
+
+
+def test_root_folder_for_mirror_falls_back_to_attribute_for_legacy_backends(make_config):
+    """Backwards compat: a mirror that doesn't carry an embedded Config
+    but DOES expose `.root_folder` directly (test fakes, custom
+    subclasses) still resolves correctly."""
+    cfg = make_config(drive_folder_id="PRIMARY_ROOT")
+    primary = InMemoryBackend(name="primary", root_folder="PRIMARY_ROOT")
+    mirror = InMemoryBackend(name="legacy", root_folder="LEGACY_MIRROR_ROOT")
+    # Explicitly NO mirror.config attribute — exercise the legacy path.
+    if hasattr(mirror, "config"):
+        del mirror.config
+    mirror.root_folder = "LEGACY_MIRROR_ROOT"
+
+    mgr = SnapshotManager(cfg, primary, mirrors=[mirror])
+    assert mgr._root_folder_for(mirror) == "LEGACY_MIRROR_ROOT"
+
+
 # ---------------------------------------------------------------------------
 # 1. Create — both formats
 # ---------------------------------------------------------------------------

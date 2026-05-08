@@ -2098,8 +2098,14 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
             on_local=lambda msg: progress.update(local_task, detail=msg),
             on_remote=lambda msg: progress.update(primary_task, detail=msg),
         )
-        progress.remove_task(local_task)
-        progress.remove_task(primary_task)
+        # Freeze the local + primary rows at their final state so they
+        # stay visible while subsequent mirror walks add their own rows
+        # below. Without this they'd either keep spinning forever (with
+        # total=None) or be removed via remove_task and disappear from
+        # view — both confusing when SFTP listing starts and the user
+        # has lost sight of what the primary already reported.
+        progress.update(local_task, total=1, completed=1)
+        progress.update(primary_task, total=1, completed=1)
 
         for idx, (mirror, name) in enumerate(zip(mirrors, mirror_names)):
             task = progress.add_task(name, total=None,

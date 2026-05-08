@@ -1872,9 +1872,19 @@ def _build_pending_renderable(engine: SyncEngine) -> RenderableType:
         console=console,
         transient=True,
     ) as progress:
-        for idx, (backend, name) in enumerate(zip(engine._mirrors, mirror_names)):
-            task = progress.add_task(name, total=None,
-                                     detail="listing", show_time=(idx == 0))
+        # Add every mirror's row up-front so the user sees all backends
+        # progress simultaneously instead of one-at-a-time.
+        mirror_tasks_p: dict[str, int] = {}
+        for idx, name in enumerate(mirror_names):
+            mirror_tasks_p[name] = progress.add_task(
+                name, total=None, detail="queued",
+                show_time=(idx == 0),
+            )
+
+        def _walk_mirror_pending(args: tuple) -> None:
+            backend, name = args
+            task = mirror_tasks_p[name]
+            progress.update(task, detail="listing")
             try:
                 folder_id = (
                     getattr(backend, "config", None)
@@ -1890,9 +1900,6 @@ def _build_pending_renderable(engine: SyncEngine) -> RenderableType:
                         and not f["relative_path"].startswith(f"{SNAPSHOTS_FOLDER}/")
                         and not f["relative_path"].startswith(f"{BLOBS_FOLDER}/")
                         and not f["relative_path"].startswith(f"{LOGS_FOLDER}/")
-                        # Same exclude_patterns filtering the engine applies
-                        # to its remote listing — otherwise excluded files
-                        # surface as unseeded/deleted, which is wrong.
                         and not engine._is_excluded(f["relative_path"]))
                 }
                 live_files[name] = seen
@@ -1901,6 +1908,16 @@ def _build_pending_renderable(engine: SyncEngine) -> RenderableType:
                 walk_errors[name] = redact_error(str(e))
                 live_files[name] = set()
                 progress.update(task, detail=f"[red]error: {walk_errors[name]}[/]")
+
+        # Walk every mirror in parallel — pre-fix this loop was
+        # sequential, leaving each mirror to wait for its predecessor.
+        # Same fan-out approach as `_build_status_by_backend_renderable`.
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+
+        if engine._mirrors:
+            with _TPE(max_workers=len(engine._mirrors)) as ex:
+                list(ex.map(_walk_mirror_pending,
+                            zip(engine._mirrors, mirror_names)))
 
     pending_by_path: dict[str, list[tuple[str, str, str]]] = {}
     unseeded_by_backend: dict[str, int] = {}
@@ -2094,22 +2111,22 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
                                          total=None, detail="starting…",
                                          show_time=False)
 
-        states = engine.get_status(
-            on_local=lambda msg: progress.update(local_task, detail=msg),
-            on_remote=lambda msg: progress.update(primary_task, detail=msg),
-        )
-        # Freeze the local + primary rows at their final state so they
-        # stay visible while subsequent mirror walks add their own rows
-        # below. Without this they'd either keep spinning forever (with
-        # total=None) or be removed via remove_task and disappear from
-        # view — both confusing when SFTP listing starts and the user
-        # has lost sight of what the primary already reported.
-        progress.update(local_task, total=1, completed=1)
-        progress.update(primary_task, total=1, completed=1)
+        # Add all mirror task rows up-front so the user sees every
+        # backend's progress simultaneously instead of one-at-a-time.
+        mirror_tasks: dict[str, int] = {}
+        for idx, name in enumerate(mirror_names):
+            mirror_tasks[name] = progress.add_task(
+                name, total=None, detail="queued",
+                show_time=False,  # Local already carries the shared timer
+            )
 
-        for idx, (mirror, name) in enumerate(zip(mirrors, mirror_names)):
-            task = progress.add_task(name, total=None,
-                                     detail="listing", show_time=(idx == 0))
+        # Worker that walks one mirror's tree and stuffs results into
+        # `live_files[name]` / `walk_errors[name]` under thread-safe
+        # writes (dict assignment is GIL-atomic in CPython).
+        def _walk_mirror(args: tuple) -> None:
+            mirror, name = args
+            task = mirror_tasks[name]
+            progress.update(task, detail="listing")
             try:
                 folder_id = (
                     getattr(mirror, "config", None)
@@ -2138,6 +2155,43 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
                 walk_errors[name] = redact_error(str(e))
                 live_files[name] = set()
                 progress.update(task, detail=f"[red]error: {walk_errors[name]}[/]")
+
+        # Run engine.get_status() (Local + primary listing) AND every
+        # mirror's list_files_recursive concurrently via a single
+        # ThreadPoolExecutor. Pre-fix the mirror loop ran AFTER
+        # get_status returned, leaving SFTP listing as a tail-latency
+        # bottleneck — user observed Local + GDrive completing in
+        # parallel but SFTP only starting after. Now everything fans
+        # out at once: total wall-clock = max(Local, primary, mirrors)
+        # instead of get_status() + sum(mirror_walks).
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+
+        def _run_get_status() -> list:
+            return engine.get_status(
+                on_local=lambda msg: progress.update(local_task, detail=msg),
+                on_remote=lambda msg: progress.update(primary_task, detail=msg),
+            )
+
+        # +1 worker for engine.get_status, one per mirror.
+        max_workers = 1 + max(1, len(mirrors))
+        with _TPE(max_workers=max_workers) as ex:
+            primary_fut = ex.submit(_run_get_status)
+            mirror_futs = [
+                ex.submit(_walk_mirror, (m, n))
+                for m, n in zip(mirrors, mirror_names)
+            ]
+            states = primary_fut.result()
+            for f in mirror_futs:
+                f.result()  # propagate exceptions; _walk_mirror catches its own
+
+        # Freeze the local + primary rows at their final state so they
+        # stay visible while subsequent table-rendering happens. Mirror
+        # rows are already at their final detail strings from inside
+        # _walk_mirror.
+        progress.update(local_task, total=1, completed=1)
+        progress.update(primary_task, total=1, completed=1)
+        for task in mirror_tasks.values():
+            progress.update(task, total=1, completed=1)
 
     # Map FileSyncState's Status enum to (cell markup, tally key, propagates_to_mirror).
     # When propagates_to_mirror is True, the mirror cell shows the same

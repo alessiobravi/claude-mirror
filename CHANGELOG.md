@@ -4,6 +4,35 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.45] — 2026-05-08
+
+CI on the Linux matrix went green at v0.5.44. This release ships the v0.5.39 quality-of-life batch as the first PUBLISHED stable since v0.5.38.
+
+### Fixed — Test suite is fully green on Linux + macOS, all 4 Python versions
+- v0.5.44's pre-subcommand-banner suppression flipped CI from 13-red to 0-red on every Python in the matrix. v0.5.45 promotes the always-failing `test_DIAG043_streams.py` canary into a real regression test (`test_json_mode_does_not_leak_pre_subcommand_banners`) that asserts `result.stdout == ""` when `status --json` runs against an unauthed config — this catches any future code that re-introduces a banner leak into the JSON stdout path.
+
+### Shipped (cumulative content from v0.5.39 → v0.5.44, now stable)
+- **`claude-mirror restore --dry-run`** — preview what `restore` would write without touching local disk.
+- **`claude-mirror snapshot-diff TS1 TS2`** — show what changed between two snapshots; `--paths` glob filter, `--unified` standard `diff -u` output.
+- **`claude-mirror history PATH --since DATE --until DATE`** — date-range filter on the `history` command.
+- **`--json` output mode** on `status / history / inbox / log / snapshots`. Schema v1: `{"version": 1, "command": "X", "result": {...}}`.
+- **`.claude_mirror_ignore`** project-tree exclusion file (gitignore-style); complements YAML `exclude_patterns`.
+- **`claude-mirror watch --once`** for cron-driven polling.
+- **PowerShell** shell-completion alongside zsh / bash / fish.
+- **`max_upload_kbps`** bandwidth throttle (token-bucket) integrated across all 5 backends.
+- **WebDAV chunked PUT** for large files; replaces the `data=f` pattern that Apache `mod_dav` rejected via chunked-transfer-encoding.
+- **Upload-resume behaviour table** in `docs/admin.md` documenting per-backend resume guarantees.
+
+### Hardening that survived the v0.5.40 → v0.5.44 hotfix chain (stays in place)
+- `_emit_json_success` / `_emit_json_error` use `click.echo` rather than `sys.stdout.write` — Click-aware writer that CliRunner captures identically across platforms.
+- `_JsonMode.__exit__` snapshots and restores `sys.stdout` / `sys.stderr` so any context manager opened during the `with` block (Rich Live, etc.) cannot leave stale stdout wiring.
+- `_JsonMode` no-ops `make_phase_progress` for the duration in `claude_mirror._progress`, `.sync`, and `.snapshots` — defensive against any future Rich Progress that gets opened in a JSON code path.
+- `_CLIGroup.invoke()` skips `_check_watcher_running()` and the update-check fetch when `--json` is anywhere in argv (this was the actual fix; the rest is hardening).
+
+None of v0.5.39 / v0.5.40 / v0.5.41 / v0.5.42 / v0.5.43 / v0.5.44 was tagged or published to PyPI. v0.5.45 is the first publishable release in this batch.
+
+---
+
 ## [0.5.44] — 2026-05-08
 
 The actual fix for v0.5.39's `--json` mode on Linux. v0.5.43's diagnostic captured the smoking gun, and the original "empty stdout" interpretation was wrong.

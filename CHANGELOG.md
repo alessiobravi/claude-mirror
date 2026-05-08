@@ -4,6 +4,14 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.37] — 2026-05-08
+
+### Fixed — README links broken on the PyPI project page
+- After the v0.5.36 doc split, the README's relative `docs/...` / `LICENSE` / `CONTRIBUTING.md` links rendered as broken on `pypi.org/project/claude-mirror/` — PyPI does not resolve relative file paths against any source tree, so every doc link 404'd for users browsing PyPI.
+- All 35 such links in `README.md` rewritten to absolute GitHub URLs of the form `https://github.com/alessiobravi/claude-mirror/blob/main/docs/...`. They render correctly on PyPI now and continue to work on GitHub (an absolute URL is just a regular link). Anchor fragments (`#snapshots-and-disaster-recovery`, `#multi-backend-mirroring-tier-2`, `#d-multi-backend-redundancy-tier-2`) preserved.
+
+---
+
 ## [0.5.36] — 2026-05-08
 
 A documentation refactor + two correctness fixes shipped together. The 2323-line README was split into a sleek 586-line navigation hub plus a `docs/` tree organised by topic; sequential mirror walks in two status renderables were parallelised; and the network error path for unreachable backends is now a clean diagnostic message instead of a Python traceback.

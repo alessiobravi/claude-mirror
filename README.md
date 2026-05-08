@@ -19,7 +19,7 @@ Built originally for Claude Code projects (where most context lives in markdown)
 
 **Supported backends:** Google Drive, Dropbox, Microsoft OneDrive, any WebDAV server (Nextcloud, OwnCloud, Apache mod_dav, Synology/QNAP NAS, Box.com, etc.), and any SFTP/SSH-accessible server (VPS, NAS, shared hosting, self-hosted Linux). Each project picks its own primary backend independently — different projects on the same machine can use different backends.
 
-**Quality gates:** Every commit and pull request runs **361 automated tests** on Python 3.11, 3.12, 3.13, and 3.14 in parallel via GitHub Actions — covering the 3-way diff sync core, both snapshot formats, path-traversal safety, conflict resolution, auth flows, all five backends (with HTTP-level / SSH-level mocking), the notifier inbox under concurrent writers, and the watcher daemon's SIGHUP hot-reload. CI must be green before any PR can merge. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the test conventions and how to run them locally.
+**Quality gates:** Every commit and pull request runs **361 automated tests** on Python 3.11, 3.12, 3.13, and 3.14 in parallel via GitHub Actions — covering the 3-way diff sync core, both snapshot formats, path-traversal safety, conflict resolution, auth flows, all five backends (with HTTP-level / SSH-level mocking), the notifier inbox under concurrent writers, and the watcher daemon's SIGHUP hot-reload. CI must be green before any PR can merge. See [`CONTRIBUTING.md`](https://github.com/alessiobravi/claude-mirror/blob/main/CONTRIBUTING.md) for the test conventions and how to run them locally.
 
 ---
 
@@ -31,24 +31,24 @@ Built originally for Claude Code projects (where most context lives in markdown)
   - **Google Drive** — Cloud Pub/Sub streaming (sub-second latency)
   - **Dropbox** — `files/list_folder/longpoll` (seconds latency)
   - **OneDrive / WebDAV / SFTP** — periodic polling (default 30s, configurable)
-- Conflicts (both sides changed) are resolved interactively: keep local, keep remote, or open in `$EDITOR` — see [docs/conflict-resolution.md](docs/conflict-resolution.md)
-- A snapshot is saved after every push or sync, enabling point-in-time recovery — see [docs/admin.md](docs/admin.md#snapshots-and-disaster-recovery)
-- **Multi-backend mirroring (Tier 2)** — push to multiple backends simultaneously (e.g. Drive + SFTP), with per-backend retry, classified error handling, and snapshot mirroring — see [docs/admin.md](docs/admin.md#multi-backend-mirroring-tier-2) and [docs/scenarios.md](docs/scenarios.md#d-multi-backend-redundancy-tier-2)
+- Conflicts (both sides changed) are resolved interactively: keep local, keep remote, or open in `$EDITOR` — see [docs/conflict-resolution.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/conflict-resolution.md)
+- A snapshot is saved after every push or sync, enabling point-in-time recovery — see [docs/admin.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md#snapshots-and-disaster-recovery)
+- **Multi-backend mirroring (Tier 2)** — push to multiple backends simultaneously (e.g. Drive + SFTP), with per-backend retry, classified error handling, and snapshot mirroring — see [docs/admin.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md#multi-backend-mirroring-tier-2) and [docs/scenarios.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/scenarios.md#d-multi-backend-redundancy-tier-2)
 - Optional **Slack** notifications on push/pull/sync/delete (per-project, opt-in, webhook-based)
 
 ---
 
 ## Supported storage backends
 
-Each backend ships in the base install — `pipx install claude-mirror` enables all five. Per-backend setup walkthroughs live under [docs/backends/](docs/backends/):
+Each backend ships in the base install — `pipx install claude-mirror` enables all five. Per-backend setup walkthroughs live under [docs/backends/](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/):
 
 | Backend | Latency | Setup | Reference |
 |---|---|---|---|
-| **Google Drive** | sub-second (Pub/Sub gRPC) | OAuth2 + GCP project (Drive API + Pub/Sub API) | [docs/backends/google-drive.md](docs/backends/google-drive.md) |
-| **Dropbox** | seconds (long-poll) | OAuth2 PKCE + Dropbox app | [docs/backends/dropbox.md](docs/backends/dropbox.md) |
-| **OneDrive** | up to `poll_interval` (default 30s) | Device-code OAuth2 + Azure AD app | [docs/backends/onedrive.md](docs/backends/onedrive.md) |
-| **WebDAV** | up to `poll_interval` (default 30s) | URL + username + app password (Nextcloud, OwnCloud, NAS, Apache mod_dav, Box, Synology, QNAP, ...) | [docs/backends/webdav.md](docs/backends/webdav.md) |
-| **SFTP** | up to `poll_interval` (default 30s) | SSH key (preferred) or password — any OpenSSH-accessible server | [docs/backends/sftp.md](docs/backends/sftp.md) |
+| **Google Drive** | sub-second (Pub/Sub gRPC) | OAuth2 + GCP project (Drive API + Pub/Sub API) | [docs/backends/google-drive.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/google-drive.md) |
+| **Dropbox** | seconds (long-poll) | OAuth2 PKCE + Dropbox app | [docs/backends/dropbox.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/dropbox.md) |
+| **OneDrive** | up to `poll_interval` (default 30s) | Device-code OAuth2 + Azure AD app | [docs/backends/onedrive.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/onedrive.md) |
+| **WebDAV** | up to `poll_interval` (default 30s) | URL + username + app password (Nextcloud, OwnCloud, NAS, Apache mod_dav, Box, Synology, QNAP, ...) | [docs/backends/webdav.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/webdav.md) |
+| **SFTP** | up to `poll_interval` (default 30s) | SSH key (preferred) or password — any OpenSSH-accessible server | [docs/backends/sftp.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/sftp.md) |
 
 ---
 
@@ -134,22 +134,22 @@ claude-mirror update --apply            # auto-detects PyPI vs editable; uses pi
 
 ## Documentation index
 
-The trimmed README covers install, your first project, daily-usage cheatsheet, notifications, and troubleshooting. Everything else lives under [`docs/`](docs/):
+The trimmed README covers install, your first project, daily-usage cheatsheet, notifications, and troubleshooting. Everything else lives under [`docs/`](https://github.com/alessiobravi/claude-mirror/blob/main/docs/):
 
 **Backends** (per-backend setup, config fields, troubleshooting):
-- [docs/backends/google-drive.md](docs/backends/google-drive.md) — Google Cloud project, Drive API, Pub/Sub, OAuth2 setup
-- [docs/backends/dropbox.md](docs/backends/dropbox.md) — Dropbox app registration, OAuth2 PKCE
-- [docs/backends/onedrive.md](docs/backends/onedrive.md) — Azure AD app, device-code login
-- [docs/backends/webdav.md](docs/backends/webdav.md) — Nextcloud / OwnCloud / NAS / Apache mod_dav
-- [docs/backends/sftp.md](docs/backends/sftp.md) — SSH keys, host fingerprints, OpenSSH
+- [docs/backends/google-drive.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/google-drive.md) — Google Cloud project, Drive API, Pub/Sub, OAuth2 setup
+- [docs/backends/dropbox.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/dropbox.md) — Dropbox app registration, OAuth2 PKCE
+- [docs/backends/onedrive.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/onedrive.md) — Azure AD app, device-code login
+- [docs/backends/webdav.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/webdav.md) — Nextcloud / OwnCloud / NAS / Apache mod_dav
+- [docs/backends/sftp.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/sftp.md) — SSH keys, host fingerprints, OpenSSH
 
 **Operations & admin**:
-- [docs/admin.md](docs/admin.md) — snapshots, retention, `gc` / `prune` / `forget`, doctor, watcher service, multi-backend Tier 2 setup, auto-start
-- [docs/conflict-resolution.md](docs/conflict-resolution.md) — interactive conflict prompts, `$EDITOR` merge, three-way diff
-- [docs/cli-reference.md](docs/cli-reference.md) — every command, every flag
+- [docs/admin.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md) — snapshots, retention, `gc` / `prune` / `forget`, doctor, watcher service, multi-backend Tier 2 setup, auto-start
+- [docs/conflict-resolution.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/conflict-resolution.md) — interactive conflict prompts, `$EDITOR` merge, three-way diff
+- [docs/cli-reference.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/cli-reference.md) — every command, every flag
 
 **Topology guides** (pick the one that matches your situation):
-- [docs/scenarios.md](docs/scenarios.md) — seven deployment topologies, end to end:
+- [docs/scenarios.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/scenarios.md) — seven deployment topologies, end to end:
   - **A. Standalone** — local ↔ 1 backend
   - **B. Personal multi-machine** — local ⇄ 1 backend ⇄ local'
   - **C. Multi-user collaboration** — Alice ⇄ shared backend ⇄ Bob
@@ -193,7 +193,7 @@ Then authenticate (opens a browser window):
 claude-mirror auth
 ```
 
-Detailed setup of the GCP project, OAuth consent screen, Drive folder, and Pub/Sub topic — including how to invite collaborators — lives in [docs/backends/google-drive.md](docs/backends/google-drive.md).
+Detailed setup of the GCP project, OAuth consent screen, Drive folder, and Pub/Sub topic — including how to invite collaborators — lives in [docs/backends/google-drive.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/google-drive.md).
 
 ### Option 2 — SFTP
 
@@ -218,7 +218,7 @@ File patterns [**/*.md]:
 Save this configuration? [Y/n]:
 ```
 
-No interactive auth step — the wizard validates the SSH connection and host fingerprint immediately. Set up the remote root path and SSH key permissions ahead of time; full walkthrough at [docs/backends/sftp.md](docs/backends/sftp.md).
+No interactive auth step — the wizard validates the SSH connection and host fingerprint immediately. Set up the remote root path and SSH key permissions ahead of time; full walkthrough at [docs/backends/sftp.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/sftp.md).
 
 ### After init: push your first batch
 
@@ -233,7 +233,7 @@ claude-mirror push       # upload the local-ahead files; creates a snapshot
 
 Repeat `init --wizard` once per project. Every project gets its own config file at `~/.config/claude_mirror/<project>.yaml`. Different projects on the same machine can use different backends — Drive for one, SFTP for another, WebDAV for a third. All commands auto-detect the right config from the current working directory.
 
-For team-shared / multi-backend / multi-user setups, see [docs/scenarios.md](docs/scenarios.md).
+For team-shared / multi-backend / multi-user setups, see [docs/scenarios.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/scenarios.md).
 
 ---
 
@@ -257,9 +257,9 @@ claude-mirror log                       # who pushed what, when, across machines
 claude-mirror inbox                     # show + clear pending notifications
 ```
 
-Snapshot, restore, and admin commands (`history`, `snapshots`, `restore`, `prune`, `gc`, `forget`, `doctor`, `seed-mirror`, `migrate-state`) live in [docs/cli-reference.md](docs/cli-reference.md), with operational guidance in [docs/admin.md](docs/admin.md).
+Snapshot, restore, and admin commands (`history`, `snapshots`, `restore`, `prune`, `gc`, `forget`, `doctor`, `seed-mirror`, `migrate-state`) live in [docs/cli-reference.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/cli-reference.md), with operational guidance in [docs/admin.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md).
 
-Conflict resolution flow (interactive `keep local / keep remote / merge / skip` prompt) is documented in [docs/conflict-resolution.md](docs/conflict-resolution.md).
+Conflict resolution flow (interactive `keep local / keep remote / merge / skip` prompt) is documented in [docs/conflict-resolution.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/conflict-resolution.md).
 
 ---
 
@@ -308,7 +308,7 @@ Claude will detect the config for your current working directory, report any pen
 
 You can also ask in natural language: "push my changes", "pull the latest", "sync everything", "what's different in this file?", "show me the snapshots", "restore to 10:30 this morning", "clean up old snapshots", "what changed recently".
 
-For background and persistent-service setup of `claude-mirror watch-all`, see [docs/admin.md#auto-start-the-watcher](docs/admin.md#auto-start-the-watcher).
+For background and persistent-service setup of `claude-mirror watch-all`, see [docs/admin.md#auto-start-the-watcher](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md#auto-start-the-watcher).
 
 ### Recommended project memory directives
 
@@ -480,7 +480,7 @@ The check fetches `https://raw.githubusercontent.com/alessiobravi/claude-mirror/
 
 ## Troubleshooting
 
-The most common gotchas are listed here. For backend-specific errors (Drive auth, Dropbox/OneDrive token cache, WebDAV `MKCOL`, SFTP host fingerprint), see the per-backend docs under [docs/backends/](docs/backends/).
+The most common gotchas are listed here. For backend-specific errors (Drive auth, Dropbox/OneDrive token cache, WebDAV `MKCOL`, SFTP host fingerprint), see the per-backend docs under [docs/backends/](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/).
 
 ### `RefreshError: Reauthentication is needed` (Google Drive)
 
@@ -488,7 +488,7 @@ The OAuth refresh token has expired or been revoked. The error mentions `gcloud`
 
 **Fix:** `claude-mirror auth --config ~/.config/claude_mirror/<project>.yaml` — opens a browser for fresh OAuth login. The stale token is replaced; the rest of the config is preserved.
 
-For "auth expires every day or two" symptoms (caused by the OAuth consent screen sitting in `Testing` mode, or Workspace Cloud Session Control settings), see the in-depth diagnosis in [docs/backends/google-drive.md](docs/backends/google-drive.md).
+For "auth expires every day or two" symptoms (caused by the OAuth consent screen sitting in `Testing` mode, or Workspace Cloud Session Control settings), see the in-depth diagnosis in [docs/backends/google-drive.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/google-drive.md).
 
 ### `Not authenticated. Run claude-mirror auth first.`
 
@@ -510,7 +510,7 @@ The MSAL token cache is missing, corrupted, or its refresh token has been revoke
 
 ### SFTP: host fingerprint or permission errors
 
-See [docs/backends/sftp.md](docs/backends/sftp.md) for the full troubleshooting flow (`~/.ssh/known_hosts` updates, `internal-sftp`-jailed accounts, server-side `sha256sum` fallback).
+See [docs/backends/sftp.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/sftp.md) for the full troubleshooting flow (`~/.ssh/known_hosts` updates, `internal-sftp`-jailed accounts, server-side `sha256sum` fallback).
 
 ### `claude-mirror doctor`
 
@@ -520,7 +520,7 @@ For end-to-end self-test (config + creds + connectivity + backends + manifest sa
 claude-mirror doctor
 ```
 
-See [docs/admin.md](docs/admin.md) for related operational guidance and [docs/cli-reference.md](docs/cli-reference.md) for the full flag list.
+See [docs/admin.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md) for related operational guidance and [docs/cli-reference.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/cli-reference.md) for the full flag list.
 
 ---
 
@@ -575,7 +575,7 @@ If you do not accept these terms, do not download or run claude-mirror.
 
 ## License
 
-claude-mirror is free software released under the **GNU General Public License, version 3 or later** (GPL-3.0-or-later). The full text is in [LICENSE](./LICENSE).
+claude-mirror is free software released under the **GNU General Public License, version 3 or later** (GPL-3.0-or-later). The full text is in [LICENSE](https://github.com/alessiobravi/claude-mirror/blob/main/LICENSE).
 
 In short:
 
@@ -583,4 +583,4 @@ In short:
 - If you distribute a modified version (or any work that incorporates claude-mirror's source), you must release your changes under the same GPL-3.0-or-later license and make the corresponding source available to recipients.
 - claude-mirror comes with **NO WARRANTY**, to the extent permitted by applicable law (see the Disclaimer above and Sections 15–17 of the GPL).
 
-For the formal terms, see [LICENSE](./LICENSE) or [gnu.org/licenses/gpl-3.0](https://www.gnu.org/licenses/gpl-3.0.html).
+For the formal terms, see [LICENSE](https://github.com/alessiobravi/claude-mirror/blob/main/LICENSE) or [gnu.org/licenses/gpl-3.0](https://www.gnu.org/licenses/gpl-3.0.html).

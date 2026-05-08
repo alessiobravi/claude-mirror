@@ -4,6 +4,51 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.38] — 2026-05-08
+
+Three small quality-of-life improvements landed together via three parallel agents in worktree isolation: opinionated retention defaults at `init`, PyPI-primary update-check, and full documentation of the existing `doctor` command.
+
+### Added — Snapshot retention defaults at `init`
+- `claude-mirror init --wizard` (and the non-wizard flag-driven path) now write `keep_last: 10`, `keep_daily: 7`, `keep_monthly: 12`, `keep_yearly: 3` into newly created project YAMLs. Both paths share a single `Config(...)` constructor at `cli.py:1364`, so one edit covers both.
+- The dataclass defaults stay at `0` — pre-existing YAMLs that omit these fields still load with all-zero retention (back-compat preserved). The new defaults only land in YAMLs created by `init` going forward.
+- After the next `push`, the engine automatically prunes snapshots outside the keep-set (no extra confirmation; setting the YAML field IS the consent — same opt-in semantics that have been there since v0.5.32).
+- Rationale for these specific values: ≈ "10 newest + one per day for last week + one per month for last year + one per year for last 3 years". Generous enough to cover normal recovery scenarios, opinionated enough to prevent disk bloat that Scenario A in `docs/scenarios.md` flags as a real-world pitfall.
+- 2 new tests in `tests/test_retention_defaults.py` (offline, <100ms): the YAML written by `init` contains the four `keep_*` keys with expected values; legacy YAMLs lacking these fields still load with `0`.
+
+### Changed — Update-check fetches from PyPI first
+- `claude_mirror/_update_check.py` now walks a three-stage chain: **PyPI JSON API** (`https://pypi.org/pypi/claude-mirror/json`, the only authoritative answer to "is the wheel installable right now?") → **GitHub Contents API** (catches very recent tags before the wheel finishes uploading) → **raw CDN** (last fallback when both APIs are blocked).
+- Each stage runs only if the previous raised. Cache file gains a `last_source: "pypi" | "github_api" | "raw_cdn"` field for future `--verbose` diagnostics; old cache files (without the field) still parse fine.
+- Closes the user-visible gap where a freshly-pushed tag triggered an "upgrade available" prompt seconds before the PyPI wheel finished uploading — `pipx upgrade` would then fail. The new ordering reports a version only when it's actually installable.
+- New `_fetch_via_pypi()`, new `_fetch_remote_version_with_source() -> (version, source_name)`. The legacy `_fetch_remote_version()` is preserved as a thin wrapper for any caller that doesn't need the source attribution.
+- 5 new tests in `tests/test_update_check.py` (offline, deterministic, <100ms each): PyPI primary success path; PyPI down → GitHub API success; PyPI + GitHub API down → CDN success; total network failure → `None` (no notice fired); PyPI returns malformed JSON → falls through to GitHub API. The existing `test_update_check_silent_on_network_error` regression in `tests/test_load_paths_narrow.py` continues to pass.
+- README "Update notifications" section updated to describe the new layered approach.
+- No new dependencies — `urllib` only.
+
+### Documentation — `doctor` command fully documented
+- `docs/admin.md` gains a new top-level `## Doctor` H2 section (137 lines) documenting the existing `claude-mirror doctor` command (implemented at `claude_mirror/cli.py:4175-4724`, untouched). Sections: overview paragraph, full check matrix grouped by category (Configuration / Credentials / Tokens / Connectivity / SFTP-specific aux / Project path / Manifest integrity), sample successful output, sample failure output, exit codes (0 on all-pass, 1 on any failure — composes with shell scripts and CI), three common invocations, cross-links to all five backend setup pages plus `conflict-resolution.md` and `cli-reference.md#doctor`.
+- Documents five behaviours the command's docstring elided: Tier 2 mirror-config-load failures recorded as separate Check 1 failures; `--backend` filter prints a dim "skipped" line for non-matching backends; the connectivity check classifies exceptions into AUTH / PERMISSION / FILE_REJECTED+404 / TRANSIENT / unknown buckets via `classify_error` and renders different fix-hints per bucket; SFTP-specific auxiliary checks (key file readable, known_hosts presence, plaintext-password advisory) run regardless of connectivity outcome; plaintext-password and `sftp_strict_host_check: false` cases are advisories (yellow warning, not failures).
+- README's troubleshooting section: replaced the soft-link "see docs/admin.md for related operational guidance" with a hard anchor link `docs/admin.md#doctor` — restoring the anchor that was soft-linked in v0.5.36 because the section didn't exist yet.
+- `docs/cli-reference.md` gains a `### doctor` entry under "Maintenance" with the two flags and a link to `admin.md#doctor` for depth.
+- All `.md` link targets verified via the v0.5.36 audit script — broken=0.
+
+### Updated docs/files
+- `claude_mirror/cli.py` (retention defaults at the shared `Config(...)` constructor).
+- `claude_mirror/_update_check.py` (PyPI-primary fetch chain).
+- `tests/test_retention_defaults.py` (new, 2 tests).
+- `tests/test_update_check.py` (new, 5 tests).
+- `docs/admin.md` (new `## Doctor` section + new "Retention defaults at init" subsection inside "Auto-pruning by retention policy").
+- `docs/cli-reference.md` (new `doctor` entry).
+- `README.md` (Update notifications layered description, doctor anchor restored).
+- `pyproject.toml` (version 0.5.37 → 0.5.38).
+
+### Tests
+- `pytest tests/` — **368 passed in ~2s** (361 + 2 retention + 5 update-check). All offline, all deterministic.
+
+### Process note
+- Three agents worked in parallel via `isolation: "worktree"`. Zero file overlap inside each agent's scope; the only shared files (`docs/admin.md`, `README.md`) had non-overlapping section ownership and merged cleanly via `git cherry-pick` with no manual conflict resolution.
+
+---
+
 ## [0.5.37] — 2026-05-08
 
 ### Fixed — README links broken on the PyPI project page

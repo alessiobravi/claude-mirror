@@ -624,6 +624,96 @@ The `.claude_mirror_ignore` file itself is auto-excluded from sync — the rules
 
 For broader selective-sync guidance — picking what to mirror in the first place — see [Scenario F in scenarios.md](scenarios.md#f-selective-sync).
 
+## Notifications
+
+claude-mirror can post every sync event (push / pull / sync / delete) to one or more team chat / automation backends. All four are **per-project**, **opt-in**, and **best-effort**: a notification failure (network error, bad URL, 4xx, 5xx) never blocks or fails a sync. The Slack integration is the most feature-rich (rich blocks, per-backend status, ACTION REQUIRED alerts on permanent failures); the others are simpler one-shot webhooks.
+
+Multiple backends can be enabled simultaneously on the same project — every enabled webhook fires on every event, in sequence. One backend's failure does not stop the others.
+
+| Backend | When to pick it | URL form |
+|---|---|---|
+| **Slack** | Team chat in Slack; want rich-block formatting + per-mirror status + permanent-failure alerts | `https://hooks.slack.com/services/T.../B.../...` |
+| **Discord** | Team chat in Discord; want a coloured embed card per event | `https://discord.com/api/webhooks/{id}/{token}` |
+| **Microsoft Teams** | Team chat in Teams; legacy connector or modern Workflows webhook | `https://outlook.office.com/webhook/...` or `https://{tenant}.webhook.office.com/...` |
+| **Generic** | Wiring claude-mirror into n8n / Make / Zapier / a custom dashboard / an internal Slack-replacement | Any URL — claude-mirror POSTs a schema-stable JSON envelope and lets you add custom auth headers |
+
+### Slack
+
+See [README — Slack notifications](../README.md#slack-notifications) for the full webhook setup. Slack's payload includes the per-backend status block (Tier 2 multi-backend) and the `ACTION REQUIRED` header on permanent failures — the other three backends do not (yet). Config fields: `slack_enabled`, `slack_webhook_url`, `slack_channel`.
+
+### Discord
+
+1. In your Discord server: **Server Settings → Integrations → Webhooks → New Webhook**, pick the target channel, copy the **Webhook URL**.
+2. Add to your project YAML:
+
+```yaml
+discord_enabled: true
+discord_webhook_url: https://discord.com/api/webhooks/123456789012345678/abcdefghijklmnopqrstuvwxyz1234567890
+```
+
+Each event renders as a single embed card: green stripe for `push`, blue for `pull` / `sync`, red for `delete`. The card carries Action / User / Machine / Project / Files fields; the file list is capped at 10 entries with an `and N more` sentinel for larger pushes.
+
+### Microsoft Teams
+
+Two URL forms work — both accept the **MessageCard** schema:
+
+- **Legacy Office 365 connector** (`https://outlook.office.com/webhook/...`) — set up via the channel's `...` menu → **Connectors → Incoming Webhook**. Microsoft has been deprecating connectors; new tenants may not be able to create them.
+- **Workflows-based webhook** (`https://{tenant}.webhook.office.com/...`) — the recommended modern path. Use Power Automate's "Post to a channel when a webhook request is received" template and copy the resulting URL.
+
+Add to your project YAML:
+
+```yaml
+teams_enabled: true
+teams_webhook_url: https://outlook.office.com/webhook/abcd1234-5678-90ab-cdef-1234567890ab/IncomingWebhook/0123456789abcdef0123456789abcdef/abcd1234-5678-90ab-cdef-1234567890ab
+```
+
+Each event renders as a single MessageCard. The `themeColor` matches Discord's colour logic (green / blue / red); the activity title carries the headline; facts list breaks out Action / User / Machine / Project; the body holds the file list (capped at 10 with `and N more`).
+
+### Generic
+
+Use this for any HTTP endpoint that accepts a JSON `POST` body — n8n, Make, Zapier, a custom internal service, etc. claude-mirror sends a **schema-stable v1 envelope**:
+
+```json
+{
+  "version": 1,
+  "event": "push",
+  "user": "alice",
+  "machine": "laptop",
+  "project": "myproject",
+  "files": ["memory/notes.md", "CLAUDE.md"],
+  "timestamp": "2026-05-08T12:00:00+00:00"
+}
+```
+
+The schema is additive-only: future versions will add fields, never rename or remove the ones above, so a downstream consumer pinned to v1 keeps working. Add to your project YAML:
+
+```yaml
+webhook_enabled: true
+webhook_url: https://n8n.example.com/webhook/claude-mirror-sync
+webhook_extra_headers:
+  Authorization: Bearer your-static-token-here
+  X-Tenant-ID: tenant-42
+```
+
+Every header in `webhook_extra_headers` is set on the outgoing request, so this is also how you attach a Bearer token, a custom routing header, or anything else your endpoint requires.
+
+### Config-field summary
+
+| Field | Type | Default | Purpose |
+|---|---|---|---|
+| `slack_enabled` | bool | `false` | Master switch for Slack posts. |
+| `slack_webhook_url` | str | `""` | Slack incoming-webhook URL. |
+| `slack_channel` | str | `""` | Optional Slack channel override. |
+| `discord_enabled` | bool | `false` | Master switch for Discord posts. |
+| `discord_webhook_url` | str | `""` | Discord incoming-webhook URL. |
+| `teams_enabled` | bool | `false` | Master switch for Teams posts. |
+| `teams_webhook_url` | str | `""` | Teams incoming-webhook URL (legacy connector or Workflows). |
+| `webhook_enabled` | bool | `false` | Master switch for the generic JSON webhook. |
+| `webhook_url` | str | `""` | Arbitrary `POST` target for the generic envelope. |
+| `webhook_extra_headers` | dict / null | `null` | Extra HTTP headers for the generic webhook (auth tokens, tenant IDs). |
+
+All four are independent — enable Slack and Discord and Generic together if you want; each runs on every event.
+
 ## Multi-backend mirroring (Tier 2)
 
 A single project can be synced to multiple storage backends at the same time. Push uploads to all of them in parallel, snapshots are mirrored across all of them (configurable), and pull / status read from the primary. If a mirror fails transiently it is retried automatically on the next push; permanent failures are quarantined and surfaced via `claude-mirror status --pending` and the desktop / Slack notifiers.

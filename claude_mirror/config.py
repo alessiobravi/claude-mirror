@@ -59,6 +59,25 @@ class Config:
     slack_enabled: bool = False
     slack_webhook_url: str = ""
     slack_channel: str = ""    # override channel (optional, webhook default used if empty)
+    # Discord notifications (optional, per-project) — POSTs an embed card
+    # to a Discord incoming webhook (https://discord.com/api/webhooks/{id}/{token}).
+    # Same opt-in / best-effort contract as Slack: failures never block sync.
+    discord_enabled: bool = False
+    discord_webhook_url: str = ""
+    # Microsoft Teams notifications (optional, per-project) — POSTs a
+    # MessageCard payload to a Teams incoming webhook (legacy connector at
+    # outlook.office.com/webhook/... OR the newer {tenant}.webhook.office.com/...
+    # form). Same opt-in / best-effort contract as Slack and Discord.
+    teams_enabled: bool = False
+    teams_webhook_url: str = ""
+    # Generic webhook (optional, per-project) — POSTs a schema-stable JSON
+    # envelope (version 1: event/user/machine/project/files/timestamp) to
+    # any URL. Designed for n8n / Make / Zapier / internal endpoints that
+    # need a stable structured payload. `webhook_extra_headers` carries
+    # auth tokens (e.g. {"Authorization": "Bearer abc"}) onto the request.
+    webhook_enabled: bool = False
+    webhook_url: str = ""
+    webhook_extra_headers: Optional[dict[str, str]] = None
     # Snapshot format:
     #   "full"  — every snapshot is a full server-side copy of the project tree
     #             into _claude_mirror_snapshots/{ts}/ (legacy default for existing

@@ -1934,6 +1934,54 @@ class SyncEngine:
             }
         return result
 
+    def _dispatch_extra_webhooks(self, event: SyncEvent) -> None:
+        """Fire Discord, Teams, and Generic webhook notifiers for ``event``.
+
+        Each backend is checked independently — one being misconfigured
+        cannot suppress the others. Lazy import keeps the cold-start
+        cost off code paths that never publish events. Every call is
+        wrapped so a notifier raising (which the abstraction tries hard
+        not to do) cannot break sync.
+        """
+        cfg = self.config
+        # Lazy import: the webhooks module pulls in urllib.request, which
+        # is cheap, but we still skip the import entirely when no
+        # additional backend is enabled — keeps `claude-mirror inbox`
+        # and other non-publishing commands free of the cost.
+        if not (
+            getattr(cfg, "discord_enabled", False)
+            or getattr(cfg, "teams_enabled", False)
+            or getattr(cfg, "webhook_enabled", False)
+        ):
+            return
+        try:
+            from .notifications.webhooks import (
+                DiscordWebhookNotifier,
+                GenericWebhookNotifier,
+                TeamsWebhookNotifier,
+            )
+        except Exception:
+            return  # best-effort — never let an import error break sync
+
+        if cfg.discord_enabled and cfg.discord_webhook_url:
+            try:
+                DiscordWebhookNotifier(cfg.discord_webhook_url).notify(event)
+            except Exception:
+                pass  # best-effort
+        if cfg.teams_enabled and cfg.teams_webhook_url:
+            try:
+                TeamsWebhookNotifier(cfg.teams_webhook_url).notify(event)
+            except Exception:
+                pass  # best-effort
+        if cfg.webhook_enabled and cfg.webhook_url:
+            try:
+                GenericWebhookNotifier(
+                    cfg.webhook_url,
+                    extra_headers=cfg.webhook_extra_headers,
+                ).notify(event)
+            except Exception:
+                pass  # best-effort
+
     def _surface_quarantine(self, files_in_event: list[str]) -> None:
         """Surface permanent-failure backends to desktop + Slack.
 
@@ -2038,6 +2086,16 @@ class SyncEngine:
                 )
             except Exception:
                 pass  # best-effort
+
+        # Additional webhook notifiers — Discord, Microsoft Teams, and a
+        # generic JSON-envelope endpoint. Each runs sequentially and
+        # independently: a failure on one does not block any of the
+        # others, and none of them can ever raise out into the sync
+        # path. Sequential is fine because each call is best-effort
+        # with a short timeout (5s) and we already accept Slack's
+        # latency cost on this path. Webhooks fire only when their
+        # respective `*_enabled` flag is set AND the URL is non-empty.
+        self._dispatch_extra_webhooks(event)
 
         # Desktop notification on permanent failure — independent of
         # Slack so the user sees it regardless of channel config.

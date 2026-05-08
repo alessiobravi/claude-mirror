@@ -497,11 +497,28 @@ webdav_streaming_threshold_bytes: 4194304
 
 Ignored by the four other backends (each has its own native chunking story documented in [admin.md — Upload resume behaviour by backend](admin.md#upload-resume-behaviour-by-backend)).
 
+### Notification webhook fields
+
+claude-mirror can post sync events to Slack, Discord, Microsoft Teams, and any generic JSON-receiving URL. All four are independent and opt-in; failures never block a sync. Full setup walkthroughs in [admin.md — Notifications](admin.md#notifications).
+
+| Field | Type | Default | Purpose |
+|---|---|---|---|
+| `discord_enabled` | bool | `false` | Master switch for Discord webhook posts. |
+| `discord_webhook_url` | str | `""` | Discord incoming-webhook URL — `https://discord.com/api/webhooks/{id}/{token}`. |
+| `teams_enabled` | bool | `false` | Master switch for Microsoft Teams webhook posts. |
+| `teams_webhook_url` | str | `""` | Teams incoming-webhook URL — legacy `outlook.office.com/webhook/...` form OR the modern `{tenant}.webhook.office.com/...` form. |
+| `webhook_enabled` | bool | `false` | Master switch for the generic JSON webhook (n8n / Make / Zapier / custom endpoints). |
+| `webhook_url` | str | `""` | Arbitrary URL that receives the schema-stable v1 JSON envelope on every event. |
+| `webhook_extra_headers` | dict[str,str] / null | `null` | Extra HTTP headers attached to every generic-webhook request — typically auth tokens (`Authorization: Bearer ...`) or routing headers (`X-Tenant-ID: ...`). |
+
+Slack-specific fields (`slack_enabled`, `slack_webhook_url`, `slack_channel`) are covered in [README — Slack notifications](../README.md#slack-notifications).
+
 ---
 
 ## See also
 
-- [admin.md](admin.md) — snapshots, retention, watcher daemon.
+- [admin.md](admin.md) — snapshots, retention, watcher daemon, notifications.
 - [conflict-resolution.md](conflict-resolution.md) — what `sync` does when both sides changed.
 - [README — Daily usage](../README.md#part-4--daily-usage) — narrative walkthrough of the daily commands.
 - [README — Slack notifications](../README.md#slack-notifications) — Slack-specific config and webhook setup.
+- [admin.md — Notifications](admin.md#notifications) — Discord, Teams, and Generic webhook setup.

@@ -161,6 +161,19 @@ claude-mirror prune --keep-last 5 --keep-monthly 12 --delete --yes
 
 `prune` is dry-run by default and requires both `--delete` AND a typed `YES` confirmation (or `--yes` for non-interactive use) — same safety contract as `forget` and `gc`. Any `--keep-*` flag overrides the corresponding config field for that one run only.
 
+#### Retention defaults at init
+
+Since v0.5.38, `claude-mirror init` writes a sensible retention policy into every newly created YAML so the prune path has something to act on out of the box:
+
+```yaml
+keep_last:    10         # 10 newest snapshots, regardless of age
+keep_daily:   7          # plus one per day for the last week
+keep_monthly: 12         # plus one per month for the last year
+keep_yearly:  3          # plus one per year for the last 3 years
+```
+
+These kick in on the next successful `claude-mirror push` (or whenever `prune` is run). To use a different policy, edit the YAML directly or pass `--keep-*` flags to `prune` for a one-off override. To disable retention entirely, set every field to `0`. Pre-existing project YAMLs are not modified — configs without these fields continue to mean "no retention" (the dataclass defaults remain `0`), which closes out the Scenario A pitfall in [`docs/scenarios.md`](scenarios.md).
+
 ### Search the archive for a file's version history
 
 When you want to find the right snapshot to restore from, `claude-mirror history PATH` scans every snapshot's manifest and reports which ones contain the file. For `blobs` snapshots, the SHA-256 lets it label distinct versions (v1, v2, ...) so you can spot when the file actually changed:

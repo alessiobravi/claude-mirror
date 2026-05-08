@@ -1392,6 +1392,18 @@ def init(
         credentials_file=credentials_file,
         token_file=token_file,
         backend=backend,
+        # Sensible snapshot-retention defaults written into every newly
+        # initialised YAML so the prune command has a policy to act on
+        # the first time it runs. Pre-existing configs are unchanged —
+        # the dataclass defaults remain 0 (= disabled) so omitting these
+        # fields from a hand-written YAML still means "no retention".
+        # Roughly: keep 10 newest + last week of dailies + last year of
+        # monthlies + last 3 years of yearlies. Edit the YAML or pass
+        # --keep-* to `claude-mirror prune` to override.
+        keep_last=10,
+        keep_daily=7,
+        keep_monthly=12,
+        keep_yearly=3,
     )
     config.save(config_path)
     console.print(f"[green]Config saved to:[/]     {config_path}")

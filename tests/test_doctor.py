@@ -401,9 +401,15 @@ def test_doctor_backend_filter_limits_checks(
     primary_creds = tmp_path / "primary_credentials.json"
     primary_creds.write_text("{}")
 
-    # Mirror: dropbox
+    # Mirror: dropbox — token JSON gets a refresh_token + scope so the
+    # v0.5.48 dropbox deep checks accept it; the YAML carries a valid
+    # app key for the same reason.
     mirror_token = tmp_path / "mirror_token.json"
-    _write_token(mirror_token)
+    mirror_token.write_text(json.dumps({
+        "app_key": "uao2pmhc0xgg2xj",
+        "refresh_token": "fake-refresh-token",
+        "scope": "files.content.read files.content.write account_info.read",
+    }))
     mirror_creds = tmp_path / "mirror_credentials.json"
     mirror_creds.write_text("{}")
     mirror_cfg_path = _write_config(
@@ -412,7 +418,10 @@ def test_doctor_backend_filter_limits_checks(
         token_file=mirror_token,
         credentials_file=mirror_creds,
         backend="dropbox",
-        extra={"dropbox_folder": "/claude-mirror/test"},
+        extra={
+            "dropbox_app_key": "uao2pmhc0xgg2xj",
+            "dropbox_folder": "/claude-mirror/test",
+        },
     )
 
     primary_cfg_path = _write_config(
@@ -425,6 +434,26 @@ def test_doctor_backend_filter_limits_checks(
     )
 
     _patch_storage(monkeypatch, "ok")
+
+    # Stub `dropbox.Dropbox` so the v0.5.48 dropbox deep checks
+    # (account smoke + folder access + scope inspection) succeed
+    # without talking to the network. The point of this test is
+    # the --backend FILTER, not the dropbox SDK.
+    from unittest.mock import MagicMock
+    fake_account = MagicMock()
+    fake_account.account_id = "dbid:test"
+    fake_account.email = "alice@example.com"
+    fake_account.team = None
+    atype = MagicMock()
+    atype.is_basic = MagicMock(return_value=True)
+    atype.is_pro = MagicMock(return_value=False)
+    atype.is_business = MagicMock(return_value=False)
+    fake_account.account_type = atype
+    fake_dbx = MagicMock()
+    fake_dbx.users_get_current_account.return_value = fake_account
+    fake_dbx.files_list_folder.return_value = MagicMock(entries=[])
+    import dropbox as _dropbox
+    monkeypatch.setattr(_dropbox, "Dropbox", MagicMock(return_value=fake_dbx))
 
     result = CliRunner().invoke(
         cli, ["doctor", "--config", str(primary_cfg_path), "--backend", "dropbox"]

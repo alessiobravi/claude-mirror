@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json as _json
 import os
+import re
 import signal
 import sys
 import threading
@@ -6096,6 +6097,523 @@ def _run_googledrive_deep_checks(path: str, config: "Config") -> list[str]:
     return failures
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Dropbox deep checks (v0.5.48)
+#
+# Layered on top of the generic doctor pass for `--backend dropbox`. Mirrors
+# the v0.5.46 googledrive deep-check pattern: lazy SDK import, classified
+# ✓ / ✗ / ⚠ output, single ACTION REQUIRED bucket for grouped auth failures.
+# ─────────────────────────────────────────────────────────────────────────
+
+# Dropbox app keys are short alphanumeric tokens issued by the developer
+# console. Empirically they are 15 chars but we accept 10-20 to absorb any
+# future format drift. Lower-case + digits only — no hyphens, no underscores.
+_DROPBOX_APP_KEY_RE = re.compile(r"^[a-z0-9]{10,20}$")
+
+# OAuth scopes claude-mirror needs to read + write the configured folder.
+# Token JSON from a PKCE flow carries these in a `scope` field (space- or
+# comma-separated). Legacy tokens (pre-2020 long-lived access_token) have
+# no scope field at all — we surface that as an info line.
+_DROPBOX_REQUIRED_SCOPES = ("files.content.read", "files.content.write")
+
+
+def _run_dropbox_deep_checks(path: str, config: "Config") -> list[str]:
+    """Dropbox-specific deep diagnostic checks.
+
+    Runs AFTER the generic credentials/token/connectivity checks have
+    already reported. Adds Dropbox-specific assertions that the generic
+    pass cannot make:
+
+      1. Token JSON shape — `access_token` or `refresh_token` present.
+      2. App-key sanity — non-empty + matches the short-alphanumeric format.
+      3. Account smoke test — `users_get_current_account` returns an
+         Account with a populated `account_id`.
+      4. Granted scopes inspection — for PKCE tokens, verify the operations
+         claude-mirror needs (file read/write) are present. Legacy tokens
+         skip this with an info line.
+      5. Folder access — `files_list_folder(dropbox_folder, limit=1)`
+         catches NotFound / permission denied / team-folder restrictions.
+      6. Account type / team status — info line about admin policies that
+         may affect sync if the account is a team member.
+
+    Returns the list of failure summary strings (empty ⇒ all-pass).
+    Renders ✓ / ✗ / ⚠ lines to `console` as it goes, matching the
+    surrounding doctor's output style.
+
+    Auth failures are bucketed: if `users_get_current_account` returns an
+    AuthError, ONE auth-bucket failure line is emitted and checks 4-6 are
+    skipped, so the user sees a single "fix: re-run claude-mirror auth"
+    rather than four identical lines for the same root cause.
+    """
+    import json as _json_local
+
+    failures: list[str] = []
+
+    # ───── Check 1: Token JSON shape ─────
+    # The generic check 3 already verified the file exists + has a
+    # refresh_token (the format claude-mirror writes); the deep check
+    # confirms either `access_token` (long-lived legacy) or `refresh_token`
+    # (PKCE) is present so the SDK has SOMETHING to authenticate with.
+    token_path = Path(config.token_file)
+    if not token_path.exists():
+        # Generic check already reported this; emitting again would just
+        # be noise. Bail silently.
+        return failures
+
+    token_data: dict = {}
+    try:
+        raw = token_path.read_text()
+        parsed = _json_local.loads(raw)
+        if isinstance(parsed, dict):
+            token_data = parsed
+    except (OSError, _json_local.JSONDecodeError) as exc:
+        console.print(
+            f"  [red]✗[/] Token file unreadable / not JSON: "
+            f"[bold]{token_path}[/]\n"
+            f"      [dim]{exc}[/]\n"
+            f"      [yellow]Fix:[/] run "
+            f"[bold]claude-mirror auth --config {path}[/] to refresh "
+            f"the token."
+        )
+        failures.append(f"Dropbox token file corrupt: {token_path}")
+        return failures
+
+    has_access = bool(token_data.get("access_token"))
+    has_refresh = bool(token_data.get("refresh_token"))
+    if not has_access and not has_refresh:
+        console.print(
+            f"  [red]✗[/] Token JSON missing both [bold]access_token[/] "
+            f"and [bold]refresh_token[/]: [bold]{token_path}[/]\n"
+            f"      [yellow]Fix:[/] run "
+            f"[bold]claude-mirror auth --config {path}[/] to refresh "
+            f"the token."
+        )
+        failures.append("Dropbox token JSON missing access_token/refresh_token")
+        return failures
+
+    if has_refresh:
+        console.print(
+            f"  [green]✓[/] Token JSON valid; "
+            f"[dim]refresh_token present[/]"
+        )
+    else:
+        console.print(
+            f"  [green]✓[/] Token JSON valid; "
+            f"[dim]access_token present (legacy long-lived token)[/]"
+        )
+
+    # ───── Check 2: App-key sanity ─────
+    # The app key is required to construct a `dropbox.Dropbox(...)`
+    # client; an empty / malformed key would just produce an opaque SDK
+    # error several lines later. Surface it cleanly here.
+    app_key_yaml = (config.dropbox_app_key or "").strip()
+    # Token JSON also carries an app_key fallback when DropboxBackend writes
+    # it — fall back to the YAML value if the token didn't store one.
+    app_key_token = str(token_data.get("app_key", "") or "").strip()
+    app_key = app_key_yaml or app_key_token
+
+    if not app_key:
+        console.print(
+            f"  [red]✗[/] [bold]dropbox_app_key[/] is empty in "
+            f"[bold]{path}[/]\n"
+            f"      [yellow]Fix:[/] add the App key from your Dropbox "
+            f"app's [bold]Settings[/] tab "
+            f"([bold]https://www.dropbox.com/developers/apps[/]) to the "
+            f"YAML, then re-run "
+            f"[bold]claude-mirror auth --config {path}[/]."
+        )
+        failures.append("Dropbox app key empty")
+        return failures
+
+    if not _DROPBOX_APP_KEY_RE.match(app_key):
+        console.print(
+            f"  [red]✗[/] [bold]dropbox_app_key[/] format invalid: "
+            f"[dim]{app_key!r}[/]\n"
+            f"      [dim]Expected 10-20 lower-case alphanumeric "
+            f"characters (e.g. [bold]uao2pmhc0xgg2xj[/]).[/]\n"
+            f"      [yellow]Fix:[/] copy the App key from your Dropbox "
+            f"app's [bold]Settings[/] tab at "
+            f"[bold]https://www.dropbox.com/developers/apps[/] and update "
+            f"[bold]{path}[/]."
+        )
+        failures.append(f"Dropbox app key format invalid: {app_key}")
+        return failures
+
+    console.print(
+        f"  [green]✓[/] App key format valid: [dim]{app_key}[/]"
+    )
+
+    # ───── Lazy-import the SDK ─────
+    # Pays the multi-tens-of-millisecond import cost only on this branch.
+    # Generic doctor invocations on other backends remain quick.
+    try:
+        import dropbox as _dropbox  # noqa: PLC0415
+        from dropbox.exceptions import (  # noqa: PLC0415
+            ApiError,
+            AuthError,
+            HttpError,
+        )
+    except ImportError as exc:
+        console.print(
+            f"  [red]✗[/] Dropbox SDK not importable: [dim]{exc}[/]\n"
+            f"      [yellow]Fix:[/] reinstall claude-mirror with the "
+            f"Dropbox backend pulled in — "
+            f"[bold]pipx install --force claude-mirror[/]."
+        )
+        failures.append("Dropbox SDK not importable")
+        return failures
+
+    # Track whether we've already emitted the AUTH bucket so a cascading
+    # auth failure across checks 3-5 surfaces ONCE not three times.
+    auth_bucket_reported = False
+
+    def _maybe_auth_bucket(exc: BaseException) -> bool:
+        """If `exc` is AuthError-class, emit ONE bucket line (only the
+        first time) and return True. Caller skips its own per-check
+        message. Returns False otherwise."""
+        nonlocal auth_bucket_reported
+        is_auth = isinstance(exc, AuthError)
+        # Some HttpErrors with status 401 ALSO mean "token revoked";
+        # treat them the same so a 401 short-circuits the cascade too.
+        if not is_auth and isinstance(exc, HttpError):
+            try:
+                status = int(getattr(exc, "status_code", 0) or 0)
+                if status == 401:
+                    is_auth = True
+            except (TypeError, ValueError):
+                pass
+        if not is_auth:
+            return False
+        if not auth_bucket_reported:
+            auth_bucket_reported = True
+            console.print(
+                "  [red]✗[/] Dropbox auth failed "
+                f"([dim]{type(exc).__name__}: {str(exc)[:140]}[/])\n"
+                "      [yellow]Fix:[/] re-run "
+                f"[bold]claude-mirror auth --config {path}[/] — "
+                "remaining Dropbox checks skipped to avoid duplicate "
+                "failures from the same root cause."
+            )
+            failures.append("Dropbox auth failed")
+        return True
+
+    # ───── Build the Dropbox client ─────
+    # Prefer refresh_token (PKCE flow) so the SDK silently refreshes the
+    # access_token on the first RPC; fall back to a bare access_token for
+    # legacy tokens. Both shapes are tolerated by `dropbox.Dropbox`.
+    try:
+        if has_refresh:
+            dbx = _dropbox.Dropbox(
+                app_key=app_key,
+                oauth2_refresh_token=token_data.get("refresh_token"),
+            )
+        else:
+            dbx = _dropbox.Dropbox(
+                oauth2_access_token=token_data.get("access_token"),
+            )
+    except BaseException as exc:  # noqa: BLE001 — diagnostic, must not bubble
+        console.print(
+            f"  [red]✗[/] Could not construct Dropbox client: "
+            f"[dim]{type(exc).__name__}: {str(exc)[:160]}[/]\n"
+            f"      [yellow]Fix:[/] re-run "
+            f"[bold]claude-mirror auth --config {path}[/]."
+        )
+        failures.append(
+            f"Dropbox client construction failed: {type(exc).__name__}"
+        )
+        return failures
+
+    # ───── Check 3: Account smoke test ─────
+    # First network call after auth — surfaces revoked tokens cleanly.
+    account: Any = None
+    try:
+        account = dbx.users_get_current_account()
+    except BaseException as exc:  # noqa: BLE001 — diagnostic, must not bubble
+        if _maybe_auth_bucket(exc):
+            return failures
+        console.print(
+            f"  [red]✗[/] Account smoke test failed "
+            f"([dim]{type(exc).__name__}[/]): "
+            f"[dim]{str(exc)[:160]}[/]\n"
+            f"      [yellow]Fix:[/] check internet connectivity and "
+            f"re-run [bold]claude-mirror auth --config {path}[/] if the "
+            f"failure persists."
+        )
+        failures.append(
+            f"Dropbox account smoke test failed: {type(exc).__name__}"
+        )
+        return failures
+
+    account_id = getattr(account, "account_id", None) if account is not None else None
+    account_email = getattr(account, "email", None) if account is not None else None
+    if not account_id:
+        console.print(
+            "  [red]✗[/] Account response missing [bold]account_id[/] "
+            f"(got [dim]{type(account).__name__}[/])\n"
+            f"      [yellow]Fix:[/] re-run "
+            f"[bold]claude-mirror auth --config {path}[/]; if the issue "
+            f"persists, the Dropbox SDK may be too old — upgrade with "
+            f"[bold]pipx install --force claude-mirror[/]."
+        )
+        failures.append("Dropbox account response missing account_id")
+        return failures
+
+    if account_email:
+        console.print(
+            f"  [green]✓[/] Account: [bold]{account_email}[/] "
+            f"([dim]account_id: {account_id}[/])"
+        )
+    else:
+        console.print(
+            f"  [green]✓[/] Account verified "
+            f"([dim]account_id: {account_id}[/])"
+        )
+
+    # ───── Check 4: Granted scopes inspection ─────
+    # PKCE tokens carry a `scope` field (space- or comma-separated list);
+    # legacy tokens have no scope field at all. For PKCE, verify the
+    # operations claude-mirror needs are present; for legacy, emit an
+    # info line and move on (legacy tokens implicitly grant everything
+    # the app was approved for at the time of issuance).
+    raw_scope = token_data.get("scope") or token_data.get("scopes") or ""
+    if isinstance(raw_scope, list):
+        scope_set = {str(s).strip() for s in raw_scope if str(s).strip()}
+    elif isinstance(raw_scope, str) and raw_scope.strip():
+        # Accept both space- and comma-separated; Dropbox returns space-
+        # separated but we tolerate either to absorb format drift.
+        normalised = raw_scope.replace(",", " ")
+        scope_set = {s for s in normalised.split() if s}
+    else:
+        scope_set = set()
+
+    if scope_set:
+        missing_scopes = [
+            s for s in _DROPBOX_REQUIRED_SCOPES if s not in scope_set
+        ]
+        if missing_scopes:
+            console.print(
+                f"  [red]✗[/] Token missing required scope(s): "
+                f"[bold]{', '.join(missing_scopes)}[/]\n"
+                f"      [dim]Granted: "
+                f"{', '.join(sorted(scope_set)) or '(none)'}[/]\n"
+                f"      [yellow]Fix:[/] enable the missing scope(s) on "
+                f"your Dropbox app's [bold]Permissions[/] tab at "
+                f"[bold]https://www.dropbox.com/developers/apps[/], "
+                f"click [bold]Submit[/], then re-run "
+                f"[bold]claude-mirror auth --config {path}[/]."
+            )
+            failures.append(
+                f"Dropbox token missing scope(s): {', '.join(missing_scopes)}"
+            )
+        else:
+            console.print(
+                f"  [green]✓[/] Scopes: "
+                f"[dim]{', '.join(_DROPBOX_REQUIRED_SCOPES)}[/]"
+            )
+    else:
+        console.print(
+            "  [yellow]·[/] Legacy token format; scope inspection "
+            "skipped — re-auth via PKCE flow when convenient "
+            f"([bold]claude-mirror auth --config {path}[/])."
+        )
+
+    # ───── Check 5: Folder access ─────
+    # `files_list_folder(path=dropbox_folder, limit=1)` catches: folder
+    # doesn't exist (LookupError.is_not_found), permission denied
+    # (HttpError 403), team-folder access not granted, etc. Each maps
+    # to a specific fix-hint.
+    folder = (config.dropbox_folder or "").strip()
+    if not folder:
+        console.print(
+            f"  [red]✗[/] [bold]dropbox_folder[/] is empty in "
+            f"[bold]{path}[/]\n"
+            f"      [yellow]Fix:[/] set [bold]dropbox_folder[/] to the "
+            f"absolute path of your sync folder (e.g. "
+            f"[bold]/claude-mirror/myproject[/]) in the YAML."
+        )
+        failures.append("Dropbox folder path empty")
+    else:
+        try:
+            dbx.files_list_folder(path=folder, limit=1)
+            console.print(
+                f"  [green]✓[/] Folder accessible: [dim]{folder}[/]"
+            )
+        except BaseException as exc:  # noqa: BLE001 — diagnostic, must not bubble
+            if _maybe_auth_bucket(exc):
+                # Don't return — the team-status info line below is
+                # still useful and doesn't make any RPC calls.
+                pass
+            else:
+                # Inspect ApiError → ListFolderError → LookupError for
+                # the specific failure mode. Wrap every getattr in a
+                # try/except because the SDK's typed-union accessors raise
+                # AttributeError when the wrong tag is set.
+                fix_hint: str = ""
+                summary: str = ""
+                handled = False
+                if isinstance(exc, ApiError):
+                    err = getattr(exc, "error", None)
+                    try:
+                        if err is not None and hasattr(err, "is_path") and err.is_path():
+                            path_err = err.get_path()
+                            if hasattr(path_err, "is_not_found") and path_err.is_not_found():
+                                fix_hint = (
+                                    f"create [bold]{folder}[/] in your "
+                                    f"Dropbox account (web UI or "
+                                    f"Dropbox client) and re-run "
+                                    f"[bold]claude-mirror doctor "
+                                    f"--backend dropbox --config "
+                                    f"{path}[/]."
+                                )
+                                summary = "folder not found"
+                                console.print(
+                                    f"  [red]✗[/] Folder not found in "
+                                    f"Dropbox: [bold]{folder}[/]\n"
+                                    f"      [yellow]Fix:[/] {fix_hint}"
+                                )
+                                failures.append(
+                                    f"Dropbox folder not found: {folder}"
+                                )
+                                handled = True
+                            elif (
+                                hasattr(path_err, "is_no_write_permission")
+                                and path_err.is_no_write_permission()
+                            ):
+                                console.print(
+                                    f"  [red]✗[/] Access denied on "
+                                    f"folder: [bold]{folder}[/]\n"
+                                    f"      [yellow]Fix:[/] check the "
+                                    f"folder is shared with the "
+                                    f"authenticated account "
+                                    f"([bold]{account_email or account_id}[/]) "
+                                    f"and that the Dropbox app has the "
+                                    f"[bold]files.content.write[/] "
+                                    f"scope."
+                                )
+                                failures.append(
+                                    f"Dropbox folder access denied: {folder}"
+                                )
+                                handled = True
+                    except Exception:
+                        # Defensive: typed-union introspection failed.
+                        # Fall through to the generic ApiError handler.
+                        pass
+
+                    if not handled:
+                        # Generic ApiError fallback — surfaces any
+                        # path-error variant we don't model explicitly.
+                        text = str(exc)
+                        denied_hit = (
+                            "access_denied" in text.lower()
+                            or "forbidden" in text.lower()
+                        )
+                        if denied_hit:
+                            console.print(
+                                f"  [red]✗[/] Access denied on folder: "
+                                f"[bold]{folder}[/]\n"
+                                f"      [dim]{text[:160]}[/]\n"
+                                f"      [yellow]Fix:[/] verify the "
+                                f"folder is shared with "
+                                f"[bold]{account_email or account_id}[/] "
+                                f"and that the Dropbox app has the "
+                                f"[bold]files.content.read[/] + "
+                                f"[bold]files.content.write[/] scopes."
+                            )
+                            failures.append(
+                                f"Dropbox folder access denied: {folder}"
+                            )
+                            handled = True
+
+                if not handled:
+                    # Final catch-all — HTTP / network / unknown.
+                    text = str(exc)
+                    if isinstance(exc, HttpError):
+                        try:
+                            status = int(
+                                getattr(exc, "status_code", 0) or 0
+                            )
+                        except (TypeError, ValueError):
+                            status = 0
+                        if status == 403:
+                            console.print(
+                                f"  [red]✗[/] Folder access denied "
+                                f"(HTTP 403): [bold]{folder}[/]\n"
+                                f"      [yellow]Fix:[/] verify the "
+                                f"folder is shared with "
+                                f"[bold]{account_email or account_id}[/]."
+                            )
+                            failures.append(
+                                f"Dropbox folder access denied: {folder}"
+                            )
+                            handled = True
+                        elif status == 404:
+                            console.print(
+                                f"  [red]✗[/] Folder not found "
+                                f"(HTTP 404): [bold]{folder}[/]\n"
+                                f"      [yellow]Fix:[/] create "
+                                f"[bold]{folder}[/] in Dropbox and "
+                                f"re-run."
+                            )
+                            failures.append(
+                                f"Dropbox folder not found: {folder}"
+                            )
+                            handled = True
+
+                if not handled:
+                    console.print(
+                        f"  [red]✗[/] Folder probe failed "
+                        f"([dim]{type(exc).__name__}[/]): "
+                        f"[dim]{str(exc)[:160]}[/]\n"
+                        f"      [yellow]Fix:[/] verify "
+                        f"[bold]dropbox_folder[/] in [bold]{path}[/] is "
+                        f"correct and that the folder is shared with "
+                        f"the authenticated account."
+                    )
+                    failures.append(
+                        f"Dropbox folder probe failed: {type(exc).__name__}"
+                    )
+
+    # ───── Check 6: Account type / team status ─────
+    # Read account.account_type from check 3's result. Dropbox SDK's
+    # AccountType union has is_basic / is_pro / is_business predicates.
+    # Separately, FullAccount.team is non-None when the user is a member
+    # of a Dropbox Business team — surface that as an info line because
+    # team admins can disable third-party app access at the team level,
+    # which would silently break sync.
+    account_type_label = "unknown"
+    try:
+        atype = getattr(account, "account_type", None)
+        if atype is not None:
+            for tag, label in (
+                ("is_basic", "personal"),
+                ("is_pro", "pro"),
+                ("is_business", "business"),
+            ):
+                pred = getattr(atype, tag, None)
+                if callable(pred) and pred():
+                    account_type_label = label
+                    break
+    except Exception:
+        # Defensive: any introspection failure falls through to "unknown".
+        pass
+
+    is_team_member = getattr(account, "team", None) is not None
+    if is_team_member:
+        console.print(
+            f"  [yellow]·[/] Account type: "
+            f"[bold]{account_type_label}[/] (team member) — "
+            f"[dim]team admins may disable third-party app access; "
+            f"if sync stops working unexpectedly, ask your Dropbox "
+            f"admin to confirm claude-mirror is permitted.[/]"
+        )
+    else:
+        console.print(
+            f"  [green]✓[/] Account type: [dim]{account_type_label}[/]"
+        )
+
+    return failures
+
+
 def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
     """Run the doctor check sequence for one config + its mirrors.
 
@@ -6553,6 +7071,15 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
         if backend_name == "googledrive":
             failures.extend(_run_googledrive_deep_checks(path, config))
 
+        # ───── Deep Dropbox checks (dropbox only) ─────
+        # Adds Dropbox-specific assertions the generic loop above can't
+        # make: token JSON shape, app-key format, account smoke test,
+        # granted scope inspection, configured-folder access, and an
+        # info line about team-account admin policies. Skipped silently
+        # for other backends.
+        if backend_name == "dropbox":
+            failures.extend(_run_dropbox_deep_checks(path, config))
+
         # ───── Check 5: project_path exists locally ─────
         # Only check on the primary — every mirror config validated by
         # `_create_storage_set` must point at the SAME project_path, so
@@ -6638,6 +7165,9 @@ def doctor(config_path: str, backend_filter: str) -> None:
           optional), Drive API enabled, Pub/Sub API enabled, topic exists,
           per-machine subscription exists, IAM grant for Drive's service
           account on the topic
+      4c. dropbox only: token JSON shape, app-key format, account smoke
+          test (users_get_current_account), scope inspection (PKCE only),
+          folder access (files_list_folder), team-account info line
       5. project_path exists locally and is a directory
       6. Manifest integrity (if a manifest file is present)
 
@@ -6645,7 +7175,7 @@ def doctor(config_path: str, backend_filter: str) -> None:
     Examples:
       claude-mirror doctor
       claude-mirror doctor --config ~/.config/claude_mirror/work.yaml
-      claude-mirror doctor --backend dropbox
+      claude-mirror doctor --backend dropbox        # generic + deep Dropbox checks
       claude-mirror doctor --backend googledrive    # generic + deep Drive checks
     """
     cfg_path = _resolve_config(config_path)

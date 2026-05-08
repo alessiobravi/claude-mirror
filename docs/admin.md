@@ -1047,6 +1047,62 @@ claude-mirror doctor — /home/alice/.config/claude_mirror/myproject.yaml
 ✗ 1 issue(s) found. Fix the items above and re-run claude-mirror doctor.
 ```
 
+### Dropbox deep checks
+
+When `--backend dropbox` is in effect (explicitly via the flag, or because the primary / a Tier 2 mirror is `dropbox`), the doctor runs an additional six checks targeting failure modes that only show up on Dropbox. These complement the generic credentials/token/connectivity loop above; they don't replace it. Skipped silently for every other backend.
+
+| Check | Failure looks like |
+|---|---|
+| Token JSON shape — `access_token` (legacy long-lived) or `refresh_token` (PKCE) present | `Token JSON missing both access_token and refresh_token` — fix is `claude-mirror auth --config PATH` to refresh the token |
+| App-key sanity — `dropbox_app_key` non-empty and matches `^[a-z0-9]{10,20}$` (Dropbox app keys are short alphanumeric strings) | `dropbox_app_key is empty in PATH` or `dropbox_app_key format invalid` — fix is to copy the App key from the Dropbox app's Settings tab at https://www.dropbox.com/developers/apps and update the YAML |
+| Account smoke test — `users_get_current_account()` returns an Account with a populated `account_id` | `Account smoke test failed: REASON` — surfaces revoked tokens cleanly, since this is the first network call after auth. Fix is `claude-mirror auth --config PATH` |
+| Granted scopes inspection — for PKCE tokens, `files.content.read` and `files.content.write` must both appear on the granted scope list | `Token missing required scope(s): files.content.write` — fix is to enable the missing scope on the Dropbox app's Permissions tab, click Submit, then re-run `claude-mirror auth --config PATH`. Legacy tokens (no `scope` field) emit a yellow info line "Legacy token format; scope inspection skipped" and skip this check rather than failing |
+| Folder access — `files_list_folder(path=dropbox_folder, limit=1)` succeeds | `Folder not found in Dropbox: PATH` (create the folder via the Dropbox web UI / desktop client) or `Access denied on folder: PATH` (verify the folder is shared with the authenticated account and that the app has the read + write scopes) |
+| Account type / team status — read from check 3's `FullAccount.account_type` (basic / pro / business) and `FullAccount.team` (None for personal accounts, non-None for team members) | Personal accounts: green ✓ info line "Account type: personal/pro/business". Team members: yellow info line about admin policies — team admins can disable third-party app access at the team level, which silently breaks sync |
+
+#### Dropbox auth-failure bucketing
+
+If `users_get_current_account` fails with `AuthError` (or an HTTP 401 from a generic `HttpError`), the deep section emits ONE auth-bucket failure line (`Dropbox auth failed`) and skips the remaining Dropbox checks (folder access, etc.). This avoids three identical "auth needed" lines for what is always the same root cause and the same fix (`claude-mirror auth --config PATH`).
+
+#### Lazy import
+
+The Dropbox SDK (`dropbox`) is lazy-imported inside the deep-check function so its tens-of-milliseconds import cost is only paid when `--backend dropbox` is actually exercising these checks. Generic `claude-mirror doctor` invocations on other backends remain fast.
+
+### Sample Dropbox deep-check successful output
+
+```
+── checking dropbox backend (/home/alice/.config/claude_mirror/dropbox-myproject.yaml)
+  ✓ credentials file exists: /home/alice/.config/claude_mirror/dropbox-credentials.json
+  ✓ token file present with refresh_token: /home/alice/.config/claude_mirror/dropbox-myproject-token.json
+  ✓ backend connectivity ok (list_folders on root succeeded)
+  ✓ Token JSON valid; refresh_token present
+  ✓ App key format valid: uao2pmhc0xgg2xj
+  ✓ Account: alice@example.com (account_id: dbid:AAH123456)
+  ✓ Scopes: files.content.read, files.content.write
+  ✓ Folder accessible: /claude-mirror/myproject
+  ✓ Account type: personal
+  ✓ project_path exists: /home/alice/projects/myproject
+  ✓ manifest parses: /home/alice/projects/myproject/.claude_mirror_manifest.json
+```
+
+### Sample Dropbox deep-check failure output
+
+```
+── checking dropbox backend (/home/alice/.config/claude_mirror/dropbox-myproject.yaml)
+  ✓ credentials file exists: /home/alice/.config/claude_mirror/dropbox-credentials.json
+  ✓ token file present with refresh_token: /home/alice/.config/claude_mirror/dropbox-myproject-token.json
+  ✓ backend connectivity ok (list_folders on root succeeded)
+  ✓ Token JSON valid; refresh_token present
+  ✓ App key format valid: uao2pmhc0xgg2xj
+  ✓ Account: alice@example.com (account_id: dbid:AAH123456)
+  ✓ Scopes: files.content.read, files.content.write
+  ✗ Folder not found in Dropbox: /claude-mirror/myproject
+      Fix: create /claude-mirror/myproject in your Dropbox account (web UI or Dropbox client) and re-run claude-mirror doctor --backend dropbox --config /home/alice/.config/claude_mirror/dropbox-myproject.yaml.
+  ✓ Account type: personal
+
+✗ 1 issue(s) found. Fix the items above and re-run claude-mirror doctor.
+```
+
 ### Exit codes
 
 - `0` — every check passed.

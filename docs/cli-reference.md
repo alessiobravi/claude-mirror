@@ -48,7 +48,7 @@ claude-mirror forget            TIMESTAMP... | --before DATE/DURATION | --keep-l
 claude-mirror prune             [--keep-last N] [--keep-daily N] [--keep-monthly N] [--keep-yearly N]
                               [--delete] [--yes] [--config PATH]   # dry-run by default; reads keep_* from config
 claude-mirror gc                [--backend NAME] [--delete] [--yes] [--config PATH]   # dry-run by default; --delete to actually delete; --backend targets a specific mirror (Tier 2)
-claude-mirror doctor            [--backend NAME] [--config PATH]   # end-to-end self-test: config + credentials + connectivity + project + manifest (+ deep Drive checks under --backend googledrive)
+claude-mirror doctor            [--backend NAME] [--config PATH]   # end-to-end self-test: config + credentials + connectivity + project + manifest (+ deep checks under --backend googledrive or --backend dropbox)
 claude-mirror migrate-snapshots --to {blobs|full} [--dry-run] [--keep-source] [--no-update-config] [--config PATH]
 claude-mirror log               [--limit N] [--config PATH]
 claude-mirror inbox       [--config PATH]
@@ -443,6 +443,8 @@ Delete blobs no longer referenced by any manifest (only relevant for `blobs`-for
 End-to-end self-test of a project's configuration: config file parses, credentials / token files present, backend connectivity, `project_path` exists, manifest is valid. Each check repeats per backend including Tier 2 mirrors. Exits 0 on all-pass, 1 on any failure. Pass `--config PATH` to point at a specific config (auto-detected from cwd otherwise) or `--backend NAME` to limit checks to one backend (`googledrive` / `dropbox` / `onedrive` / `webdav` / `sftp`).
 
 `--backend googledrive` additionally runs six Drive-specific deep checks beyond the generic per-backend loop: OAuth scope inventory (Drive required, Pub/Sub optional), Drive API enabled, Pub/Sub API enabled, Pub/Sub topic exists, per-machine subscription exists, and the IAM grant for Drive's service account on the topic. The IAM grant is the highest-value check — about 70% of self-serve Drive setups miss it, which silently breaks real-time notifications across machines. See [admin.md#drive-deep-checks](admin.md#drive-deep-checks) for the full deep-check matrix and [backends/google-drive.md#diagnosing-setup-problems](backends/google-drive.md#diagnosing-setup-problems) for sample output.
+
+`--backend dropbox` additionally runs six Dropbox-specific deep checks beyond the generic per-backend loop: token JSON shape (`access_token` or `refresh_token` present), `dropbox_app_key` format sanity, account smoke test (`users_get_current_account`), granted-scope inspection (`files.content.read` + `files.content.write` for PKCE tokens; legacy tokens skip with an info line), folder access (`files_list_folder` against the configured `dropbox_folder`), and an account-type / team-status info line (team admins can disable third-party app access, silently breaking sync). Auth failures bucket into a single `Dropbox auth failed` line. See [admin.md#dropbox-deep-checks](admin.md#dropbox-deep-checks) for the full deep-check matrix and [backends/dropbox.md#diagnosing-setup-problems](backends/dropbox.md#diagnosing-setup-problems) for sample output.
 
 See [admin.md#doctor](admin.md#doctor) for the full check matrix, sample output, and fix-hint interpretation.
 

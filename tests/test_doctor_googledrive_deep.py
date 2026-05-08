@@ -661,19 +661,33 @@ def test_deep_drive_scope_missing_short_circuits_with_single_failure(
 def test_deep_skipped_for_non_googledrive_backend(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The deep checks must NOT run for dropbox / onedrive / webdav / sftp
-    — they are Drive-specific. We confirm by writing a dropbox config and
-    a factory-stub that would fail loudly if invoked."""
+    """The deep DRIVE checks must NOT run for dropbox / onedrive / webdav
+    / sftp — they are Drive-specific. We confirm by writing a dropbox
+    config and a factory-stub that would fail loudly if invoked.
+
+    Note: as of v0.5.48 dropbox HAS its own deep checks (see
+    test_doctor_dropbox_deep.py). To keep this test's invariant clean,
+    we mock `dropbox.Dropbox` so the dropbox deep checks pass — the
+    only thing we assert here is that the Drive-specific factory is
+    never reached.
+    """
     project = tmp_path / "project"
     project.mkdir()
     token = tmp_path / "token.json"
-    _write_token(token)
+    # Dropbox-shaped token JSON — has refresh_token + scope so the
+    # dropbox deep checks accept it without a fuss.
+    token.write_text(json.dumps({
+        "app_key": "uao2pmhc0xgg2xj",
+        "refresh_token": "fake-refresh-token",
+        "scope": "files.content.read files.content.write account_info.read",
+    }))
     creds = tmp_path / "credentials.json"
     creds.write_text("{}")
     cfg_path = tmp_path / "config.yaml"
     data = {
         "project_path": str(project),
         "backend": "dropbox",
+        "dropbox_app_key": "uao2pmhc0xgg2xj",
         "dropbox_folder": "/claude-mirror/test",
         "credentials_file": str(creds),
         "token_file": str(token),
@@ -685,6 +699,25 @@ def test_deep_skipped_for_non_googledrive_backend(
     cfg_path.write_text(yaml.safe_dump(data))
 
     _patch_storage_ok(monkeypatch)
+
+    # Stub `dropbox.Dropbox` so the dropbox deep checks succeed without
+    # talking to the network. The point of this test is to assert the
+    # GOOGLEDRIVE factory is never reached, not to exercise the dropbox
+    # deep checks (those have their own dedicated test module).
+    fake_account = MagicMock()
+    fake_account.account_id = "dbid:test"
+    fake_account.email = "alice@example.com"
+    fake_account.team = None
+    atype = MagicMock()
+    atype.is_basic = MagicMock(return_value=True)
+    atype.is_pro = MagicMock(return_value=False)
+    atype.is_business = MagicMock(return_value=False)
+    fake_account.account_type = atype
+    fake_dbx = MagicMock()
+    fake_dbx.users_get_current_account.return_value = fake_account
+    fake_dbx.files_list_folder.return_value = MagicMock(entries=[])
+    import dropbox as _dropbox
+    monkeypatch.setattr(_dropbox, "Dropbox", MagicMock(return_value=fake_dbx))
 
     # Factory stub that fails loudly if called — proves the Dropbox path
     # never invokes the Drive-deep section.

@@ -6,11 +6,22 @@ All notable changes to claude-mirror.
 
 ## [0.5.35] — 2026-05-08
 
+### Added — `claude-mirror gc --backend NAME` (per-mirror garbage collection)
+- New `--backend NAME` flag on `claude-mirror gc`. When set, gc operates on the named backend (primary or any configured mirror) instead of always defaulting to the primary. Critical for cleaning up orphan blobs that accumulated on a specific mirror without disturbing the primary or other mirrors.
+- Engine: `SnapshotManager.gc()` gains an optional `backend_name: Optional[str] = None` parameter. When None (default), preserves pre-v0.5.35 behaviour exactly — operates on the primary. When set, looks up the matching backend in `[self.storage] + self._mirrors`; raises `ValueError` with the list of available backend names if the requested name doesn't match.
+- All four `self.storage.*` calls inside `gc()` (list_files_recursive × 2, download_file, delete_file) are routed through the resolved `target_backend`, ensuring per-backend isolation. The folder lookups use `_get_snapshots_folder_for(backend)` and `_get_blobs_folder_for(backend)` (helpers that already existed for the snapshot fan-out path).
+- CLI: `gc` command's docstring + help text updated with Tier 2 examples (`claude-mirror gc --backend sftp --delete` etc.). The dry-run banner now names the target backend so the user can't accidentally gc the wrong one.
+- 4 new tests in `tests/test_snapshots.py` cover: default-targets-primary back-compat (with a configured mirror present, gc-no-flag still leaves mirror's orphans alone), named-mirror-targeted (gc on sftp deletes sftp's orphans, leaves primary alone), unknown-backend-raises (clean ValueError), and primary-by-name parity (passing `backend_name="primary"` matches the no-arg call).
+
+### Verified — Other backends are NOT affected by the v0.5.34 SFTP threading bug
+- After fixing the paramiko channel-multiplex stall in v0.5.34, audited the remaining four backends (Google Drive, Dropbox, OneDrive, WebDAV) for the same class of bug (single shared client object across worker threads with insufficient parallelism guarantees). Audit ran 4 agents in parallel, ~30 seconds each, no code changes — pure analysis pass.
+- **Result: all four are SAFE.** Drive already uses `threading.local()` for its `googleapiclient` Resource (the maintainer pre-empted the bug — see L116-117 comment naming `httplib2` thread-unsafety explicitly). Dropbox, OneDrive, and WebDAV all share a single `requests.Session` that IS genuinely thread-safe via urllib3's connection pool — concurrent HTTPS requests parallelize via separate TCP connections from the pool, no channel-multiplex serialization to worry about. SFTP was the unique outlier (paramiko's SFTPClient single-channel architecture).
+- No code changes for the other backends. Conclusion captured here so future maintainers (or future re-audits triggered by similar reports) know the question has been deliberately asked and answered.
+
 ### Added — GitHub Discussions wired into the issue chooser + README badge
 - GitHub Discussions enabled on the repository (Settings → Features → Discussions). Splits "I have a question" / "how do I configure SFTP" / "Tier 2 best practices" from "this is a confirmed bug" before noise accumulates in the issues tracker.
 - `.github/ISSUE_TEMPLATE/config.yml` extended with a "Question / setup help / general usage" contact link that points to the Discussions tab. Anyone clicking "New issue" now sees Discussions as the first listed alternative, with an explicit note that issues are reserved for confirmed bugs and concrete feature requests.
 - README badge row gains a Discussions count badge alongside the existing Tests / PyPI / Python / License row — completes the standard 5-badge maturity-signalling row that public Python tools typically display.
-- No code changes; no test surface impact.
 
 ---
 

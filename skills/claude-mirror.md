@@ -141,7 +141,8 @@ claude-mirror forget   --keep-last 50                    --config <config-path> 
 claude-mirror prune                                      --config <config-path>   # apply YAML's keep_last/keep_daily/keep_monthly/keep_yearly policy (dry-run by default)
 claude-mirror prune    --delete --yes                    --config <config-path>   # apply retention policy non-interactively (cron / CI)
 claude-mirror diff     <path>                            --config <config-path>   # colorized line-diff of local vs remote for one file
-claude-mirror gc                                         --config <config-path>   # reclaim orphan blobs after forget
+claude-mirror gc                                         --config <config-path>   # reclaim orphan blobs on PRIMARY (default)
+claude-mirror gc       --backend NAME                    --config <config-path>   # Tier 2: reclaim orphan blobs on a specific mirror
 claude-mirror migrate-snapshots --to {blobs|full}        --config <config-path>   # convert snapshots between formats (admin-only; rarely skill-triggered)
 claude-mirror log       --config <config-path>
 claude-mirror inbox     --config <config-path>

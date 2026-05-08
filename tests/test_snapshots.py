@@ -791,6 +791,16 @@ def _seed_blob(backend, content: bytes) -> tuple[str, str]:
     return sha, fid
 
 
+def _seed_blob_on(backend, content: bytes) -> tuple[str, str]:
+    """Like _seed_blob but uses the backend's own configured root folder
+    (e.g. 'MIRROR_ROOT' for a mirror in the per-backend gc tests below)."""
+    sha = hashlib.sha256(content).hexdigest()
+    blobs_id = backend.get_or_create_folder(BLOBS_FOLDER, backend._root_id)
+    prefix_id = backend.get_or_create_folder(sha[:2], blobs_id)
+    fid = backend.upload_bytes(content, sha, prefix_id)
+    return sha, fid
+
+
 def test_gc_lists_orphan_blobs_dry_run(cfg, memory_backend):
     """Blobs not referenced by any manifest are listed in dry-run."""
     referenced_sha, _ = _seed_blob(memory_backend, b"keep")
@@ -863,6 +873,91 @@ def test_gc_preserves_blobs_referenced_by_at_least_one_manifest(
     assert fid_a in memory_backend._nodes  # referenced by both manifests
     assert fid_b in memory_backend._nodes  # referenced by manifest 2
     assert fid_c not in memory_backend._nodes  # orphan
+
+
+def test_gc_default_targets_primary_backend(cfg, make_config, memory_backend):
+    """Without --backend, gc operates on the primary (back-compat with
+    pre-v0.5.35 behaviour). A configured mirror with its own orphan is
+    NOT touched when gc runs against the primary."""
+    # Seed orphan on primary.
+    primary_orphan_sha, primary_orphan_fid = _seed_blob(memory_backend, b"primary-orphan")
+    primary_ref_sha, _ = _seed_blob(memory_backend, b"primary-keep")
+    snaps_p = memory_backend.get_or_create_folder(SNAPSHOTS_FOLDER, "ROOT")
+    memory_backend.upload_bytes(
+        json.dumps({"timestamp": "2026-01-01T00-00-00Z",
+                    "files": {"a.md": primary_ref_sha}}).encode(),
+        f"2026-01-01T00-00-00Z{MANIFEST_SUFFIX}", snaps_p,
+    )
+    # Build a mirror with its own orphan; mgr should NOT touch it.
+    mirror = InMemoryBackend(name="sftp", root_folder="MIRROR_ROOT")
+    mirror.config = _MirrorConfigStub("MIRROR_ROOT")
+    mirror_orphan_sha, mirror_orphan_fid = _seed_blob_on(mirror, b"mirror-orphan")
+
+    mgr = _make_manager(cfg, memory_backend, mirrors=[mirror])
+    result = mgr.gc(dry_run=False)  # no backend_name → primary
+    assert result["deleted"] == 1
+    assert primary_orphan_fid not in memory_backend._nodes
+    # Mirror's orphan is intentionally untouched.
+    assert mirror_orphan_fid in mirror._nodes
+
+
+def test_gc_targets_named_mirror(cfg, memory_backend):
+    """gc(backend_name='sftp') operates on the SFTP mirror's blob store
+    + manifests, leaving the primary alone."""
+    # Primary has an orphan but mgr should NOT touch it when --backend sftp.
+    primary_orphan_sha, primary_orphan_fid = _seed_blob(memory_backend, b"primary-orphan")
+    primary_ref_sha, _ = _seed_blob(memory_backend, b"primary-keep")
+    snaps_p = memory_backend.get_or_create_folder(SNAPSHOTS_FOLDER, "ROOT")
+    memory_backend.upload_bytes(
+        json.dumps({"timestamp": "2026-01-01T00-00-00Z",
+                    "files": {"a.md": primary_ref_sha}}).encode(),
+        f"2026-01-01T00-00-00Z{MANIFEST_SUFFIX}", snaps_p,
+    )
+    # Mirror has its own orphan + own manifest.
+    mirror = InMemoryBackend(name="sftp", root_folder="MIRROR_ROOT")
+    mirror.config = _MirrorConfigStub("MIRROR_ROOT")
+    m_orphan_sha, m_orphan_fid = _seed_blob_on(mirror, b"mirror-orphan")
+    m_ref_sha, m_ref_fid = _seed_blob_on(mirror, b"mirror-keep")
+    snaps_m = mirror.get_or_create_folder(SNAPSHOTS_FOLDER, "MIRROR_ROOT")
+    mirror.upload_bytes(
+        json.dumps({"timestamp": "2026-01-01T00-00-00Z",
+                    "files": {"a.md": m_ref_sha}}).encode(),
+        f"2026-01-01T00-00-00Z{MANIFEST_SUFFIX}", snaps_m,
+    )
+
+    mgr = _make_manager(cfg, memory_backend, mirrors=[mirror])
+    result = mgr.gc(dry_run=False, backend_name="sftp")
+    assert result["deleted"] == 1
+    assert m_orphan_fid not in mirror._nodes      # mirror orphan deleted
+    assert m_ref_fid in mirror._nodes              # mirror referenced kept
+    assert primary_orphan_fid in memory_backend._nodes  # primary untouched
+
+
+def test_gc_with_unknown_backend_name_raises(cfg, memory_backend):
+    """gc(backend_name='nonexistent') raises ValueError naming the
+    available backends — clean error rather than silently operating
+    on the wrong target."""
+    mgr = _make_manager(cfg, memory_backend)
+    with pytest.raises(ValueError) as excinfo:
+        mgr.gc(dry_run=True, backend_name="nonexistent")
+    assert "nonexistent" in str(excinfo.value)
+
+
+def test_gc_backend_name_matching_primary_works(cfg, memory_backend):
+    """Explicitly passing the primary's backend_name should target the
+    primary — same outcome as the default no-arg call."""
+    orphan_sha, orphan_fid = _seed_blob(memory_backend, b"primary-orphan")
+    ref_sha, _ = _seed_blob(memory_backend, b"primary-keep")
+    snaps = memory_backend.get_or_create_folder(SNAPSHOTS_FOLDER, "ROOT")
+    memory_backend.upload_bytes(
+        json.dumps({"timestamp": "2026-01-01T00-00-00Z",
+                    "files": {"a.md": ref_sha}}).encode(),
+        f"2026-01-01T00-00-00Z{MANIFEST_SUFFIX}", snaps,
+    )
+    mgr = _make_manager(cfg, memory_backend)
+    result = mgr.gc(dry_run=False, backend_name="primary")  # the InMemoryBackend's name
+    assert result["deleted"] == 1
+    assert orphan_fid not in memory_backend._nodes
 
 
 # ---------------------------------------------------------------------------

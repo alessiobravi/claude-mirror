@@ -1478,12 +1478,20 @@ class SnapshotManager:
     # Garbage collection (blobs format only)
     # ------------------------------------------------------------------
 
-    def gc(self, dry_run: bool = False) -> dict:
+    def gc(self, dry_run: bool = False, backend_name: Optional[str] = None) -> dict:
         """Delete blobs no longer referenced by any v2 manifest.
 
+        backend_name: when None (default), gc operates on the primary
+        backend (`self.storage`). When set to one of the configured
+        mirror's `backend_name` values, gc operates on THAT mirror's
+        blob store + manifest folder instead — useful for cleaning
+        up orphans on a specific mirror without touching the primary.
+        Raises ValueError if the name doesn't match the primary or
+        any configured mirror.
+
         Safety:
-          * Refuses to run if there are zero v2 manifests on remote — this
-            would otherwise delete the entire blob store.
+          * Refuses to run if there are zero v2 manifests on the chosen
+            backend — this would otherwise delete the entire blob store.
           * Reads ALL manifests first; only then lists blobs; only then
             deletes orphans. A blob written between the manifest read and
             the blob list is safe (it must be referenced by a manifest
@@ -1499,8 +1507,31 @@ class SnapshotManager:
 
         Returns: summary dict with counts.
         """
-        snapshots_folder_id = self._get_snapshots_folder()
-        blobs_folder_id = self._get_blobs_folder()
+        # Resolve which backend to gc against.
+        target_backend = self.storage  # default: primary
+        if backend_name is not None:
+            primary_name = (
+                getattr(self.storage, "backend_name", "") or "primary"
+            )
+            if backend_name == primary_name:
+                target_backend = self.storage
+            else:
+                target_backend = next(
+                    (b for b in self._mirrors
+                     if (getattr(b, "backend_name", "") or "") == backend_name),
+                    None,
+                )
+                if target_backend is None:
+                    available = [primary_name] + [
+                        getattr(b, "backend_name", "?") or "?"
+                        for b in self._mirrors
+                    ]
+                    raise ValueError(
+                        f"No backend named {backend_name!r} configured for "
+                        f"this project. Available: {', '.join(available)}"
+                    )
+        snapshots_folder_id = self._get_snapshots_folder_for(target_backend)
+        blobs_folder_id = self._get_blobs_folder_for(target_backend)
 
         with make_phase_progress(console) as progress:
             # 1) List blobs first.
@@ -1521,7 +1552,7 @@ class SnapshotManager:
                 )
 
             try:
-                blob_entries = self.storage.list_files_recursive(
+                blob_entries = target_backend.list_files_recursive(
                     blobs_folder_id, progress_cb=_blob_cb,
                 )
             except Exception:
@@ -1536,7 +1567,7 @@ class SnapshotManager:
                 detail="listing manifests…", show_time=False,
             )
             try:
-                files = self.storage.list_files_recursive(snapshots_folder_id)
+                files = target_backend.list_files_recursive(snapshots_folder_id)
             except Exception:
                 files = []
             manifest_files = [
@@ -1563,7 +1594,7 @@ class SnapshotManager:
             referenced: set[str] = set()
             for i, mf in enumerate(manifest_files, 1):
                 try:
-                    raw = self.storage.download_file(mf["id"])
+                    raw = target_backend.download_file(mf["id"])
                     manifest = json.loads(raw)
                     referenced.update(manifest.get("files", {}).values())
                 except Exception:
@@ -1613,7 +1644,7 @@ class SnapshotManager:
 
             def _delete_one(entry: dict) -> bool:
                 try:
-                    self.storage.delete_file(entry["id"])
+                    target_backend.delete_file(entry["id"])
                     return True
                 except Exception:
                     return False

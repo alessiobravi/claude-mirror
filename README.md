@@ -19,7 +19,7 @@ Built originally for Claude Code projects (where most context lives in markdown)
 
 **Supported backends:** Google Drive, Dropbox, Microsoft OneDrive, any WebDAV server (Nextcloud, OwnCloud, Apache mod_dav, Synology/QNAP NAS, Box.com, etc.), and any SFTP/SSH-accessible server (VPS, NAS, shared hosting, self-hosted Linux). Each project picks its own primary backend independently — different projects on the same machine can use different backends.
 
-**Quality gates:** Every commit and pull request runs **357 automated tests** on Python 3.11, 3.12, 3.13, and 3.14 in parallel via GitHub Actions — covering the 3-way diff sync core, both snapshot formats, path-traversal safety, conflict resolution, auth flows, all five backends (with HTTP-level / SSH-level mocking), the notifier inbox under concurrent writers, and the watcher daemon's SIGHUP hot-reload. CI must be green before any PR can merge. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the test conventions and how to run them locally.
+**Quality gates:** Every commit and pull request runs **361 automated tests** on Python 3.11, 3.12, 3.13, and 3.14 in parallel via GitHub Actions — covering the 3-way diff sync core, both snapshot formats, path-traversal safety, conflict resolution, auth flows, all five backends (with HTTP-level / SSH-level mocking), the notifier inbox under concurrent writers, and the watcher daemon's SIGHUP hot-reload. CI must be green before any PR can merge. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the test conventions and how to run them locally.
 
 ---
 
@@ -1004,9 +1004,11 @@ Each unique file body is uploaded **exactly once**. The manifest is a small JSON
 Run `claude-mirror gc` periodically to delete blobs no longer referenced by any manifest. **Safe by default** — running without flags is a dry-run scan only:
 
 ```bash
-claude-mirror gc                      # dry-run only — reports orphans, deletes nothing
-claude-mirror gc --delete             # actually delete (must type YES to confirm)
-claude-mirror gc --delete --yes       # actually delete, skip the typed prompt (cron / CI)
+claude-mirror gc                              # primary backend, dry-run
+claude-mirror gc --delete                     # primary backend, actually delete
+claude-mirror gc --delete --yes               # primary, delete, skip typed prompt
+claude-mirror gc --backend sftp               # gc the SFTP mirror, dry-run (Tier 2)
+claude-mirror gc --backend sftp --delete      # gc the SFTP mirror, real delete
 ```
 
 With `--delete` the command asks you to **type the literal word `YES`** (uppercase, exact). A `y`/`yes`/`Y`/anything-else aborts the deletion. `--yes` is the only way to skip the prompt and is explicitly required for non-interactive use. `gc` also refuses to run if no manifests exist on remote (which would otherwise wipe the entire blob store).
@@ -1751,7 +1753,7 @@ claude-mirror forget            TIMESTAMP... | --before DATE/DURATION | --keep-l
                               [--delete] [--yes] [--config PATH]   # dry-run by default; --delete to actually delete
 claude-mirror prune             [--keep-last N] [--keep-daily N] [--keep-monthly N] [--keep-yearly N]
                               [--delete] [--yes] [--config PATH]   # dry-run by default; reads keep_* from config
-claude-mirror gc                [--delete] [--yes] [--config PATH]   # dry-run by default; --delete to actually delete
+claude-mirror gc                [--backend NAME] [--delete] [--yes] [--config PATH]   # dry-run by default; --delete to actually delete; --backend targets a specific mirror (Tier 2)
 claude-mirror migrate-snapshots --to {blobs|full} [--dry-run] [--keep-source] [--no-update-config] [--config PATH]
 claude-mirror log               [--limit N] [--config PATH]
 claude-mirror inbox       [--config PATH]

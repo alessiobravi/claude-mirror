@@ -3288,9 +3288,16 @@ def seed_mirror(backend_name: str, dry_run: bool, config_path: str) -> None:
 @click.option("--yes", "skip_confirm", is_flag=True, default=False,
               help="With --delete, skip both confirmation prompts. Required "
                    "for non-interactive use (cron, CI).")
+@click.option("--backend", "backend_name", default="",
+              help="Tier 2: target a specific backend (primary or any "
+                   "configured mirror by `backend_name`, e.g. 'sftp', "
+                   "'dropbox'). Default: the primary backend. Use this "
+                   "to clean up orphan blobs on a mirror without "
+                   "touching the primary, or vice versa.")
 @click.option("--config", "config_path", default="",
               help="Config file path. Auto-detected from cwd if omitted.")
-def gc(do_delete: bool, dry_run: bool, skip_confirm: bool, config_path: str) -> None:
+def gc(do_delete: bool, dry_run: bool, skip_confirm: bool,
+       backend_name: str, config_path: str) -> None:
     """Delete blobs no longer referenced by any snapshot manifest.
 
     \b
@@ -3299,14 +3306,27 @@ def gc(do_delete: bool, dry_run: bool, skip_confirm: bool, config_path: str) -> 
       1. pass --delete explicitly, AND
       2. confirm twice (or pass --yes to skip the prompts).
 
-    Refuses to run if no blobs-format manifests exist on remote
-    (otherwise gc would wipe the entire blob store).
+    \b
+    Tier 2: pass --backend NAME to gc a specific mirror. Without it,
+    gc operates on the primary backend (matching pre-Tier-2 behaviour
+    exactly). Each backend has its own _claude_mirror_blobs/ tree;
+    gc on one backend does NOT touch any other.
+
+    \b
+    Examples:
+      claude-mirror gc                          # primary, dry-run
+      claude-mirror gc --delete                 # primary, real delete
+      claude-mirror gc --backend sftp           # gc the SFTP mirror, dry-run
+      claude-mirror gc --backend sftp --delete  # gc the SFTP mirror for real
+
+    Refuses to run if no blobs-format manifests exist on the chosen
+    backend (otherwise gc would wipe the entire blob store).
 
     Only meaningful when snapshot_format is 'blobs'.
     """
     config = Config.load(_resolve_config(config_path))
-    storage = _create_storage(config)
-    snap = SnapshotManager(config, storage)
+    storage, mirrors = _create_storage_set(config)
+    snap = SnapshotManager(config, storage, mirrors=mirrors)
     if (config.snapshot_format or "full").lower() != "blobs":
         console.print(
             "[yellow]Note:[/] this project's snapshot_format is "
@@ -3316,33 +3336,44 @@ def gc(do_delete: bool, dry_run: bool, skip_confirm: bool, config_path: str) -> 
 
     # Up-front banner when running in dry-run mode (no --delete) so the
     # user knows BEFORE the scan starts that nothing will be deleted.
+    target_label = backend_name or (
+        getattr(storage, "backend_name", "") or config.backend or "primary"
+    )
     if not do_delete:
         console.print(
-            "[bold yellow]🔍 DRY-RUN mode[/] — scanning for orphan blob(s); "
+            f"[bold yellow]🔍 DRY-RUN mode[/] — scanning for orphan blob(s) "
+            f"on backend [bold]{target_label}[/]; "
             "no deletions will be performed."
         )
 
     # Phase 1: always run a dry-run scan first so we know the scope.
-    result = snap.gc(dry_run=True)
+    try:
+        result = snap.gc(dry_run=True, backend_name=backend_name or None)
+    except ValueError as e:
+        console.print(f"[red]{e}[/]")
+        sys.exit(1)
 
     if not do_delete:
         if result.get("refused"):
             return
         orphans = result.get("orphans", 0)
         if orphans > 0:
+            backend_arg = (
+                f" --backend {backend_name}" if backend_name else ""
+            )
             console.print(
                 f"\n[bold yellow]Dry-run complete.[/] No deletions were performed.\n"
-                f"To actually delete {orphans} orphan blob(s):\n"
-                f"  [bold cyan]claude-mirror gc --delete[/]\n"
+                f"To actually delete {orphans} orphan blob(s) on {target_label}:\n"
+                f"  [bold cyan]claude-mirror gc{backend_arg} --delete[/]\n"
                 f"[dim](you'll be asked to type YES to confirm before "
                 f"anything is deleted)[/]"
             )
         else:
             console.print(
-                "\n[bold yellow]Dry-run complete.[/] Nothing to clean up — "
-                "no orphan blobs.\n"
-                "[dim]When orphans appear in future runs, use: "
-                "[bold]claude-mirror gc --delete[/][/]"
+                f"\n[bold yellow]Dry-run complete.[/] Nothing to clean up "
+                f"on {target_label} — no orphan blobs.\n"
+                f"[dim]When orphans appear in future runs, use: "
+                f"[bold]claude-mirror gc --delete[/][/]"
             )
         return
 
@@ -3354,7 +3385,7 @@ def gc(do_delete: bool, dry_run: bool, skip_confirm: bool, config_path: str) -> 
         orphans = result["orphans"]
         confirmation = click.prompt(
             f"\nThis will permanently delete {orphans} orphan blob(s) "
-            f"from remote storage.\n"
+            f"from {target_label} remote storage.\n"
             f"This cannot be undone via claude-mirror.\n"
             f"Type YES (uppercase, exact) to confirm",
             default="",
@@ -3370,7 +3401,7 @@ def gc(do_delete: bool, dry_run: bool, skip_confirm: bool, config_path: str) -> 
     # scan is the cost we pay for the safer default. On most projects
     # it's a few seconds; it never deletes anything not still orphaned
     # at the moment of the second scan, which is the safest semantics.)
-    snap.gc(dry_run=False)
+    snap.gc(dry_run=False, backend_name=backend_name or None)
 
 
 @cli.command()

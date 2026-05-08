@@ -272,6 +272,7 @@ claude-mirror pull                      # download remote-ahead files
 claude-mirror pull --output DIR         # preview to DIR without touching local files
 claude-mirror diff path/to/file.md      # colourised unified diff (remote → local)
 claude-mirror sync                      # full bidirectional with conflict prompts
+claude-mirror sync --no-prompt --strategy keep-local   # cron-friendly: auto-resolve all conflicts
 claude-mirror watch                     # foreground watcher; system notification on remote pushes
 claude-mirror watch --once --quiet      # single polling cycle (cron-friendly: */5 * * * * ...)
 claude-mirror watch-all                 # watch every config in ~/.config/claude_mirror/

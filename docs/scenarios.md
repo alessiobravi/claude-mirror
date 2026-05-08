@@ -87,6 +87,18 @@ Optional but recommended: install the watcher service via `claude-mirror-install
 - **The `.claude_mirror_*` files in your project root are local state.** Add them to `.gitignore` if the project is also a git repo.
 - **Upgrading to multi-machine later is free.** When you do add a second machine, you keep the same config and just run `init`/`auth` on the new machine pointing at the same Dropbox folder. You're already in [Scenario B](#b-personal-multi-machine-sync).
 
+### Automated nightly sync
+
+Even on a single machine, you may want a cron-driven safety net that pushes anything you forgot to push manually. The `--no-prompt --strategy` flow makes that one-line:
+
+```cron
+# Nightly at 03:00 — push any local edits, pull anything edited via the
+# cloud UI, and resolve any 2-way conflict by keeping the local copy.
+0 3 * * * cd /home/alice/projects/myproject && /usr/local/bin/claude-mirror sync --no-prompt --strategy keep-local
+```
+
+In a true single-machine scenario, conflicts are vanishingly rare — they only happen if you also edited via the Dropbox / Drive web UI between cron ticks. `--strategy keep-local` is the right default: your local edits always win, the conflict is logged in `_sync_log.json` with the chosen strategy, and the next interactive `claude-mirror log` surfaces it so you know to investigate. See [`docs/admin.md` — Unattended sync via cron](./admin.md#unattended-sync-via-cron) for the full flag table and `docs/cli-reference.md#sync`.
+
 ---
 
 ## B. Personal multi-machine sync
@@ -159,6 +171,20 @@ See [`docs/backends/google-drive.md`](./backends/google-drive.md) for the GCP pr
 - **The watcher must actually be running.** If you skipped `claude-mirror-install`, run `claude-mirror watch-all` in a terminal — otherwise notifications pile up in the Pub/Sub backlog and you lose the real-time signal.
 - **Same-account, different-Drive is a footgun.** If you point one machine at folder X and another at folder Y on the same Google account, they will each happily mirror their own copy and never see each other. Double-check `drive_folder_id` is identical across configs.
 - **Skill auto-detection works in Claude Code.** Open the project in Claude Code on either machine and the skill picks the right config from `cwd`.
+
+### Automated nightly sync
+
+For machines that are awake-but-idle overnight (e.g. a desktop you don't power off), pair the watcher with a cron-driven safety-net `sync` that catches anything the watcher missed:
+
+```cron
+# Every 4 hours, push pending edits + pull remote edits + auto-resolve any
+# conflicts in favour of local. The watcher already handles real-time
+# pulls; this is the belt-and-braces guarantee that an asleep / offline /
+# pub-sub-glitch window doesn't leave your machine stale.
+0 */4 * * * cd /Users/alice/projects/myproject && /usr/local/bin/claude-mirror sync --no-prompt --strategy keep-local
+```
+
+`keep-local` is the safest default for a personal-multi-machine setup: when both your laptop AND your desktop edited the same file (rare but possible if both were offline at the same time), local wins on whichever machine the cron runs on. The conflict is logged in `_sync_log.json` so the next time you open `claude-mirror log` you see the auto-resolution and can manually re-merge if needed. Full flag table in [`docs/cli-reference.md#sync`](./cli-reference.md#sync); crontab samples in [`docs/admin.md`](./admin.md#unattended-sync-via-cron).
 
 ---
 

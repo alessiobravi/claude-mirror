@@ -32,7 +32,7 @@ claude-mirror auth        [--check] [--config PATH]
 claude-mirror status      [--short] [--config PATH]
 claude-mirror status --pending                  [--config PATH]
 claude-mirror status --by-backend               [--config PATH]   # Tier 2: per-file table with one column per backend
-claude-mirror sync        [--config PATH]
+claude-mirror sync        [--no-prompt --strategy {keep-local|keep-remote}] [--config PATH]
 claude-mirror push        [FILES...] [--force-local] [--config PATH]
 claude-mirror pull        [FILES...] [--output PATH] [--config PATH]
 claude-mirror diff        PATH [--context N] [--config PATH]
@@ -351,6 +351,45 @@ Download remote-ahead files and update the local manifest. Pass file arguments t
 Bidirectional in one command: pushes local-ahead files, pulls remote-ahead files, and prompts interactively for conflicts. Creates a snapshot and notifies collaborators after completion. Shows live ETA + transfer rate during the upload and download phases — see [admin.md "Transfer progress"](admin.md#transfer-progress-live-eta--bytessec).
 
 See [conflict-resolution.md](conflict-resolution.md) for what happens at the conflict prompt.
+
+Flags:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--config PATH` | auto-detected from cwd | Path to a specific config YAML when more than one project lives under `~/.config/claude_mirror/`. |
+| `--no-prompt` | off | Resolve conflicts non-interactively. **Requires `--strategy`.** Designed for cron / launchd / systemd unattended runs where no TTY is available. |
+| `--strategy {keep-local,keep-remote}` | none | Conflict-resolution strategy when `--no-prompt` is set. `keep-local` overwrites the remote with the local content; `keep-remote` overwrites the local file with the remote content. Required when `--no-prompt` is set; ignored otherwise (with a yellow info line). |
+
+#### Cron / unattended use
+
+The interactive flow blocks on `click.prompt` when both sides of a file have changed since the last sync. Under cron / launchd / systemd this hangs forever (or fails immediately, depending on stdin handling), so `claude-mirror sync` running unattended needs an explicit conflict-resolution strategy:
+
+```bash
+claude-mirror sync --no-prompt --strategy keep-local    # cron-friendly: local always wins
+claude-mirror sync --no-prompt --strategy keep-remote   # cron-friendly: remote always wins
+```
+
+Output is one yellow line per auto-resolved conflict plus one trailing summary line — designed for cron mail and `journalctl` consumers:
+
+```
+⚠  CLAUDE.md: auto-resolved (keep-local)
+⚠  notes/todo.md: auto-resolved (keep-local)
+Summary: 12 in sync, 3 pushed, 2 pulled, 2 conflicts auto-resolved (keep-local).
+```
+
+Every auto-resolution is appended to `_sync_log.json` on the remote with a `auto_resolved_files: [{path, strategy}]` audit trail, so a later interactive operator can spot exactly which files were overwritten by the cron flow.
+
+`--no-prompt` without `--strategy` exits 1 immediately with the message:
+
+```
+--no-prompt requires --strategy. Choices: keep-local, keep-remote.
+```
+
+`--strategy` without `--no-prompt` prints `--strategy ignored without --no-prompt` and falls back to the interactive flow.
+
+If you run `claude-mirror sync` (no flags) and stdin is not a TTY (cron / launchd / systemd), the command fails fast at entry with a hint pointing at `--no-prompt --strategy` rather than hanging on a prompt nobody can answer.
+
+Sample crontab entries are in [admin.md](admin.md#unattended-sync-via-cron). For the interactive prompt menu, see [conflict-resolution.md](conflict-resolution.md).
 
 ### `diff`
 

@@ -713,13 +713,41 @@ class SyncEngine:
 
         return states
 
-    def sync(self) -> None:
-        """Bidirectional sync: auto-resolve non-conflicts in parallel, prompt for conflicts."""
+    def sync(
+        self,
+        *,
+        non_interactive_strategy: Optional[str] = None,
+    ) -> dict:
+        """Bidirectional sync: auto-resolve non-conflicts in parallel, prompt for conflicts.
+
+        non_interactive_strategy: when set (one of "keep-local" / "keep-remote"),
+        every conflict is auto-resolved by the supplied policy and a one-line
+        Rich note is printed per file. The interactive diff/prompt path is
+        skipped entirely. Designed for `claude-mirror sync --no-prompt
+        --strategy ...` running under cron / launchd / systemd. The handler
+        passed to the engine MUST already be configured with the same
+        strategy — the CLI does this in `_load_engine`.
+
+        Returns a dict with the per-category counts the CLI uses to render
+        the trailing one-line cron summary:
+            {
+                "in_sync": int,         # files that did not need any action
+                "pushed": [str, ...],
+                "pulled": [str, ...],
+                "skipped": [str, ...],
+                "deleted": [str, ...],
+                "auto_resolved": [{"path": str, "strategy": str}, ...],
+            }
+        """
         pushed, pulled, skipped, deleted = [], [], [], []
+        # Audit trail for `--no-prompt --strategy ...`. Each entry is
+        # `{"path": str, "strategy": str}`. Empty in the interactive flow.
+        auto_resolved: list[dict] = []
 
         with self._make_phase_progress() as progress:
             states = self._run_status_phase(progress)
 
+            in_sync_count = sum(1 for s in states if s.status is Status.IN_SYNC)
             local_pushes = [s for s in states if s.status in (Status.LOCAL_AHEAD, Status.NEW_LOCAL)]
             pulls        = [s for s in states if s.status in (Status.DRIVE_AHEAD, Status.NEW_DRIVE)]
             existing_conflicts = [s for s in states if s.status == Status.CONFLICT]
@@ -782,7 +810,14 @@ class SyncEngine:
                 )
                 deleted.extend(s.rel_path for s in ok)
 
-            # Conflicts (interactive — pause the live region while prompting).
+            # Conflicts. Two paths:
+            #   * Interactive (default): pause the live region while
+            #     `_resolve_conflict` prompts the user.
+            #   * Non-interactive (`--no-prompt --strategy ...`): the
+            #     MergeHandler is preconfigured with a policy, so every
+            #     `_resolve_conflict` call returns instantly without
+            #     touching stdin. We print a one-line yellow note per file
+            #     so cron emails and journal logs show what was overwritten.
             all_conflicts = existing_conflicts + new_conflicts
             conflict_task = progress.add_task(
                 "Conflicts", total=max(len(all_conflicts), 1),
@@ -791,7 +826,7 @@ class SyncEngine:
                 progress.stop()
                 try:
                     for i, state in enumerate(all_conflicts, 1):
-                        if state in new_conflicts:
+                        if state in new_conflicts and non_interactive_strategy is None:
                             entry = self.manifest.get(state.rel_path)
                             context = self._remote_change_context(
                                 state.rel_path, since=entry.synced_at if entry else ""
@@ -807,6 +842,21 @@ class SyncEngine:
                             pulled.append(state.rel_path)
                         else:
                             skipped.append(state.rel_path)
+                        if non_interactive_strategy is not None:
+                            # Per-file audit print + structured record.
+                            # The flag combination (--no-prompt + --strategy)
+                            # IS the user's consent for the destructive
+                            # overwrite (see `feedback_destructive_safe_default`),
+                            # so no extra typed-YES prompt — but we DO log
+                            # unambiguously what just happened.
+                            console.print(
+                                f"[yellow]⚠[/]  {state.rel_path}: "
+                                f"auto-resolved ({non_interactive_strategy})"
+                            )
+                            auto_resolved.append({
+                                "path": state.rel_path,
+                                "strategy": non_interactive_strategy,
+                            })
                 finally:
                     progress.start()
                     progress.update(
@@ -843,7 +893,17 @@ class SyncEngine:
                     "Notify", total=notify_count,
                     detail=f"publishing {notify_count} event(s)…", show_time=True)
                 if pushed and self.notifier:
-                    self._publish_event(pushed, "sync", snapshot_ts=snapshot_ts)
+                    # Carry the auto-resolution audit list on the same
+                    # SyncEvent that already records the pushed files.
+                    # Keeps the audit trail in lock-step with what was
+                    # actually written to the remote in this run, in the
+                    # SAME `_sync_log.json` interactive runs use — no
+                    # separate auto-resolution-only log file.
+                    self._publish_event(
+                        pushed, "sync",
+                        snapshot_ts=snapshot_ts,
+                        auto_resolved_files=auto_resolved,
+                    )
                     progress.update(notify_task, advance=1, detail="sync event sent")
                 if deleted and self.notifier:
                     self._publish_event(deleted, "delete")
@@ -869,6 +929,15 @@ class SyncEngine:
                 "[yellow]Sync succeeded; the failed snapshot will be retried "
                 "on the next push/sync.[/]"
             )
+
+        return {
+            "in_sync": in_sync_count,
+            "pushed": list(pushed),
+            "pulled": list(pulled),
+            "skipped": list(skipped),
+            "deleted": list(deleted),
+            "auto_resolved": list(auto_resolved),
+        }
 
     def push(self, paths: Optional[list[str]] = None, force_local: bool = False) -> None:
         pushed: list[str] = []
@@ -2248,6 +2317,7 @@ class SyncEngine:
         action: str,
         *,
         snapshot_ts: Optional[str] = None,
+        auto_resolved_files: Optional[list[dict]] = None,
     ) -> None:
         """Queue a sync event: append it to the in-memory log and fire the publish
         without blocking on broker ack. Log upload + ack waits are flushed once at
@@ -2257,6 +2327,13 @@ class SyncEngine:
         flows through to Slack so the recipient sees the recovery point
         explicitly. Pub/Sub events are unchanged (the SyncEvent wire format
         stays stable so older subscribers keep working).
+
+        auto_resolved_files: per-file audit trail of conflicts auto-resolved
+        by `sync --no-prompt --strategy ...`. Each entry is
+        `{"path": str, "strategy": str}`. Empty for every interactive run
+        and for every push/pull/delete event. Travels on the same SyncEvent
+        and lands in the same `_sync_log.json` so audits can spot every
+        auto-resolution in one place.
         """
         event = SyncEvent.now(
             machine=self.config.machine_name,
@@ -2264,6 +2341,7 @@ class SyncEngine:
             files=files,
             action=action,
             project=self._project.name,
+            auto_resolved_files=auto_resolved_files,
         )
         try:
             future = self.notifier.publish_event_async(event)

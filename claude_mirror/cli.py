@@ -563,11 +563,26 @@ def _create_notifier(config: Config, storage: StorageBackend) -> NotificationBac
     return None
 
 
-def _load_engine(config_path: str, with_pubsub: bool = True) -> tuple[SyncEngine, Config, StorageBackend]:
+def _load_engine(
+    config_path: str,
+    with_pubsub: bool = True,
+    *,
+    non_interactive_strategy: Optional[str] = None,
+) -> tuple[SyncEngine, Config, StorageBackend]:
+    """Build a SyncEngine ready to run a top-level command.
+
+    non_interactive_strategy: when set (one of "keep-local"/"keep-remote"),
+    the MergeHandler is constructed in non-interactive mode so every
+    conflict is resolved by the canned policy without ever calling
+    `click.prompt`. Used by `sync --no-prompt --strategy ...` for cron /
+    launchd / systemd unattended runs. When None (the default), the
+    handler keeps the existing interactive [L]ocal / [D]rive / [E]ditor /
+    [S]kip flow — every existing caller is unchanged.
+    """
     config = Config.load(config_path)
     storage, mirrors = _create_storage_set(config)
     manifest = Manifest(config.project_path)
-    merge = MergeHandler()
+    merge = MergeHandler(non_interactive_strategy=non_interactive_strategy)
     snap = SnapshotManager(config, storage, mirrors=mirrors)
 
     # Prune orphan per-backend manifest state for mirrors no longer in
@@ -642,8 +657,14 @@ class _CLIGroup(click.Group):
         # script consumers. The diagnostic dump from v0.5.43 confirmed
         # the watcher banner was leaking into stdout ahead of the JSON
         # envelope on Linux.
+        # Same suppression for `sync --no-prompt`: the cron / launchd /
+        # systemd flow renders one yellow line per auto-resolved file
+        # plus one trailing summary line; a watcher banner or update
+        # notice in front of it would clutter cron mail with noise the
+        # operator can't act on from a non-interactive context anyway.
         json_mode = "--json" in args
-        if not json_mode:
+        no_prompt_mode = "--no-prompt" in args
+        if not json_mode and not no_prompt_mode:
             _check_watcher_running(sub_cmd)
             # Update check (best-effort, silent on any failure). Skipped for
             # the silent inbox path (PreToolUse hook) so it doesn't print an
@@ -3279,10 +3300,102 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
 
 @cli.command()
 @click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
-def sync(config_path: str) -> None:
-    """Bidirectional sync: push local changes, pull remote changes, prompt on conflicts."""
-    engine, _, _ = _load_engine(_resolve_config(config_path))
-    engine.sync()
+@click.option(
+    "--no-prompt",
+    "no_prompt",
+    is_flag=True,
+    default=False,
+    help=(
+        "Resolve conflicts non-interactively. Requires --strategy. "
+        "Designed for cron / launchd / systemd unattended runs where no "
+        "TTY is available. Default: prompts on conflicts as today."
+    ),
+)
+@click.option(
+    "--strategy",
+    "strategy",
+    type=click.Choice(["keep-local", "keep-remote"]),
+    default=None,
+    help=(
+        "Conflict-resolution strategy when --no-prompt is set. "
+        "keep-local overwrites the remote with the local content. "
+        "keep-remote overwrites the local file with the remote content. "
+        "Required when --no-prompt is set; ignored otherwise."
+    ),
+)
+def sync(config_path: str, no_prompt: bool, strategy: Optional[str]) -> None:
+    """Bidirectional sync: push local changes, pull remote changes, prompt on conflicts.
+
+    For unattended use under cron / launchd / systemd, pass
+    `--no-prompt --strategy {keep-local,keep-remote}` so every conflict
+    resolves non-interactively. Every auto-resolution is logged to
+    `_sync_log.json` with the strategy that won, so audits can spot every
+    auto-overwrite after the fact.
+    """
+    # Mutual-exclusion validation. The flag combination IS the destructive
+    # consent (per `feedback_destructive_safe_default.md`), but
+    # `--no-prompt` alone has no meaning — we'd just hang on stdin.
+    if no_prompt and strategy is None:
+        console.print(
+            "[red]--no-prompt requires --strategy. "
+            "Choices: keep-local, keep-remote.[/]"
+        )
+        sys.exit(1)
+    if strategy is not None and not no_prompt:
+        # Don't fail — the interactive flow still works fine. Just warn so
+        # the user knows their --strategy flag had no effect.
+        console.print(
+            "[yellow]--strategy ignored without --no-prompt[/]"
+        )
+        strategy = None
+
+    # Detect cron-style invocation: stdin not a TTY AND no --no-prompt set.
+    # The interactive prompt (`click.prompt`) would either hang forever
+    # (cron with stdin redirected from /dev/null) or fail immediately
+    # (cron with no stdin), and either way the user's "fix it" is to
+    # pass `--no-prompt --strategy`. Surface that hint up front so the
+    # operator doesn't have to read 200 lines of cron mail to figure it
+    # out. We only fail-fast when there are actual conflicts to resolve;
+    # but at command entry we don't know yet, so the safe move is to
+    # detect the no-TTY case and tell the user to be explicit.
+    if not no_prompt and not sys.stdin.isatty():
+        console.print(
+            "[red]sync needs an interactive terminal to prompt on conflicts.[/]\n"
+            "[yellow]Hint:[/] pass [bold]--no-prompt --strategy keep-local[/] "
+            "(or [bold]keep-remote[/]) so every conflict resolves "
+            "automatically — see "
+            "[bold]docs/cli-reference.md#sync[/]."
+        )
+        sys.exit(1)
+
+    engine, _, _ = _load_engine(
+        _resolve_config(config_path),
+        non_interactive_strategy=strategy,
+    )
+    result = engine.sync(non_interactive_strategy=strategy)
+
+    # Trailing one-line summary in non-interactive mode. Designed to fit
+    # on a single line in cron mail / journalctl output so an operator
+    # can grep for "Summary:" and immediately see what happened.
+    if no_prompt:
+        ar = result.get("auto_resolved", []) or []
+        if ar:
+            # Strategy is uniform across the run — every auto-resolved
+            # entry shares the same strategy this command ran under.
+            conflict_text = (
+                f"{len(ar)} conflict auto-resolved ({strategy})"
+                if len(ar) == 1
+                else f"{len(ar)} conflicts auto-resolved ({strategy})"
+            )
+        else:
+            conflict_text = "0 conflicts"
+        console.print(
+            f"[bold]Summary:[/] "
+            f"{result.get('in_sync', 0)} in sync, "
+            f"{len(result.get('pushed', []))} pushed, "
+            f"{len(result.get('pulled', []))} pulled, "
+            f"{conflict_text}."
+        )
 
 
 @cli.command()

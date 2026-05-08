@@ -468,6 +468,34 @@ For cron-driven setups that prefer a polling tick over a long-running daemon, th
 
 Each `--once` run does exactly one polling cycle, dispatches any inbox events, then exits 0. A persistent watermark in `~/.config/claude_mirror/watch_once_state/` ensures successive runs only surface events that arrived since the previous tick — the very first run after install captures the current log tail and emits nothing, so a fresh cron install does not flood you with weeks of historical events. `--quiet` suppresses the startup banner so cron emails only contain real news. See `claude-mirror watch --help` for the full flag list.
 
+### Unattended sync via cron
+
+`claude-mirror watch --once` only PULLS remote changes — it never pushes local edits and never resolves conflicts. For a fully bidirectional cron-driven flow (push local edits, pull remote edits, auto-resolve any conflicts) use `claude-mirror sync --no-prompt --strategy ...`:
+
+```cron
+# Hourly cron-driven sync. Local always wins on conflict — fits a workflow
+# where the cron host is the authoritative editing machine. Every auto-
+# resolution is logged to `_sync_log.json` on the remote with the strategy
+# that won, so you can audit overwrites later.
+0 * * * * cd /Users/alice/projects/myproject && /usr/local/bin/claude-mirror sync --no-prompt --strategy keep-local
+
+# Every 15 minutes, remote always wins — fits a workflow where the cron
+# host is a passive backup target and the canonical edits happen
+# elsewhere (collaborator's laptop, web UI, etc.).
+*/15 * * * * cd /Users/alice/projects/myproject && /usr/local/bin/claude-mirror sync --no-prompt --strategy keep-remote
+```
+
+Output is one yellow line per auto-resolved file plus a trailing one-line `Summary:` so cron mail / `journalctl` is grep-friendly:
+
+```
+⚠  CLAUDE.md: auto-resolved (keep-local)
+Summary: 47 in sync, 2 pushed, 1 pulled, 1 conflict auto-resolved (keep-local).
+```
+
+`--strategy keep-local` overwriting remote IS destructive in the operator's mind (the same way `--force-local` is). The flag combination IS the consent — there is no extra typed-`YES` gate the way there is on `forget` / `prune` / `gc`. But every auto-resolved file is logged in `_sync_log.json` with its winning strategy, so an audit pass can spot every overwrite after the fact via `claude-mirror log --limit 100`.
+
+If you accidentally run `claude-mirror sync` (no flags) under cron, the command detects the non-TTY stdin and fails fast with a hint pointing at the right flag combination, rather than hanging on a prompt that will never be answered. See [`docs/cli-reference.md#sync`](cli-reference.md#sync) for the full flag table.
+
 To watch a specific subset:
 
 ```bash

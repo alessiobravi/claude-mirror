@@ -4,6 +4,18 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.43] — 2026-05-08
+
+**DIAGNOSTIC release.** Not for production use. v0.5.39's `--json` mode is broken on Linux under Click's CliRunner; three theory-driven hotfixes (v0.5.40 / v0.5.41 / v0.5.42) failed to land. This release ships instrumentation rather than a fix:
+
+- `_emit_json_success` writes diagnostic markers to stderr (sys.stdout type, sys.stderr type, payload length, click.echo result), then emits the JSON to BOTH stdout and stderr.
+- A new `tests/test_DIAG043_streams.py` runs `status --json` and FAILS unconditionally, dumping `result.exit_code` / `result.stdout` / `result.stderr` / `result.output` to the assertion message so CI logs reveal what actually landed in each captured stream.
+- v0.5.44 will strip the instrumentation and ship a real fix once CI tells us which channel reaches `result.stdout` on Linux.
+
+None of v0.5.39 / v0.5.40 / v0.5.41 / v0.5.42 was tagged or published to PyPI.
+
+---
+
 ## [0.5.42] — 2026-05-08
 
 Third and decisive hotfix for v0.5.39's `--json` mode on Linux. The two prior fixes (`click.echo` in v0.5.40, `sys.stdout` snapshot/restore in v0.5.41) addressed symptoms; this one addresses the cause.

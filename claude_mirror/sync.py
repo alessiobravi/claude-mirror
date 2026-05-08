@@ -610,6 +610,11 @@ class SyncEngine:
             else:
                 progress.update(conflict_task, completed=1)
 
+            # Persist manifest before snapshot — see identical comment in
+            # `push()` for the rationale (Ctrl+C during snapshot must not
+            # lose the file-upload bookkeeping).
+            self.manifest.save()
+
             # Snapshot
             snapshot_ts: Optional[str] = None
             snapshot_error: Optional[str] = None
@@ -774,6 +779,17 @@ class SyncEngine:
                     )
             else:
                 progress.update(conflict_task, completed=1)
+
+            # Persist the manifest to disk NOW — before the snapshot
+            # phase, which can take a long time on a fresh mirror with
+            # thousands of unique blobs and is the most likely point of
+            # interruption (Ctrl+C, network drop). Without this, the
+            # in-memory per-file state recorded by _push_file/_fan_out
+            # would be lost on interrupt and the same files would be
+            # re-pushed on the next run, wasting bandwidth and breaking
+            # the user's mental model. The file uploads are durable;
+            # only the snapshot create is meaningfully retryable.
+            self.manifest.save()
 
             # Snapshot
             snapshot_ts: Optional[str] = None

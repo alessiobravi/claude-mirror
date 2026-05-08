@@ -4,6 +4,19 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.40] — 2026-05-08
+
+Hotfix for v0.5.39 — `--json` emit path was Linux-broken under Click 8.3's `CliRunner`.
+
+### Fixed — `--json` output reaches `result.stdout` on Linux too
+- The v0.5.39 `_emit_json_success` / `_emit_json_error` helpers used `sys.stdout.write()` + `sys.stdout.flush()` to emit the JSON envelope. This worked under macOS pytest but failed on the CI Linux matrix (Python 3.11 / 3.12 / 3.13 / 3.14): 13 of the 21 `tests/test_json_output.py` cases failed with `json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)` — `result.stdout` was an empty string.
+- Root cause: under Click 8.3 + CliRunner on Linux, `sys.stdout.write()` does not reliably reach the runner's captured stdout buffer. macOS happens to route the writes through a path that CliRunner observes; Linux does not. Click's own `click.echo()` uses Click's internal output abstraction and is captured identically on both platforms.
+- Fix: switched both `_emit_json_success` (success → stdout) and `_emit_json_error` (error → stderr via `err=True`) to `click.echo()`. Same JSON serialisation; same success / error semantics; same exit codes; just a different writer.
+- v0.5.39 was pushed to `origin/main` but not tagged and not published to PyPI, so no users running `pipx install claude-mirror` ever received the broken `--json` path.
+- All 505 tests pass on macOS locally; CI re-run on push will validate the Linux matrix.
+
+---
+
 ## [0.5.39] — 2026-05-08
 
 A large quality-of-life batch — eleven user-facing additions across snapshot CLI, scripting interfaces, project-tree exclusions, cron-mode watcher, PowerShell completion, and per-backend bandwidth control. **505 tests pass (368 → 505, +137 new).** All offline, all deterministic, ~2.5s end-to-end.

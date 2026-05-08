@@ -130,22 +130,23 @@ def _emit_json_success(command: str, result: Any) -> None:
 
     Uses indent=2 + sort_keys=False + ensure_ascii=False so the output is
     human-readable, diff-friendly, and preserves UTF-8 paths verbatim.
+    Uses click.echo so Click's CliRunner captures the output identically
+    on macOS and Linux. (sys.stdout.write does not reliably reach the
+    runner's captured buffer on Linux under Click 8.3.)
     """
     doc = {
         "version": JSON_SCHEMA_VERSION,
         "command": command,
         "result": result,
     }
-    sys.stdout.write(
-        _json.dumps(doc, indent=2, sort_keys=False, ensure_ascii=False)
-    )
-    sys.stdout.write("\n")
-    sys.stdout.flush()
+    click.echo(_json.dumps(doc, indent=2, sort_keys=False, ensure_ascii=False))
 
 
 def _emit_json_error(command: str, exc: BaseException) -> None:
     """Emit a v1 error envelope to stderr: {version, command, error},
-    then exit 1. `exc.__class__.__name__` is the `error.type`."""
+    then exit 1. `exc.__class__.__name__` is the `error.type`. Uses
+    click.echo(err=True) for the same Linux/CliRunner reason as
+    _emit_json_success."""
     doc = {
         "version": JSON_SCHEMA_VERSION,
         "command": command,
@@ -154,11 +155,10 @@ def _emit_json_error(command: str, exc: BaseException) -> None:
             "message": str(exc),
         },
     }
-    sys.stderr.write(
-        _json.dumps(doc, indent=2, sort_keys=False, ensure_ascii=False)
+    click.echo(
+        _json.dumps(doc, indent=2, sort_keys=False, ensure_ascii=False),
+        err=True,
     )
-    sys.stderr.write("\n")
-    sys.stderr.flush()
     sys.exit(1)
 
 

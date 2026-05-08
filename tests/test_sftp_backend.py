@@ -228,7 +228,15 @@ def _wire_fake(backend: SFTPBackend, server: Optional[FakeServer] = None) -> Fak
     fake_sftp.posix_rename.side_effect = server.posix_rename
     fake_sftp.open.side_effect = server.open
     backend._client = fake_ssh
-    backend._sftp = fake_sftp
+    # Per-thread SFTP channel cache (post-v0.5.34 fix for paramiko
+    # channel-multiplexing bottleneck). Tests still wire ONE shared mock
+    # SFTPClient — no real threading happens in unit tests, so a single
+    # cache slot for the calling thread suffices.
+    backend._tls.sftp = fake_sftp
+    # Also point the SSHClient mock at open_sftp so any code path that
+    # calls `self._client.open_sftp()` (e.g. a fresh worker thread) gets
+    # the same fake SFTPClient back rather than a generic MagicMock.
+    fake_ssh.open_sftp.return_value = fake_sftp
     backend._server = server  # for tests
     return server
 
@@ -426,8 +434,8 @@ def test_upload_file_uses_atomic_tmp_then_rename(make_config, config_dir, projec
     # The .tmp must NOT survive the rename.
     assert "/srv/project/note.md.tmp" not in server.storage
     # posix_rename must have been called.
-    backend._sftp.posix_rename.assert_called_once()
-    args, _ = backend._sftp.posix_rename.call_args
+    backend._tls.sftp.posix_rename.assert_called_once()
+    args, _ = backend._tls.sftp.posix_rename.call_args
     assert args[0].endswith(".tmp")
     assert args[1] == "/srv/project/note.md"
 
@@ -443,13 +451,13 @@ def test_upload_file_rolls_back_tmp_on_error(make_config, config_dir, project_di
     # Simulate posix_rename failing, the .tmp landed first.
     def boom(src, dst):
         raise IOError(errno.EIO, "I/O error during rename")
-    backend._sftp.posix_rename.side_effect = boom
+    backend._tls.sftp.posix_rename.side_effect = boom
 
     with pytest.raises(IOError):
         backend.upload_file(str(local), "note.md", "/srv/project")
 
     # The cleanup path called sftp.remove on the .tmp.
-    backend._sftp.remove.assert_called_once_with("/srv/project/note.md.tmp")
+    backend._tls.sftp.remove.assert_called_once_with("/srv/project/note.md.tmp")
 
 
 # ─── 12. upload_bytes round-trip ───────────────────────────────────────────────

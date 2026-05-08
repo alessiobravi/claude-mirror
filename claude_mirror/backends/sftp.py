@@ -53,24 +53,49 @@ class SFTPBackend(StorageBackend):
 
     def __init__(self, config: Config) -> None:
         self.config = config
+        # Single shared SSH connection (one TCP socket).
         self._client: Optional[paramiko.SSHClient] = None
-        self._sftp: Optional[paramiko.SFTPClient] = None
+        # Per-thread SFTPClient channels — paramiko's SFTPClient is
+        # NOMINALLY thread-safe but its operations multiplex through one
+        # request/response channel. Under concurrent load (e.g. snapshot
+        # blob fan-out with parallel_workers=5) the channel queue stalls,
+        # leaving most workers blocked while only one progresses. Giving
+        # each worker thread its own SFTP channel (over the same SSH
+        # connection — paramiko Transport supports many channels per
+        # connection) restores real parallelism without paying the TCP
+        # handshake cost per worker. threading.local cleans up channel
+        # references on thread exit; close() also drops them explicitly.
+        import threading as _threading
+        self._tls = _threading.local()
 
     # ------------------------------------------------------------------
     # Connection helper
     # ------------------------------------------------------------------
 
     def _connect(self) -> tuple[paramiko.SSHClient, paramiko.SFTPClient]:
-        """Establish (or reuse) an SSH + SFTP session.
+        """Establish (or reuse) the shared SSH connection AND return a
+        thread-local SFTPClient.
 
-        Caches the client + sftp handles on `self` so repeated calls in
-        the same process share one TCP connection. Host-key policy is
-        derived from `sftp_strict_host_check` — strict mode (default)
-        rejects unknown fingerprints; relaxed mode auto-adds them and
-        is intended only for closed LAN test setups.
+        Caches the SSHClient on `self._client` so repeated calls in the
+        same process share one TCP connection. The SFTPClient (channel)
+        is per-thread — each worker thread that touches `_connect` gets
+        its own channel multiplexed over the shared connection. See the
+        `__init__` comment for why per-thread channels matter for
+        parallel performance.
+
+        Host-key policy is derived from `sftp_strict_host_check` —
+        strict mode (default) rejects unknown fingerprints; relaxed mode
+        auto-adds them and is intended only for closed LAN test setups.
         """
-        if self._client is not None and self._sftp is not None:
-            return self._client, self._sftp
+        # Fast path: shared SSH ready, this thread already has a channel.
+        existing_sftp = getattr(self._tls, "sftp", None)
+        if self._client is not None and existing_sftp is not None:
+            return self._client, existing_sftp
+        # Open the shared SSH connection if it hasn't been established yet.
+        if self._client is not None and existing_sftp is None:
+            sftp = self._client.open_sftp()
+            self._tls.sftp = sftp
+            return self._client, sftp
 
         ssh = paramiko.SSHClient()
 
@@ -123,7 +148,9 @@ class SFTPBackend(StorageBackend):
         sftp = ssh.open_sftp()
 
         self._client = ssh
-        self._sftp = sftp
+        # First channel goes into thread-local for the calling thread;
+        # each subsequent thread that calls _connect opens its own.
+        self._tls.sftp = sftp
         return ssh, sftp
 
     def _mkdir_p(self, sftp: paramiko.SFTPClient, path: str) -> None:
@@ -237,9 +264,9 @@ class SFTPBackend(StorageBackend):
 
     @property
     def sftp(self) -> paramiko.SFTPClient:
-        if not self._sftp:
-            self.get_credentials()
-        return self._sftp
+        # _connect returns this thread's SFTPClient (caches in _tls).
+        _, sftp = self._connect()
+        return sftp
 
     @property
     def ssh(self) -> paramiko.SSHClient:

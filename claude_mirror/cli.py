@@ -5299,6 +5299,584 @@ def completion(shell: str) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# Google Drive deep diagnostic constants + seams
+# ───────────────────────────────────────────────────────────────────────────
+#
+# Service-account email that Google Drive's push-notification subsystem uses
+# to publish change events into a user-owned Pub/Sub topic. When you call
+# `drive.changes.watch(topicName=...)`, Drive's backend authenticates as
+# THIS account when posting to the topic, so the topic's IAM policy MUST
+# include this principal with role `roles/pubsub.publisher`.
+#
+# Source: Google Drive API Push Notifications guide,
+# https://developers.google.com/drive/api/guides/push#initial-requirements
+#
+# About 70% of self-serve Drive setups miss this grant — Pub/Sub appears to
+# work (subscribe / publish from the user's own credentials succeeds) but
+# Drive itself silently fails to publish change events, so other machines
+# never receive notifications. The deep doctor surfaces it explicitly.
+_DRIVE_PUBSUB_PUBLISHER_SA = "apps-storage-noreply@google.com"
+
+# OAuth scope identifiers we expect to find on a fully-configured token.
+_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+_PUBSUB_SCOPE = "https://www.googleapis.com/auth/pubsub"
+
+
+def _googledrive_deep_check_factory(
+    config: "Config", token_path: "Path"
+) -> dict:
+    """Build the OAuth credentials + Pub/Sub admin client used by the deep
+    Google Drive doctor checks.
+
+    Lazily imports the Google Cloud Pub/Sub SDK so the cost is only paid
+    when `claude-mirror doctor` is actually inspecting a Drive backend.
+    Most doctor invocations are quick health checks; we don't want them
+    paying the multi-hundred-millisecond gRPC import cost.
+
+    Returns a dict with keys:
+      publisher    — google.cloud.pubsub_v1.PublisherClient instance
+      creds        — google.oauth2.credentials.Credentials instance
+      scopes       — list of granted scope URIs (from token JSON)
+      auth_error   — exception or None; non-None means token is unusable
+                     (corrupt / wrong shape / refresh failed). When set,
+                     the deep checks emit ONE auth-bucket failure rather
+                     than five identical "auth needed" lines.
+
+    Tests monkeypatch this whole function to inject a stub publisher /
+    scope list, which is why it's a module-level seam rather than inline.
+    """
+    import json as _json_local  # local alias avoids shadowing module-level import
+
+    # Read scopes directly from the token JSON. We do this BEFORE building
+    # OAuth `Credentials` so that even a token with a missing/malformed
+    # scopes field doesn't crash the factory — we just report empty scopes
+    # and let the calling check fail with a clear message.
+    scopes: list[str] = []
+    auth_error: Optional[BaseException] = None
+    try:
+        token_data = _json_local.loads(token_path.read_text())
+        if isinstance(token_data, dict):
+            raw_scopes = token_data.get("scopes")
+            if isinstance(raw_scopes, list):
+                scopes = [str(s) for s in raw_scopes]
+            elif isinstance(raw_scopes, str):
+                # Legacy token format: scopes as space-separated string.
+                scopes = raw_scopes.split()
+    except (OSError, _json_local.JSONDecodeError) as e:
+        auth_error = e
+
+    # Lazy-import — pays the cost only on the Drive deep path.
+    creds = None
+    publisher = None
+    try:
+        from google.oauth2.credentials import Credentials  # noqa: PLC0415
+        from google.cloud import pubsub_v1  # noqa: PLC0415
+
+        creds = Credentials.from_authorized_user_file(
+            str(token_path),
+            [_DRIVE_SCOPE, _PUBSUB_SCOPE],
+        )
+        publisher = pubsub_v1.PublisherClient(credentials=creds)
+    except BaseException as e:  # noqa: BLE001 — diagnostic must not bubble
+        if auth_error is None:
+            auth_error = e
+
+    return {
+        "publisher": publisher,
+        "creds": creds,
+        "scopes": scopes,
+        "auth_error": auth_error,
+    }
+
+
+def _run_googledrive_deep_checks(path: str, config: "Config") -> list[str]:
+    """Drive-specific deep diagnostic checks.
+
+    Runs AFTER the generic credentials/token/connectivity checks have
+    already reported. Adds Drive-specific assertions that the generic
+    pass cannot make:
+
+      1. OAuth scopes granted (Drive required, Pub/Sub optional but
+         needed for Pub/Sub-related checks 4-6).
+      2. Drive API enabled in the GCP project.
+      3. Pub/Sub API enabled.
+      4. Pub/Sub topic exists at the configured projects/PROJECT/topics/TOPIC.
+      5. Per-machine subscription exists at the canonical name pattern
+         (config.subscription_id, defined as `{topic}-{machine_safe}`).
+      6. Drive's service account has `roles/pubsub.publisher` on the
+         topic — the killer "70% of users miss this" check.
+
+    Returns the list of failure summary strings (empty ⇒ all-pass).
+    Renders ✓ / ✗ / ⚠ lines to `console` as it goes, matching the
+    surrounding doctor's output style.
+
+    Auth failures are bucketed: if the saved token is unusable, ONE
+    AUTH-class failure line is emitted and checks 2-6 are skipped, so
+    the user sees a single "fix: re-run claude-mirror auth" rather than
+    five identical lines for the same root cause.
+    """
+    failures: list[str] = []
+
+    # Skip the entire deep section gracefully when the user hasn't even
+    # configured a GCP project or Pub/Sub topic. The Drive backend itself
+    # tolerates missing Pub/Sub config (it just disables real-time push);
+    # we mirror that here with an info line rather than failing.
+    gcp_project_id = (config.gcp_project_id or "").strip()
+    pubsub_topic_id = (config.pubsub_topic_id or "").strip()
+    if not gcp_project_id or not pubsub_topic_id:
+        console.print(
+            "  [yellow]⚠[/] Pub/Sub not configured "
+            "([dim]gcp_project_id / pubsub_topic_id empty[/]) — "
+            "skipping deep Drive checks. Real-time notifications "
+            "won't work without these. "
+            "[yellow]Fix:[/] run "
+            f"[bold]claude-mirror init --wizard --config {path}[/] "
+            "to add Pub/Sub settings."
+        )
+        return failures
+
+    token_path = Path(config.token_file)
+    if not token_path.exists():
+        # The generic check above already emitted a failure for the
+        # missing token file; emitting a second "deep checks skipped"
+        # message would just be noise. Bail silently.
+        return failures
+
+    # ───── Build the publisher + scopes via the test seam ─────
+    factory_result = _googledrive_deep_check_factory(config, token_path)
+    publisher = factory_result["publisher"]
+    scopes: list[str] = list(factory_result.get("scopes") or [])
+    auth_error = factory_result.get("auth_error")
+
+    # ───── Check 1: OAuth scopes granted ─────
+    has_drive_scope = _DRIVE_SCOPE in scopes
+    has_pubsub_scope = _PUBSUB_SCOPE in scopes
+
+    if not has_drive_scope:
+        console.print(
+            "  [red]✗[/] OAuth Drive scope not granted "
+            f"([dim]{_DRIVE_SCOPE}[/])\n"
+            "      [yellow]Fix:[/] run "
+            f"[bold]claude-mirror auth --config {path}[/] and approve "
+            "the Drive scope on the consent screen."
+        )
+        failures.append("OAuth Drive scope not granted")
+        # Without Drive scope nothing else works — bail before issuing
+        # five more API errors that all root-cause to the same fix.
+        return failures
+
+    if has_pubsub_scope:
+        console.print(
+            "  [green]✓[/] OAuth scopes: "
+            "Drive [green]✓[/], Pub/Sub [green]✓[/]"
+        )
+    else:
+        console.print(
+            "  [yellow]⚠[/] OAuth scopes: Drive [green]✓[/], "
+            "Pub/Sub [yellow]not granted[/]; "
+            "skipping Pub/Sub checks. Re-run "
+            f"[bold]claude-mirror auth --config {path}[/] "
+            "to add the scope if you want real-time notifications."
+        )
+        # No Pub/Sub scope ⇒ checks 2-6 cannot succeed anyway. Pretend
+        # we ran them and return clean — the user opted out of Pub/Sub.
+        return failures
+
+    # If the credentials object itself couldn't be loaded (corrupt token,
+    # OAuth refresh blew up at construction time), bucket it as ONE auth
+    # failure — calling get_topic / get_iam_policy below would just spew
+    # five copies of the same root cause.
+    if auth_error is not None or publisher is None:
+        err_text = str(auth_error) if auth_error is not None else "unknown"
+        console.print(
+            "  [red]✗[/] OAuth credentials cannot be used for Pub/Sub "
+            f"admin calls: [dim]{err_text[:200]}[/]\n"
+            "      [yellow]Fix:[/] re-run "
+            f"[bold]claude-mirror auth --config {path}[/] to refresh "
+            "the token; if the failure persists, the saved scopes may "
+            "not include Pub/Sub admin permissions."
+        )
+        failures.append("OAuth credentials unusable for Pub/Sub admin")
+        return failures
+
+    # Lazy-import Pub/Sub error classes — same import-cost rationale as
+    # the publisher itself, plus we need them to classify exceptions
+    # raised by the publisher's RPC methods below.
+    from google.api_core.exceptions import (  # noqa: PLC0415
+        NotFound,
+        PermissionDenied,
+        Unauthenticated,
+        FailedPrecondition,
+        ServiceUnavailable,
+        DeadlineExceeded,
+        GoogleAPICallError,
+    )
+    from google.auth.exceptions import RefreshError  # noqa: PLC0415
+
+    topic_path = (
+        f"projects/{gcp_project_id}/topics/{pubsub_topic_id}"
+    )
+    subscription_path = (
+        f"projects/{gcp_project_id}/subscriptions/"
+        f"{config.subscription_id}"
+    )
+
+    def _classify(exc: BaseException) -> str:
+        """Map an SDK exception to one of: api_disabled, auth, not_found,
+        permission, transient, unknown."""
+        text = str(exc)
+        if isinstance(exc, RefreshError) or "invalid_grant" in text.lower():
+            return "auth"
+        if isinstance(exc, Unauthenticated):
+            return "auth"
+        # "API has not been used in project X before or it is disabled"
+        # is the canonical Google Cloud "API not enabled" error string.
+        if "has not been used in project" in text or "is disabled" in text:
+            return "api_disabled"
+        if isinstance(exc, FailedPrecondition) and (
+            "API" in text or "enable" in text.lower()
+        ):
+            return "api_disabled"
+        if isinstance(exc, NotFound):
+            return "not_found"
+        if isinstance(exc, PermissionDenied):
+            return "permission"
+        if isinstance(exc, (ServiceUnavailable, DeadlineExceeded)):
+            return "transient"
+        if isinstance(exc, (TimeoutError, ConnectionError)):
+            return "transient"
+        return "unknown"
+
+    # Track whether we've already emitted the AUTH bucket so a cascading
+    # auth failure across checks 2-6 surfaces ONCE not five times.
+    auth_bucket_reported = False
+
+    def _maybe_auth_bucket(exc: BaseException) -> bool:
+        """If `exc` looks like AUTH-class, emit ONE bucket line (only
+        the first time) and return True. Caller skips its own per-check
+        message. Returns False otherwise."""
+        nonlocal auth_bucket_reported
+        if _classify(exc) != "auth":
+            return False
+        if not auth_bucket_reported:
+            auth_bucket_reported = True
+            console.print(
+                "  [red]✗[/] Pub/Sub admin auth failed "
+                f"([dim]{type(exc).__name__}: {str(exc)[:140]}[/])\n"
+                "      [yellow]Fix:[/] re-run "
+                f"[bold]claude-mirror auth --config {path}[/] — "
+                "remaining Pub/Sub checks skipped to avoid duplicate "
+                "failures from the same root cause."
+            )
+            failures.append("Pub/Sub admin auth failed")
+        return True
+
+    # ───── Check 2: Drive API enabled ─────
+    # Cheap probe: drive.about.get(fields="user"). 403 with the canonical
+    # "API has not been used in project X" string ⇒ Drive API not enabled
+    # in the GCP project that owns the OAuth client.
+    drive_api_ok = False
+    try:
+        from googleapiclient.discovery import build as _gapi_build  # noqa: PLC0415
+
+        _drive_service = _gapi_build(
+            "drive", "v3",
+            credentials=factory_result["creds"],
+            cache_discovery=False,
+        )
+        _drive_service.about().get(fields="user").execute()
+        drive_api_ok = True
+    except BaseException as exc:  # noqa: BLE001
+        if _maybe_auth_bucket(exc):
+            # Auth-bucket already emitted; skip remaining checks.
+            return failures
+        klass = _classify(exc)
+        text = str(exc)
+        if klass == "api_disabled":
+            console.print(
+                f"  [red]✗[/] Drive API not enabled in GCP project "
+                f"[bold]{gcp_project_id}[/]\n"
+                f"      [dim]{text[:200]}[/]\n"
+                f"      [yellow]Fix:[/] enable the Drive API at "
+                f"[bold]https://console.cloud.google.com/apis/library/"
+                f"drive.googleapis.com?project={gcp_project_id}[/]"
+            )
+            failures.append(
+                f"Drive API not enabled in {gcp_project_id}"
+            )
+        elif klass == "transient":
+            console.print(
+                "  [red]✗[/] Drive API probe failed (transient): "
+                f"[dim]{type(exc).__name__}: {text[:140]}[/]\n"
+                "      [yellow]Fix:[/] retry; if persistent, your "
+                "credentials may have lost the relevant scope — re-run "
+                f"[bold]claude-mirror auth --config {path}[/]."
+            )
+            failures.append("Drive API probe transient failure")
+        else:
+            console.print(
+                f"  [red]✗[/] Drive API probe failed "
+                f"([dim]{type(exc).__name__}[/]): "
+                f"[dim]{text[:160]}[/]\n"
+                f"      [yellow]Fix:[/] enable the Drive API at "
+                f"[bold]https://console.cloud.google.com/apis/library/"
+                f"drive.googleapis.com?project={gcp_project_id}[/] "
+                f"or re-run [bold]claude-mirror auth --config {path}[/]."
+            )
+            failures.append(
+                f"Drive API probe failed: {type(exc).__name__}"
+            )
+
+    if drive_api_ok:
+        console.print(
+            f"  [green]✓[/] Drive API enabled in project "
+            f"[dim]{gcp_project_id}[/]"
+        )
+
+    # ───── Check 3: Pub/Sub API enabled (probe via get_topic) ─────
+    # We piggy-back on the topic-existence check below: if get_topic raises
+    # the "API not enabled" string, that's check 3 failing; if it raises
+    # NotFound, that's check 3 PASSING and check 4 (topic exists) failing;
+    # if it succeeds, both 3 and 4 pass. One RPC, two signals.
+    topic_get_exc: Optional[BaseException] = None
+    topic_exists = False
+    try:
+        publisher.get_topic(request={"topic": topic_path})
+        topic_exists = True
+    except BaseException as exc:  # noqa: BLE001
+        topic_get_exc = exc
+
+    if topic_get_exc is None:
+        # Topic exists ⇒ Pub/Sub API definitionally enabled.
+        console.print("  [green]✓[/] Pub/Sub API enabled")
+        console.print(
+            f"  [green]✓[/] Pub/Sub topic exists: [dim]{topic_path}[/]"
+        )
+    else:
+        if _maybe_auth_bucket(topic_get_exc):
+            return failures
+        klass = _classify(topic_get_exc)
+        text = str(topic_get_exc)
+        if klass == "api_disabled":
+            console.print(
+                "  [red]✗[/] Pub/Sub API not enabled in GCP project "
+                f"[bold]{gcp_project_id}[/]\n"
+                f"      [dim]{text[:200]}[/]\n"
+                f"      [yellow]Fix:[/] enable the Pub/Sub API at "
+                f"[bold]https://console.cloud.google.com/apis/library/"
+                f"pubsub.googleapis.com?project={gcp_project_id}[/]"
+            )
+            failures.append(
+                f"Pub/Sub API not enabled in {gcp_project_id}"
+            )
+            # Without Pub/Sub API, none of checks 4-6 can run.
+            return failures
+        # API is presumed enabled if we got here — emit the API ✓ now and
+        # then the per-failure line for the topic check.
+        console.print("  [green]✓[/] Pub/Sub API enabled")
+        if klass == "not_found":
+            console.print(
+                f"  [red]✗[/] Pub/Sub topic does not exist: "
+                f"[bold]{topic_path}[/]\n"
+                f"      [yellow]Fix:[/] create the topic at "
+                f"[bold]https://console.cloud.google.com/cloudpubsub/"
+                f"topic/list?project={gcp_project_id}[/] (topic ID: "
+                f"[bold]{pubsub_topic_id}[/]), or re-run "
+                f"[bold]claude-mirror init --wizard --config {path}[/]."
+            )
+            failures.append(f"Pub/Sub topic missing: {topic_path}")
+            # Without a topic, the subscription + IAM checks can't pass.
+            return failures
+        if klass == "permission":
+            console.print(
+                f"  [red]✗[/] Pub/Sub topic check denied (permission): "
+                f"[dim]{text[:140]}[/]\n"
+                f"      [yellow]Fix:[/] grant your account the "
+                f"[bold]Pub/Sub Editor[/] role at "
+                f"[bold]https://console.cloud.google.com/iam-admin/iam"
+                f"?project={gcp_project_id}[/]."
+            )
+            failures.append("Pub/Sub topic check permission denied")
+            return failures
+        if klass == "transient":
+            console.print(
+                "  [red]✗[/] Pub/Sub topic probe failed (transient): "
+                f"[dim]{type(topic_get_exc).__name__}: {text[:140]}[/]\n"
+                "      [yellow]Fix:[/] retry; if persistent, your "
+                "credentials may have lost the relevant scope — re-run "
+                f"[bold]claude-mirror auth --config {path}[/]."
+            )
+            failures.append("Pub/Sub topic probe transient failure")
+            return failures
+        console.print(
+            f"  [red]✗[/] Pub/Sub topic probe failed "
+            f"([dim]{type(topic_get_exc).__name__}[/]): "
+            f"[dim]{text[:160]}[/]\n"
+            f"      [yellow]Fix:[/] inspect the error above and verify "
+            f"the topic at "
+            f"[bold]https://console.cloud.google.com/cloudpubsub/topic/"
+            f"list?project={gcp_project_id}[/]."
+        )
+        failures.append(
+            f"Pub/Sub topic probe failed: {type(topic_get_exc).__name__}"
+        )
+        return failures
+
+    if not topic_exists:
+        # Defensive: the branches above should all have returned by now.
+        return failures
+
+    # ───── Check 5: Per-machine subscription exists ─────
+    try:
+        from google.cloud import pubsub_v1 as _pubsub_v1  # noqa: PLC0415
+
+        # Build a SubscriberClient lazily — we only need it for get_subscription.
+        # Reuse the OAuth credentials from the factory.
+        _subscriber = _pubsub_v1.SubscriberClient(
+            credentials=factory_result["creds"]
+        )
+        try:
+            _subscriber.get_subscription(
+                request={"subscription": subscription_path}
+            )
+        finally:
+            try:
+                _subscriber.close()
+            except Exception:
+                pass
+        console.print(
+            f"  [green]✓[/] Pub/Sub subscription exists for this machine: "
+            f"[dim]{subscription_path}[/]"
+        )
+    except BaseException as exc:  # noqa: BLE001
+        if _maybe_auth_bucket(exc):
+            return failures
+        klass = _classify(exc)
+        text = str(exc)
+        if klass == "not_found":
+            console.print(
+                f"  [red]✗[/] Pub/Sub subscription does not exist for "
+                f"this machine: [bold]{subscription_path}[/]\n"
+                f"      [yellow]Fix:[/] run "
+                f"[bold]claude-mirror auth --config {path}[/] — auth "
+                f"creates the per-machine subscription if it's missing."
+            )
+            failures.append(
+                f"Pub/Sub subscription missing: {subscription_path}"
+            )
+        elif klass == "transient":
+            console.print(
+                "  [red]✗[/] Pub/Sub subscription probe failed "
+                f"(transient): [dim]{type(exc).__name__}: "
+                f"{text[:140]}[/]\n"
+                "      [yellow]Fix:[/] retry; if persistent, your "
+                "credentials may have lost the relevant scope — re-run "
+                f"[bold]claude-mirror auth --config {path}[/]."
+            )
+            failures.append(
+                "Pub/Sub subscription probe transient failure"
+            )
+        else:
+            console.print(
+                f"  [red]✗[/] Pub/Sub subscription probe failed "
+                f"([dim]{type(exc).__name__}[/]): "
+                f"[dim]{text[:160]}[/]\n"
+                f"      [yellow]Fix:[/] re-run "
+                f"[bold]claude-mirror auth --config {path}[/] to "
+                f"recreate the subscription."
+            )
+            failures.append(
+                f"Pub/Sub subscription probe failed: {type(exc).__name__}"
+            )
+
+    # ───── Check 6: IAM grant — Drive's service account on the topic ─────
+    # Read the topic's IAM policy and look for a binding that grants
+    # `roles/pubsub.publisher` to a member matching Drive's service account
+    # (`serviceAccount:apps-storage-noreply@google.com`). This is the
+    # killer check: ~70% of Drive setups miss this and silently lose
+    # real-time notifications.
+    try:
+        policy = publisher.get_iam_policy(
+            request={"resource": topic_path}
+        )
+    except BaseException as exc:  # noqa: BLE001
+        if _maybe_auth_bucket(exc):
+            return failures
+        klass = _classify(exc)
+        text = str(exc)
+        if klass == "permission":
+            console.print(
+                f"  [red]✗[/] Cannot read topic IAM policy "
+                f"(permission denied): [dim]{text[:140]}[/]\n"
+                f"      [yellow]Fix:[/] grant your account the "
+                f"[bold]Pub/Sub Admin[/] role at "
+                f"[bold]https://console.cloud.google.com/iam-admin/iam"
+                f"?project={gcp_project_id}[/] (Pub/Sub Editor cannot "
+                f"read IAM)."
+            )
+            failures.append("Topic IAM policy read permission denied")
+        elif klass == "transient":
+            console.print(
+                "  [red]✗[/] Topic IAM policy read failed (transient): "
+                f"[dim]{type(exc).__name__}: {text[:140]}[/]\n"
+                "      [yellow]Fix:[/] retry; if persistent, your "
+                "credentials may have lost the relevant scope — re-run "
+                f"[bold]claude-mirror auth --config {path}[/]."
+            )
+            failures.append("Topic IAM policy read transient failure")
+        else:
+            console.print(
+                f"  [red]✗[/] Topic IAM policy read failed "
+                f"([dim]{type(exc).__name__}[/]): "
+                f"[dim]{text[:160]}[/]\n"
+                f"      [yellow]Fix:[/] inspect the error above; verify "
+                f"the topic exists and your account has IAM read "
+                f"permission."
+            )
+            failures.append(
+                f"Topic IAM policy read failed: {type(exc).__name__}"
+            )
+        return failures
+
+    # Search the policy for the required binding. The proto's `bindings`
+    # field is repeated and each binding's `members` is repeated; match
+    # is exact (no wildcards) — `serviceAccount:` prefix included.
+    expected_member = f"serviceAccount:{_DRIVE_PUBSUB_PUBLISHER_SA}"
+    has_publisher_grant = False
+    for binding in getattr(policy, "bindings", []) or []:
+        role = getattr(binding, "role", "")
+        if role != "roles/pubsub.publisher":
+            continue
+        members = list(getattr(binding, "members", []) or [])
+        if expected_member in members:
+            has_publisher_grant = True
+            break
+
+    if has_publisher_grant:
+        console.print(
+            f"  [green]✓[/] Drive service account has publish permission "
+            f"on the topic ([dim]{_DRIVE_PUBSUB_PUBLISHER_SA}[/])"
+        )
+    else:
+        console.print(
+            f"  [red]✗[/] Drive service account missing publish "
+            f"permission on the topic\n"
+            f"      [dim]Push events from THIS machine won't notify "
+            f"others.[/]\n"
+            f"      [yellow]Fix:[/] run "
+            f"[bold]claude-mirror init --reconfigure-pubsub --config "
+            f"{path}[/], or grant [bold]roles/pubsub.publisher[/] to "
+            f"[bold]{expected_member}[/] on topic "
+            f"[bold]{topic_path}[/] in the Cloud Console."
+        )
+        failures.append(
+            "Drive service account missing roles/pubsub.publisher on topic"
+        )
+
+    return failures
+
+
 def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
     """Run the doctor check sequence for one config + its mirrors.
 
@@ -5747,6 +6325,15 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
                     f"any internet-reachable server."
                 )
 
+        # ───── Deep Drive checks (googledrive only) ─────
+        # Adds Drive-specific assertions the generic loop above can't
+        # make: OAuth scope inventory, Drive-API-enabled probe, Pub/Sub
+        # topic + per-machine subscription presence, and the IAM grant
+        # for Drive's service account on the topic. Skipped silently
+        # for other backends.
+        if backend_name == "googledrive":
+            failures.extend(_run_googledrive_deep_checks(path, config))
+
         # ───── Check 5: project_path exists locally ─────
         # Only check on the primary — every mirror config validated by
         # `_create_storage_set` must point at the SAME project_path, so
@@ -5828,6 +6415,10 @@ def doctor(config_path: str, backend_filter: str) -> None:
          sftp.stat for SFTP)
       4a. SFTP only: key file readable, known_hosts present (if strict
           host-check is on), plaintext-password advisory
+      4b. googledrive only: OAuth scope inventory (Drive required, Pub/Sub
+          optional), Drive API enabled, Pub/Sub API enabled, topic exists,
+          per-machine subscription exists, IAM grant for Drive's service
+          account on the topic
       5. project_path exists locally and is a directory
       6. Manifest integrity (if a manifest file is present)
 
@@ -5836,6 +6427,7 @@ def doctor(config_path: str, backend_filter: str) -> None:
       claude-mirror doctor
       claude-mirror doctor --config ~/.config/claude_mirror/work.yaml
       claude-mirror doctor --backend dropbox
+      claude-mirror doctor --backend googledrive    # generic + deep Drive checks
     """
     cfg_path = _resolve_config(config_path)
     console.print(f"[bold]claude-mirror doctor[/] — {cfg_path}\n")

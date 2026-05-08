@@ -851,6 +851,34 @@ The manifest auto-recovers from a corrupt file by moving it aside, which would o
 | `.claude_mirror_manifest.json` parses as JSON (if the file exists at all) | `manifest is corrupt: PATH` — fix is `rm PATH && claude-mirror sync --config PATH` |
 | Manifest absent | info-only line — first sync will create it |
 
+### Drive deep checks
+
+When `--backend googledrive` is in effect (explicitly via the flag, or because the primary / a Tier 2 mirror is `googledrive`), the doctor runs an additional six checks targeting failure modes that only show up on Google Drive. These complement the generic credentials/token/connectivity loop above; they don't replace it. Skipped silently for every other backend.
+
+| Check | Failure looks like |
+|---|---|
+| OAuth Drive scope granted | `OAuth Drive scope not granted` — fix is `claude-mirror auth --config PATH` and approve the Drive scope on the consent screen. Drive scope is required; without it, the rest of the deep section is short-circuited (no point cascading failures off a missing root scope) |
+| OAuth Pub/Sub scope granted | If absent, doctor emits a yellow `⚠` info line and skips the remaining four Pub/Sub checks — Drive-only setups (no real-time notifications) are a valid degraded mode, so this is informational rather than a failure |
+| Drive API enabled in the GCP project | `Drive API not enabled in GCP project PROJECT_ID` — parsed from Google's canonical "API has not been used in project X before or it is disabled" error string. Fix URL is templated with the project ID so the user clicks straight to the right enable page |
+| Pub/Sub API enabled | `Pub/Sub API not enabled in GCP project PROJECT_ID` — same error-string parsing as Drive. Probed via `publisher.get_topic` so one RPC double-duties as both the API-enabled probe AND the topic-existence probe (check 4) |
+| Pub/Sub topic exists at `projects/PROJECT/topics/TOPIC` | `Pub/Sub topic does not exist: PATH` — fix points at the topic-creation URL templated with the project ID |
+| Per-machine subscription exists at `projects/PROJECT/subscriptions/TOPIC-MACHINE` | `Pub/Sub subscription does not exist for this machine: PATH` — fix is `claude-mirror auth --config PATH`, which creates the per-machine subscription if it's missing. The machine-name suffix is the value of `machine_name` in the YAML, lower-cased and dot/space-normalised to dashes |
+| IAM grant: Drive's service account has `roles/pubsub.publisher` on the topic | `Drive service account missing publish permission on the topic` plus the explanatory line `Push events from THIS machine won't notify others.` and the fix `claude-mirror init --reconfigure-pubsub --config PATH`. This is the highest-value check — about 70% of self-serve Drive setups miss this grant. Pub/Sub appears to work (subscribe + publish from the user's own credentials succeeds), but Drive itself silently fails to publish change events, so other machines never receive notifications. The expected member is `serviceAccount:apps-storage-noreply@google.com` — Google Drive's push-notification service account |
+
+#### Auth-failure bucketing
+
+If the very first Pub/Sub admin call (`get_topic` or earlier) fails with `RefreshError`, `invalid_grant`, or `Unauthenticated`, the deep section emits ONE auth-bucket failure line (`Pub/Sub admin auth failed`) and skips the remaining checks. This avoids five identical "auth needed" lines for what is always the same root cause and the same fix (`claude-mirror auth --config PATH`).
+
+#### Lazy import
+
+The Pub/Sub admin SDK (`google.cloud.pubsub_v1`) is lazy-imported inside the deep-check function so the multi-hundred-millisecond gRPC import cost is only paid when `--backend googledrive` is actually exercising these checks. Generic `claude-mirror doctor` invocations on other backends remain fast.
+
+#### When the deep section is skipped
+
+- `gcp_project_id` or `pubsub_topic_id` empty in the YAML — doctor emits a yellow info line ("Pub/Sub not configured … real-time notifications won't work") and stops the deep section there. The user is using Drive without push notifications, which is a valid degraded mode.
+- Token file missing — the generic Check 3 above already emitted a failure for this; doctor doesn't repeat it in the deep section.
+- Pub/Sub OAuth scope not granted — see the second row of the table above.
+
 ### Sample successful output
 
 ```
@@ -862,6 +890,12 @@ claude-mirror doctor — /home/alice/.config/claude_mirror/myproject.yaml
   ✓ credentials file exists: /home/alice/.config/claude_mirror/credentials.json
   ✓ token file present with refresh_token: /home/alice/.config/claude_mirror/myproject-token.json
   ✓ backend connectivity ok (list_folders on root succeeded)
+  ✓ OAuth scopes: Drive ✓, Pub/Sub ✓
+  ✓ Drive API enabled in project myproject-prod
+  ✓ Pub/Sub API enabled
+  ✓ Pub/Sub topic exists: projects/myproject-prod/topics/claude-mirror-myproject
+  ✓ Pub/Sub subscription exists for this machine: projects/myproject-prod/subscriptions/claude-mirror-myproject-workstation
+  ✓ Drive service account has publish permission on the topic (apps-storage-noreply@google.com)
   ✓ project_path exists: /home/alice/projects/myproject
   ✓ manifest parses: /home/alice/projects/myproject/.claude_mirror_manifest.json
 
@@ -894,6 +928,31 @@ claude-mirror doctor — /home/alice/.config/claude_mirror/myproject.yaml
 ✗ 2 issue(s) found. Fix the items above and re-run claude-mirror doctor.
 ```
 
+### Sample Drive deep-check failure output
+
+```
+claude-mirror doctor — /home/alice/.config/claude_mirror/myproject.yaml
+
+  ✓ config file parses: /home/alice/.config/claude_mirror/myproject.yaml
+
+── checking googledrive backend (/home/alice/.config/claude_mirror/myproject.yaml)
+  ✓ credentials file exists: /home/alice/.config/claude_mirror/credentials.json
+  ✓ token file present with refresh_token: /home/alice/.config/claude_mirror/myproject-token.json
+  ✓ backend connectivity ok (list_folders on root succeeded)
+  ✓ OAuth scopes: Drive ✓, Pub/Sub ✓
+  ✓ Drive API enabled in project myproject-prod
+  ✓ Pub/Sub API enabled
+  ✓ Pub/Sub topic exists: projects/myproject-prod/topics/claude-mirror-myproject
+  ✓ Pub/Sub subscription exists for this machine: projects/myproject-prod/subscriptions/claude-mirror-myproject-workstation
+  ✗ Drive service account missing publish permission on the topic
+      Push events from THIS machine won't notify others.
+      Fix: run claude-mirror init --reconfigure-pubsub --config /home/alice/.config/claude_mirror/myproject.yaml, or grant roles/pubsub.publisher to serviceAccount:apps-storage-noreply@google.com on topic projects/myproject-prod/topics/claude-mirror-myproject in the Cloud Console.
+  ✓ project_path exists: /home/alice/projects/myproject
+  ✓ manifest parses: /home/alice/projects/myproject/.claude_mirror_manifest.json
+
+✗ 1 issue(s) found. Fix the items above and re-run claude-mirror doctor.
+```
+
 ### Exit codes
 
 - `0` — every check passed.
@@ -907,6 +966,7 @@ This composes cleanly with shell scripts and CI: `claude-mirror doctor && claude
 claude-mirror doctor                                              # auto-detect config from cwd
 claude-mirror doctor --config ~/.config/claude_mirror/work.yaml   # specific config
 claude-mirror doctor --backend dropbox                            # only check the dropbox backend (Tier 2)
+claude-mirror doctor --backend googledrive                        # generic checks PLUS Drive deep checks (scopes, APIs, topic, subscription, IAM grant)
 ```
 
 The `--backend` filter is case-insensitive and accepts `googledrive`, `dropbox`, `onedrive`, `webdav`, or `sftp`. The primary config is always parsed; only the per-backend loop is filtered. Skipped backends print a dim `── skipped: NAME (PATH) — does not match --backend FILTER` line so the output stays self-explanatory.

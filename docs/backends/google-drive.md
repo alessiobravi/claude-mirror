@@ -131,6 +131,61 @@ If you prefer to script the wizard or are configuring offline, all three behavio
 - **Server-side snapshot copy** — `full`-format snapshots use the `files.copy` API; no file data passes through the client.
 - **Storage cost** — counts against the **Google account's** 15 GB free quota (or whatever the account has).
 
+## Diagnosing setup problems
+
+Once a Drive backend is configured (or you suspect it's misconfigured), run:
+
+```bash
+claude-mirror doctor --backend googledrive
+```
+
+This runs the generic credentials/token/connectivity checks AND six Drive-specific deep checks:
+
+1. OAuth scope inventory — both `https://www.googleapis.com/auth/drive` and `https://www.googleapis.com/auth/pubsub` must be on the saved token. Drive scope is required; Pub/Sub scope is optional but needed for real-time notifications.
+2. Drive API enabled in the GCP project — parsed from Google's canonical "API has not been used in project X" error string. The fix URL is templated with your project ID.
+3. Pub/Sub API enabled — same error-string parsing as Drive.
+4. Pub/Sub topic exists at `projects/PROJECT/topics/TOPIC` — `gcp_project_id` and `pubsub_topic_id` from the YAML.
+5. Per-machine subscription exists at `projects/PROJECT/subscriptions/TOPIC-MACHINE` — the `MACHINE` suffix is the value of `machine_name` in the YAML, lower-cased and dot/space-normalised to dashes.
+6. IAM grant: Drive's service account (`apps-storage-noreply@google.com`) has `roles/pubsub.publisher` on the topic. **This is the highest-value check** — about 70% of self-serve Drive setups miss this grant. Pub/Sub appears to work (subscribe + publish from your own credentials succeeds), but Drive itself silently fails to publish change events, so other machines never receive notifications.
+
+Sample successful output:
+
+```
+$ claude-mirror doctor --backend googledrive
+claude-mirror doctor — /home/alice/.config/claude_mirror/myproject.yaml
+
+  ✓ config file parses: /home/alice/.config/claude_mirror/myproject.yaml
+
+── checking googledrive backend (/home/alice/.config/claude_mirror/myproject.yaml)
+  ✓ credentials file exists: /home/alice/.config/claude_mirror/credentials.json
+  ✓ token file present with refresh_token: /home/alice/.config/claude_mirror/myproject-token.json
+  ✓ backend connectivity ok (list_folders on root succeeded)
+  ✓ OAuth scopes: Drive ✓, Pub/Sub ✓
+  ✓ Drive API enabled in project myproject-prod
+  ✓ Pub/Sub API enabled
+  ✓ Pub/Sub topic exists: projects/myproject-prod/topics/claude-mirror-myproject
+  ✓ Pub/Sub subscription exists for this machine: projects/myproject-prod/subscriptions/claude-mirror-myproject-workstation
+  ✓ Drive service account has publish permission on the topic (apps-storage-noreply@google.com)
+  ✓ project_path exists: /home/alice/projects/myproject
+  ✓ manifest parses: /home/alice/projects/myproject/.claude_mirror_manifest.json
+
+✓ All checks passed.
+```
+
+Sample failure on the missing-IAM-grant case (the most common one):
+
+```
+  ✗ Drive service account missing publish permission on the topic
+      Push events from THIS machine won't notify others.
+      Fix: run claude-mirror init --reconfigure-pubsub --config /home/alice/.config/claude_mirror/myproject.yaml, or grant roles/pubsub.publisher to serviceAccount:apps-storage-noreply@google.com on topic projects/myproject-prod/topics/claude-mirror-myproject in the Cloud Console.
+```
+
+If multiple Pub/Sub admin calls fail with the same auth error (e.g. an expired token), doctor emits ONE bucketed `Pub/Sub admin auth failed` line and skips the remaining Pub/Sub checks, so you don't get five identical "re-run claude-mirror auth" lines for the same root cause. The fix is `claude-mirror auth --config PATH`.
+
+If you're using Drive without Pub/Sub real-time notifications (a valid degraded mode — `gcp_project_id` and `pubsub_topic_id` empty in the YAML), the deep section emits one yellow info line and skips. The generic checks still run; everything works for `push` / `pull` / `sync`, you just miss the sub-second push notifications.
+
+See [admin.md#drive-deep-checks](../admin.md#drive-deep-checks) for the full deep-check reference table and the auth-bucketing semantics.
+
 ## See also
 
 - [Scenario A — Standalone](../scenarios.md#a-standalone-mirror) for end-to-end usage patterns with this backend.

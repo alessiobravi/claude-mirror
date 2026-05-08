@@ -4,6 +4,59 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.46] — 2026-05-08
+
+Three independent improvements landed together — all additive, all on the 0.5.x line, no minor bump required. Drive BYO wizard polish (the most painful backend setup just got smoother), a deep Drive diagnostic to surface the silent IAM-grant failure most users never know they hit, and a small `seed-mirror` ergonomics fix.
+
+### Added — Drive BYO wizard polish (URL templating + input validation + post-auth smoke test)
+- **Auto-open Cloud Console at the right page** — after the wizard captures the GCP project ID, it offers (default Yes) to launch the Drive API enable / Pub/Sub API enable / OAuth client creation pages with `?project={project_id}` pre-filled. Falls through to printing URLs for copy-paste on headless / SSH machines.
+- **Inline regex validation** — `value_proc=` callbacks reject malformed inputs at the prompt with helpful errors:
+  - GCP project ID: `^[a-z][-a-z0-9]{4,28}[a-z0-9]$` plus a link to Google's identifier rules
+  - Drive folder ID: `^[A-Za-z0-9_-]{20,}$` plus a hint to copy the segment after `/folders/` in the Drive URL
+  - Pub/Sub topic ID: `^[a-zA-Z][\w.~+%-]{2,254}$`
+  - Credentials file path: existence + JSON-parse + `installed.client_id` field (catches the very common "I downloaded a service account key by mistake" failure)
+- **Post-auth smoke test** — after the wizard completes auth and BEFORE writing the YAML, runs `drive.files.list(pageSize=1, q="'<folder>' in parents")`. Catches "Drive API not enabled", credentials-for-wrong-project, and "the folder ID I just typed doesn't actually exist" — three failures that today only surface at first sync. Smoke-test failure offers a retry loop without aborting the wizard; the YAML still writes if the user declines.
+- New module `claude_mirror/_byo_wizard.py` (URL builders, four validators, smoke runner) so `cli.py`'s wizard branch stays compact.
+- 59 new tests in `tests/test_byo_wizard.py` (URL templating, each validator's accept/reject set incl. parametrized error messages, smoke-test pass/fail/retry/decline, ReDoS-safe regex audit).
+
+### Added — `claude-mirror doctor --backend googledrive` deep diagnostic
+- Six new check types layered on top of the existing generic `doctor` checks, only when the user explicitly filters to `googledrive`:
+  - **OAuth scopes granted** — Drive scope is mandatory; missing Pub/Sub scope downgrades the next four checks to a single yellow info line ("Pub/Sub scope not granted; skipping...") rather than five red failures.
+  - **Drive API enabled** in the GCP project — uses `drive.about.get(fields="user")` and parses Google's "API has not been used in project X" error text.
+  - **Pub/Sub API enabled** — same pattern via `publisher.get_topic`.
+  - **Pub/Sub topic exists** at `projects/{gcp_project_id}/topics/{pubsub_topic_id}`. NotFound → fail-with-fix-hint.
+  - **Per-machine subscription exists** at `projects/{gcp_project_id}/subscriptions/{pubsub_topic_id}-{machine_name_safe}` (lifted from the existing `config.subscription_id` property — not invented).
+  - **IAM grant present on the topic for Drive's service account** (`apps-storage-noreply@google.com`, wrapped in `_DRIVE_PUBSUB_PUBLISHER_SA` constant for future maintenance). This is the highest-value check — most users miss this step and "Pub/Sub seems to work but no notifications arrive" silently. Surfaces with `Push events from THIS machine won't notify others.` plus the fix command.
+- Auth failures (`invalid_grant` / `unauthorized_client`) bucket into a single `ACTION REQUIRED` block instead of repeating across checks.
+- `pubsub_v1` is **lazy-imported** so generic `doctor` invocations on non-Drive projects pay no extra cost.
+- 12 new tests in `tests/test_doctor_googledrive_deep.py` (all-pass, scope-not-granted skip, API-not-enabled detection, topic missing, subscription missing, IAM grant missing, mocked auth failure produces single bucket).
+
+### Added — `seed-mirror` auto-detects single unseeded backend
+- `--backend NAME` is now optional. When omitted, `seed-mirror` consults `manifest.unseeded_for_backend(...)` for every configured mirror and:
+  - Zero candidates → green ✓ "No mirrors have unseeded files. Nothing to seed." Exit 0.
+  - **Exactly one candidate** → dim "Auto-detected unseeded mirror: `<name>`" then continues with the inferred backend.
+  - Multiple candidates → red error listing the names alphabetically + suggesting `--backend NAME`. Exit 1.
+- Explicit `--backend NAME` always wins; back-compat preserved.
+- 7 new tests in `tests/test_seed_mirror_auto_detect.py` (zero / exact-one / multiple / explicit-flag-bypass / unknown-backend / already-seeded / no-mirrors).
+
+### Documented
+- `docs/backends/google-drive.md` — new "Wizard improvements as of v0.5.46" section + "Diagnosing setup problems" subsection.
+- `docs/admin.md` — new `### Drive deep checks` subsection under `## Doctor` with check-matrix table, auth-bucketing semantics, lazy-import note, sample success + failure outputs. seed-mirror Tier 2 reference updated to mention auto-detect.
+- `docs/cli-reference.md` — `seed-mirror` synopsis line shows `[--backend NAME]`; `doctor` entry notes deep checks for `googledrive`.
+- `README.md` — Quality gates count `506 → 584` and three new coverage surfaces named: BYO wizard, deep doctor checks, seed-mirror auto-detect.
+
+### Updated docs/files
+- `claude_mirror/_byo_wizard.py` (NEW).
+- `claude_mirror/cli.py` (wizard reorder + value_proc validators + smoke-test loop; `_run_googledrive_deep_checks` ~370 lines hooked into `_run_doctor_checks`; `seed-mirror` `--backend` now optional with auto-detect).
+- `tests/test_byo_wizard.py`, `tests/test_doctor_googledrive_deep.py`, `tests/test_seed_mirror_auto_detect.py` (NEW, 78 tests total).
+- `docs/admin.md`, `docs/backends/google-drive.md`, `docs/cli-reference.md`, `README.md`.
+- `pyproject.toml` (version 0.5.45 → 0.5.46).
+
+### Tests
+- `pytest tests/` — **584 passed in ~2.5s** (= 506 baseline + 59 wizard + 12 doctor + 7 seed-mirror). All offline.
+
+---
+
 ## [0.5.45] — 2026-05-08
 
 CI on the Linux matrix went green at v0.5.44. This release ships the v0.5.39 quality-of-life batch as the first PUBLISHED stable since v0.5.38.

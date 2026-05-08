@@ -105,6 +105,24 @@ keep_monthly: 12     # plus one snapshot per month for the last 12 months
 keep_yearly:  5      # plus one snapshot per year for the last 5 years
 ```
 
+## Wizard improvements as of v0.5.46
+
+`claude-mirror init --wizard --backend googledrive` now front-loads everything that used to fail at first sync:
+
+- **Auto-open Cloud Console pages.** After you type the GCP project ID, the wizard offers to open three project-scoped pages in your default browser: enable Drive API, enable Pub/Sub API, create OAuth client. Default Yes; on No (or on a headless / SSH session where `webbrowser.open` cannot launch a browser) the wizard prints the URLs for copy-paste instead.
+- **Inline input validation.** The GCP project ID, Drive folder ID, Pub/Sub topic ID, and credentials JSON path are checked at the prompt rather than at first sync. Common mistakes get a specific error and the prompt re-asks:
+  - Pasting the whole `https://drive.google.com/drive/folders/<FOLDER_ID>` URL into the folder-ID prompt is rejected with a hint to copy only the segment after `/folders/`.
+  - Selecting a service-account key JSON instead of an OAuth Desktop client JSON is rejected with a hint pointing at the Cloud Console -> APIs & Services -> Credentials -> Create Credentials -> OAuth client ID -> Application type: Desktop app flow.
+  - GCP project IDs that violate the 6-30-char / lowercase-letter-start rule are rejected up front with a link to the canonical Google docs.
+- **Post-auth smoke test.** After OAuth completes (and BEFORE the YAML is written), the wizard runs a single `drive.files.list(pageSize=1, q="<folder_id>" in parents)` call. This catches:
+  - Drive API not enabled in the GCP project (often: the credentials.json was for a project where it isn't enabled).
+  - Folder ID typos (file not found in the Drive accessible to the authenticated account).
+  - Folder not shared with the authenticating Google account.
+  
+  Failure prints a classified reason and asks whether to retry the auth flow. Decline retry and the YAML is still saved with a yellow warning, so you can fix the underlying issue (e.g. share the folder, enable the API) and run `claude-mirror auth` later.
+
+If you prefer to script the wizard or are configuring offline, all three behaviours are skippable: decline the auto-open prompt, decline the smoke-test prompt, and the wizard collapses back to the pre-v0.5.46 question-only flow.
+
 ## Daily ops notes
 
 - **Push notifications** — Cloud Pub/Sub streaming pull (persistent gRPC connection). Typical end-to-end latency from a collaborator's `push` to your `watch` notification is sub-second.

@@ -21,6 +21,7 @@ from rich.live import Live
 from rich.table import Table
 from rich.text import Text
 
+from . import _byo_wizard
 from .backends import StorageBackend
 from .backends.googledrive import GoogleDriveBackend
 from .config import Config, CONFIG_DIR
@@ -851,6 +852,91 @@ def _derive_config_path(project_path: str) -> str:
     return str(CONFIG_DIR / f"{project_name}.yaml")
 
 
+def _maybe_run_drive_smoke_test(
+    *,
+    credentials_file: str,
+    token_file: str,
+    drive_folder_id: str,
+) -> None:
+    """Offer to authenticate now and run a `drive.files.list` smoke test
+    against `drive_folder_id` BEFORE the wizard returns and the YAML is
+    written. Default Yes; on No we skip silently — the user may be
+    configuring offline.
+
+    On smoke-test failure we print the classified reason and ask whether
+    to retry the auth flow. Three failure paths:
+      * user accepts retry  → re-run authenticate(), re-run smoke test
+      * user declines retry → print yellow warning, return (YAML still writes)
+      * the auth flow itself errors → print warning, return (YAML still writes)
+
+    The token file is written by `authenticate()` as a side effect; on
+    success the user can run `claude-mirror push` immediately. On the
+    declined-retry path the token file may still hold valid creds
+    (smoke-test failure does NOT invalidate auth), so the user can fix
+    the underlying issue (enable Drive API, share the folder) without
+    re-authenticating.
+    """
+    if not click.confirm(
+        "\nAuthenticate and run a Drive smoke test now? "
+        "(catches Drive-API-not-enabled, wrong-project credentials.json, "
+        "and folder-not-shared errors)",
+        default=True,
+    ):
+        return
+
+    # Build a minimal in-memory Config for the backend — we reuse the
+    # full GoogleDriveBackend.authenticate() so the OAuth flow, scopes,
+    # and token-file write match the production path exactly.
+    smoke_config = Config(
+        project_path=str(Path.cwd()),
+        backend="googledrive",
+        credentials_file=credentials_file,
+        token_file=token_file,
+        drive_folder_id=drive_folder_id,
+        gcp_project_id="",
+        pubsub_topic_id="",
+        file_patterns=["**/*.md"],
+    )
+
+    while True:
+        try:
+            backend_instance = GoogleDriveBackend(smoke_config)
+            console.print("\n[dim]Opening browser for Google sign-in…[/]")
+            creds = backend_instance.authenticate()
+        except Exception as e:
+            console.print(
+                f"[yellow]⚠ Authentication failed: {e}[/]\n"
+                f"[yellow]Skipping smoke test. Run `claude-mirror auth` "
+                f"after the YAML is saved to retry.[/]"
+            )
+            return
+
+        result = _byo_wizard.run_drive_smoke_test(creds, drive_folder_id)
+        if result.ok:
+            console.print(
+                "[green]✓ Drive smoke test passed.[/] "
+                "Auth complete; folder is reachable."
+            )
+            return
+
+        console.print(
+            f"\n[yellow]⚠ Drive smoke test failed.[/]\n"
+            f"  Reason: {result.reason}"
+        )
+        if not click.confirm(
+            "Retry authentication (e.g. after enabling the Drive API "
+            "or sharing the folder)?",
+            default=True,
+        ):
+            console.print(
+                "[yellow]Skipping smoke test. The YAML will still be "
+                "written. Fix the issue and run `claude-mirror auth` "
+                "(or push) to verify.[/]"
+            )
+            return
+        # Loop: retry auth + smoke test.
+
+
 def _run_wizard(backend_default: str = "googledrive") -> dict:
     """Interactive wizard that collects all init parameters. Returns a dict of values.
 
@@ -908,34 +994,75 @@ def _run_wizard(backend_default: str = "googledrive") -> dict:
     poll_interval = 30  # default; only meaningful for onedrive/webdav/sftp
 
     if backend == "googledrive":
-        # Credentials file
+        # ── GCP project ID FIRST ────────────────────────────────────────
+        # Asked before everything else in the Drive flow so we can
+        # template project-scoped Cloud Console URLs and offer to open
+        # them. The validator reasserts the GCP project-ID rules
+        # (lowercase letter start, 6-30 chars, hyphens/digits ok) at
+        # the prompt — typos no longer cascade into a mysterious first-
+        # sync failure later.
         console.print(
-            "\n[dim]Credentials file: the OAuth2 JSON downloaded from Google Cloud Console.[/]"
+            "\n[dim]GCP project ID: found in Google Cloud Console → project selector "
+            "(e.g. my-project-123). If you don't have one yet, hit Ctrl-C, create one "
+            f"at {_byo_wizard.project_create_url()} and re-run the wizard.[/]\n"
         )
-        raw_creds = click.prompt("Credentials file", default=_DEFAULT_CREDENTIALS)
-        credentials_file = str(Path(raw_creds).expanduser())
+        gcp_project_id = click.prompt(
+            "GCP project ID",
+            value_proc=_byo_wizard.validate_gcp_project_id,
+        )
 
-        console.print()
-
-        # Drive folder ID
+        # ── Offer to auto-open the project-scoped Cloud Console URLs ───
+        # Default Yes; on No (or webbrowser failure) we still print the
+        # URLs so SSH / headless users can copy-paste into a local
+        # browser. The print-fallback path is unconditional so the user
+        # never has to ask "what was that URL?".
+        urls = _byo_wizard.build_console_urls(gcp_project_id)
         console.print(
-            "[dim]Drive folder ID: open the target folder in Google Drive and copy the ID from the URL[/]"
+            "\n[dim]The wizard can open the relevant Google Cloud Console pages "
+            "for you (Drive API, Pub/Sub API, OAuth client creation).[/]"
+        )
+        if click.confirm("Open Cloud Console pages now?", default=True):
+            for label, url in urls:
+                opened = _byo_wizard.try_open_browser(url)
+                marker = "[green]opened[/]" if opened else "[yellow]could not open browser[/]"
+                console.print(f"  {marker}  {label}: {url}")
+        else:
+            console.print(
+                "[dim]Skipped auto-open. Open these URLs manually:[/]"
+            )
+            for label, url in urls:
+                console.print(f"  {label}: {url}")
+
+        # ── Credentials file (validated: exists + JSON + installed.client_id) ──
+        console.print(
+            "\n[dim]Credentials file: the OAuth2 'Desktop app' client JSON "
+            "downloaded from Google Cloud Console (NOT a service-account key).[/]"
+        )
+        credentials_file = click.prompt(
+            "Credentials file",
+            default=_DEFAULT_CREDENTIALS,
+            value_proc=_byo_wizard.validate_credentials_file,
+        )
+
+        # ── Drive folder ID (validated: looks like a folder ID, not a URL) ──
+        console.print(
+            "\n[dim]Drive folder ID: open the target folder in Google Drive and copy "
+            "the segment AFTER /folders/ in the URL[/]"
             "\n[dim]  https://drive.google.com/drive/folders/<FOLDER_ID>[/]\n"
         )
-        drive_folder_id = click.prompt("Drive folder ID")
-
-        # GCP project ID
-        console.print(
-            "\n[dim]GCP project ID: found in Google Cloud Console → project selector (e.g. my-project-123)[/]\n"
+        drive_folder_id = click.prompt(
+            "Drive folder ID",
+            value_proc=_byo_wizard.validate_drive_folder_id,
         )
-        gcp_project_id = click.prompt("GCP project ID")
 
-        # Pub/Sub topic ID
+        # ── Pub/Sub topic ID (validated: 3-255 chars, allowed charset) ──
         console.print(
             f"\n[dim]Pub/Sub topic ID: a unique name for this project's notification channel.[/]\n"
         )
         pubsub_topic_id = click.prompt(
-            "Pub/Sub topic ID", default=f"claude-mirror-{project_name}"
+            "Pub/Sub topic ID",
+            default=f"claude-mirror-{project_name}",
+            value_proc=_byo_wizard.validate_pubsub_topic_id,
         )
     elif backend == "dropbox":
         # Dropbox app key
@@ -1244,6 +1371,20 @@ def _run_wizard(backend_default: str = "googledrive") -> dict:
     if not click.confirm("Save this configuration?", default=True):
         console.print("[yellow]Aborted.[/]")
         sys.exit(0)
+
+    # ── Post-auth Drive smoke test (googledrive only, opt-in, default Yes) ──
+    # Catches the three most common Drive setup failures BEFORE the user
+    # walks away thinking everything is configured: Drive API not enabled
+    # in the GCP project, credentials.json downloaded for the wrong
+    # project, and folder ID typos / missing share. Failure here does
+    # NOT block the YAML write — the user might be configuring offline,
+    # or behind an eventual-consistency provider. We just print a warning.
+    if backend == "googledrive":
+        _maybe_run_drive_smoke_test(
+            credentials_file=credentials_file,
+            token_file=token_file,
+            drive_folder_id=drive_folder_id,
+        )
 
     return dict(
         backend=backend,

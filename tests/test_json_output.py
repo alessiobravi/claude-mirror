@@ -184,7 +184,7 @@ class _FakeSnapshotManager:
     def show_list(self):
         return self._snapshots
 
-    def history(self, path):
+    def history(self, path, since=None, until=None):
         if self._history is not None:
             return self._history
         return {"path": path, "entries": [], "distinct_versions": 0, "total_appearances": 0}

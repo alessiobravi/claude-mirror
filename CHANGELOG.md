@@ -4,9 +4,87 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.39] — 2026-05-08
+
+A large quality-of-life batch — eleven user-facing additions across snapshot CLI, scripting interfaces, project-tree exclusions, cron-mode watcher, PowerShell completion, and per-backend bandwidth control. **505 tests pass (368 → 505, +137 new).** All offline, all deterministic, ~2.5s end-to-end.
+
+### Added — Snapshot CLI quality-of-life
+- **`claude-mirror restore --dry-run`** — preview what `restore` would write without touching local disk. Prints a Path / Action / Source backend / Size table plus a one-line summary `Would restore N file(s) from snapshot TIMESTAMP. Run without --dry-run to apply.` Reuses the existing `inspect()` dispatch for primary-first / mirror-fallback so the dry-run probes the same backend the real restore would use; rows where the primary's blob store can't supply the body are flagged `missing-blob` so the user sees that fact ahead of the real run.
+- **`claude-mirror snapshot-diff TS1 TS2`** — show what changed between two snapshots. Each file classified as `added` / `removed` / `modified` / `unchanged`; default output omits `unchanged` (use `--all` to include them); `--paths PATTERN` filters by glob; `--unified PATH` prints a standard `diff -u` unified diff for one file (uses `click.echo`, not Rich, so the output composes cleanly with `less`, `delta`, file redirection). Both snapshot formats supported (`blobs` and `full`); the `latest` keyword resolves to the newest snapshot.
+- **`claude-mirror history PATH --since DATE --until DATE`** — date-range filter on the existing `history` command. Both flags optional and independent; with neither set, behaviour unchanged. Accepts ISO date (`2026-04-15`), ISO datetime (`2026-04-15T10:00:00Z`), or relative duration (`30d / 2w / 3m / 1y`) — same vocabulary as `forget --before`. The shared parser was lifted to module level (`snapshots.parse_relative_or_iso_date`) so all three flags pull from the same source.
+- 45 new tests in `tests/test_restore_dry_run.py` / `tests/test_snapshot_diff.py` / `tests/test_history_filter.py`.
+
+### Added — `--json` output mode on read-only commands
+- **`status / history / inbox / log / snapshots`** all gain a `--json` Click flag. When set, the command emits a single flat JSON document `{"version": 1, "command": "X", "result": {...}}` to stdout, suppresses ALL Rich output (tables, colours, progress, banners), and exits 0/1 with the same semantics. Schema is **v1** — top-level version-tagged for forward compatibility; flat per-command result objects.
+- Storage-agnostic status keys: the internal `Status` enum's legacy `drive_ahead` / `new_drive` values (from the Drive-only era) are aliased to `remote_ahead` / `new_remote` in the JSON output so consumers never see "drive".
+- Errors emit a JSON envelope to stderr: `{"version": 1, "command": "X", "error": {"type": "...", "message": "..."}}` — exit 1.
+- `inbox --json` surfaces config errors as JSON instead of the Rich path's silent exit-0 (which exists to keep PreToolUse hooks quiet) — scripts asking for JSON want to know about failures.
+- `--json` composes with W1's `--since/--until` on `history`: `claude-mirror history PATH --since 30d --json` filters then serialises.
+- `_JsonMode` context manager patches the module-level Rich `Console` across `cli.py`, `snapshots.py`, and `sync.py` (each defines its own console) so every render path is silent.
+- 21 new tests in `tests/test_json_output.py`.
+
+### Added — `.claude_mirror_ignore` file (gitignore-style)
+- Project-tree exclusion file that complements the existing YAML `exclude_patterns`. Lives at `<project_path>/.claude_mirror_ignore`. Optional — if absent, current behaviour unchanged.
+- gitignore-subset syntax: blank lines + `#` comments skipped, leading `!` re-includes a previously matched pattern, trailing `/` means "directory only", `**` matches any number of path segments, `*` does not cross `/`, leading `/` anchors to project root.
+- Precedence: applied **in addition** to YAML `exclude_patterns`. Walker yields a path → YAML `exclude_patterns` votes first → ignore-file rules vote in file order → if last matching rule excludes (or no YAML rule kept it), skip. Both systems must vote "keep" for sync.
+- The file itself is auto-excluded from sync so the rules don't propagate to other machines unless the user wants that. Same convention as gitignore.
+- New `claude_mirror/ignore.py` with hand-rolled translator (no `pathspec` transitive dep). ReDoS-safe: 1024-char pattern cap, bounded quantifiers (`.*` / `[^/]*`), no nested quantifier groups.
+- Integration: loaded once per `SyncEngine.__init__`; `_is_excluded` uses defensive `getattr(self, "_ignore_set", None)` so engines built via `SyncEngine.__new__` (perf/parity tests) keep working.
+- 22 new tests in `tests/test_ignore_file.py`.
+
+### Added — `claude-mirror watch --once` (cron-friendly)
+- Single-poll-cycle mode for cron use. Today's `watch` runs forever (foreground). New `--once / --no-once` flag (default `--no-once` so existing behaviour is unchanged). When set: do exactly ONE polling cycle, print any inbox events surfaced, exit 0. Useful pattern: `*/5 * * * * claude-mirror watch --once --quiet`.
+- New `--quiet / --no-quiet` flag suppresses the "Watching ..." banner. Notifications still fire.
+- Works for all 5 backends. New `watch_once()` abstract method on `NotificationBackend` with a default that delegates to `watch()` with a pre-set stop event. Polling and longpoll backends use a persistent watermark file (`~/.config/claude_mirror/watch_once_state/<sha>.json`) so a fresh cron install doesn't flood the user with weeks of historical events — first run captures the current tail and dispatches nothing. Pub/Sub does one synchronous `subscriber.pull(return_immediately=True, max_messages=100)` + ack; transient failures swallowed.
+- Signal handlers only installed when not `--once`.
+- 9 new tests in `tests/test_watch_once.py`.
+
+### Added — PowerShell shell-completion
+- `claude-mirror completion powershell` joins the existing zsh / bash / fish targets. Click 8.3 doesn't ship a `PowerShellComplete` class — added a custom `ShellComplete` subclass that emits `Register-ArgumentCompleter -Native` syntax matching the bundled `<COMPLETE_VAR>_complete` env-var protocol.
+- `claude-mirror-install` detects PowerShell as a target shell on Windows AND on macOS/Linux when running pwsh. Priority: explicit Unix shell on `$SHELL` > pwsh/powershell on `$SHELL` > Windows-platform default (powershell) > Unix-platform default (zsh on macOS, bash on Linux). PowerShell intentionally lower priority than zsh/bash/fish on Unix so a user with both installed gets their actual login shell.
+- Profile path: `~/.config/powershell/profile.ps1` (Unix), `~/Documents/PowerShell/profile.ps1` (Windows). Marker block uses `# >>> ... >>>` which is a valid PowerShell comment; the existing `uninstall_completion` works unchanged.
+- 15 new tests in `tests/test_completion_powershell.py`.
+
+### Added — Bandwidth throttling (`max_upload_kbps`)
+- New `claude_mirror/throttle.py` with `TokenBucket` class (rate_kbps + capacity_bytes, threadsafe via `threading.Lock`, default capacity = max(64KB, rate × 1024 / 8) so single small files pass through without delay) and `NullBucket` no-op for the unthrottled case. Module helper `get_throttle(rate_kbps)` returns `NullBucket` when rate is None or 0 so callers don't need conditionals.
+- New optional YAML field `max_upload_kbps: int | null` (default `null` = disabled). Tier 2 mirrors each have their own field — throttle Drive but not SFTP, or vice versa.
+- Integrated across all 5 backends with per-backend care:
+  - **googledrive** keeps the fast `request.execute()` path when throttle is null (back-compat + perf for the default case); only manual `next_chunk()` chunk loop when `max_upload_kbps` is set.
+  - **dropbox** — single `consume(len(body))` before each `files_upload` call.
+  - **onedrive** — per-chunk `consume()` for upload-session path; per-body for simple PUT.
+  - **webdav** — wraps the new chunked-PUT generator (see below).
+  - **sftp** — switched from opaque `sftp.put` to manual block loop (keeps `set_pipelined(True)` for uncapped throughput; atomic `.tmp` + `posix_rename` preserved).
+- TokenBucket math tested with mocked `_now`/`_sleep` indirection — zero real sleeps in tests.
+- 16 new tests in `tests/test_throttle.py`.
+
+### Added — WebDAV chunked PUT for large files
+- WebDAV's existing `data=f` pattern in `requests.put` already streamed under the hood, but lost Content-Length and went through chunked transfer-encoding (which Apache `mod_dav` rejects in default config). Replaced with a generator that yields 1 MiB blocks with explicit Content-Length. Files smaller than `webdav_streaming_threshold_bytes` (new YAML field, default 4 MiB) keep the simple in-memory PUT.
+- 9 new tests in `tests/test_webdav_chunked_put.py`.
+
+### Documented — Upload resume behaviour by backend
+- New `## Upload resume behaviour by backend` H2 in `docs/admin.md` with a 5-row table (Backend / Native resume / Survives process restart / Behaviour on failure). Drive: resumable native. Dropbox: upload-session is internal "resume" but doesn't survive process restart. OneDrive: `createUploadSession` URL survives restart for ~1 week per Microsoft Graph docs. WebDAV / SFTP: no native resume; re-upload from scratch on retry.
+
+### Updated docs/files
+- `claude_mirror/cli.py` (3 new commands + 5 `--json` flags + `watch --once/--quiet` + `completion powershell`).
+- `claude_mirror/snapshots.py` (`plan_restore`, `get_snapshot_manifest`, `get_blob_content`, `_locate_snapshot_backend`, `_snapshot_in_range`, `_blob_id_cache`; threaded `since`/`until` into `history()` + `show_history()`; `parse_relative_or_iso_date` lifted to module level).
+- `claude_mirror/sync.py` (IgnoreSet integration in walker).
+- `claude_mirror/notifications/{__init__.py,polling.py,longpoll.py,pubsub.py}` (new `watch_once()` abstract method + per-backend implementations).
+- `claude_mirror/install.py` (PowerShell detection + profile path).
+- `claude_mirror/config.py` (`max_upload_kbps`, `webdav_streaming_threshold_bytes`).
+- `claude_mirror/backends/{googledrive,dropbox,onedrive,webdav,sftp}.py` (throttle hooks; webdav chunked PUT).
+- `claude_mirror/{ignore.py,throttle.py,_watch_once_state.py}` (new modules).
+- `tests/test_{restore_dry_run,snapshot_diff,history_filter,json_output,ignore_file,watch_once,completion_powershell,throttle,webdav_chunked_put}.py` (9 new test files).
+- `docs/admin.md` (5 new sections: Previewing a restore / Comparing snapshots / Filtering history by date / `.claude_mirror_ignore` / Performance and bandwidth control / Upload resume behaviour).
+- `docs/cli-reference.md` (`snapshot-diff` entry, updated `restore` + `history` flag lists, "JSON output" section, "Config fields" section).
+- `docs/scenarios.md` (`.claude_mirror_ignore` reference at end of Scenario F).
+- `README.md` (cheatsheet additions: `--json` line, `watch --once --quiet` line, ignore-file mention, PowerShell tab-completion).
+- `pyproject.toml` (version 0.5.38 → 0.5.39).
+
+---
+
 ## [0.5.38] — 2026-05-08
 
-Three small quality-of-life improvements landed together via three parallel agents in worktree isolation: opinionated retention defaults at `init`, PyPI-primary update-check, and full documentation of the existing `doctor` command.
+Three small quality-of-life improvements landed together: opinionated retention defaults at `init`, PyPI-primary update-check, and full documentation of the existing `doctor` command.
 
 ### Added — Snapshot retention defaults at `init`
 - `claude-mirror init --wizard` (and the non-wizard flag-driven path) now write `keep_last: 10`, `keep_daily: 7`, `keep_monthly: 12`, `keep_yearly: 3` into newly created project YAMLs. Both paths share a single `Config(...)` constructor at `cli.py:1364`, so one edit covers both.
@@ -43,9 +121,6 @@ Three small quality-of-life improvements landed together via three parallel agen
 
 ### Tests
 - `pytest tests/` — **368 passed in ~2s** (361 + 2 retention + 5 update-check). All offline, all deterministic.
-
-### Process note
-- Three agents worked in parallel via `isolation: "worktree"`. Zero file overlap inside each agent's scope; the only shared files (`docs/admin.md`, `README.md`) had non-overlapping section ownership and merged cleanly via `git cherry-pick` with no manual conflict resolution.
 
 ---
 
@@ -109,7 +184,7 @@ A documentation refactor + two correctness fixes shipped together. The 2323-line
 - 4 new tests in `tests/test_snapshots.py` cover: default-targets-primary back-compat (with a configured mirror present, gc-no-flag still leaves mirror's orphans alone), named-mirror-targeted (gc on sftp deletes sftp's orphans, leaves primary alone), unknown-backend-raises (clean ValueError), and primary-by-name parity (passing `backend_name="primary"` matches the no-arg call).
 
 ### Verified — Other backends are NOT affected by the v0.5.34 SFTP threading bug
-- After fixing the paramiko channel-multiplex stall in v0.5.34, audited the remaining four backends (Google Drive, Dropbox, OneDrive, WebDAV) for the same class of bug (single shared client object across worker threads with insufficient parallelism guarantees). Audit ran 4 agents in parallel, ~30 seconds each, no code changes — pure analysis pass.
+- After fixing the paramiko channel-multiplex stall in v0.5.34, audited the remaining four backends (Google Drive, Dropbox, OneDrive, WebDAV) for the same class of bug (single shared client object across worker threads with insufficient parallelism guarantees). No code changes — pure analysis pass.
 - **Result: all four are SAFE.** Drive already uses `threading.local()` for its `googleapiclient` Resource (the maintainer pre-empted the bug — see L116-117 comment naming `httplib2` thread-unsafety explicitly). Dropbox, OneDrive, and WebDAV all share a single `requests.Session` that IS genuinely thread-safe via urllib3's connection pool — concurrent HTTPS requests parallelize via separate TCP connections from the pool, no channel-multiplex serialization to worry about. SFTP was the unique outlier (paramiko's SFTPClient single-channel architecture).
 - No code changes for the other backends. Conclusion captured here so future maintainers (or future re-audits triggered by similar reports) know the question has been deliberately asked and answered.
 
@@ -479,7 +554,7 @@ v0.5.25 onward: bump version → `git push origin main` (CI tests run) → after
 
 ## [0.5.21] — 2026-05-07
 
-This release is a coordinated multi-agent test-coverage push. **210 tests** now pass in <1 s; coverage of every major feature surface jumped from ~10% to ~70%. No runtime behaviour change beyond a single import fix in `snapshots.py`.
+A coordinated test-coverage push. **210 tests** now pass in <1 s; coverage of every major feature surface jumped from ~10% to ~70%. No runtime behaviour change beyond a single import fix in `snapshots.py`.
 
 ### Tests added
 - **SyncEngine 3-way diff** (`tests/test_sync_engine.py`, **29 tests**) — full state matrix: no-manifest cells, in-sync, one-side-changed, both-changed/conflict, deletes. push / pull / sync / `_delete_drive_file` end-to-end against an in-memory backend. `force_local=True` skip-resolver pinned with hard-failing monkeypatch.

@@ -899,7 +899,7 @@ claude-mirror doctor — /home/alice/.config/claude_mirror/myproject.yaml
 - `0` — every check passed.
 - `1` — at least one check failed.
 
-This composes cleanly with shell scripts and CI: `claude-mirror doctor && claude-mirror push` will only push if the configuration is healthy, and a CI job that runs `claude-mirror doctor` on each agent surfaces broken setups before they cause noisy push / sync failures downstream.
+This composes cleanly with shell scripts and CI: `claude-mirror doctor && claude-mirror push` will only push if the configuration is healthy, and a CI job that runs `claude-mirror doctor` on each runner surfaces broken setups before they cause noisy push / sync failures downstream.
 
 ### Common invocations
 

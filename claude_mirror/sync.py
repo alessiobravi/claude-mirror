@@ -112,6 +112,16 @@ class SyncEngine:
         self._push_counter_lock = threading.Lock()
         self._push_counters: dict[str, int] = {}
         self._push_counter_total: int = 0
+        # Buffered per-file "↑ {path}" messages. Worker threads append
+        # here during the Pushing phase instead of calling console.print
+        # directly — printing into the live Progress region from many
+        # threads triggered Rich-cursor drift that visibly duplicated
+        # the Guard/Pushing rows on some terminals. The buffer is
+        # flushed AFTER the Progress block exits in push()/sync() so
+        # the user still sees every ↑ line, just below the cleaned-up
+        # final summary instead of interleaved with the live region.
+        # list.append is GIL-atomic in CPython — no lock needed.
+        self._push_log_buffer: list[str] = []
         # Pre-compile exclude patterns into a single regex + a directory-prefix
         # tuple. _is_excluded is a hot path: status/push/pull each invoke it
         # once per local file, so on a 5K-file project with 10 exclude patterns
@@ -648,6 +658,10 @@ class SyncEngine:
 
             self.manifest.save()
 
+        # See identical comment in `push()` — flush buffered ↑ lines
+        # AFTER the Progress region has been torn down.
+        self._flush_push_log()
+
         self._print_summary(pushed, pulled, skipped, deleted)
         # Surface the snapshot result outside the transient progress region.
         if snapshot_ts:
@@ -823,6 +837,12 @@ class SyncEngine:
                 self._flush_publishes()
 
             self.manifest.save()
+
+        # Flush per-file ↑ messages buffered during the Pushing phase —
+        # printed AFTER the Progress live region cleared, so they don't
+        # interleave with Rich cursor management and produce duplicated
+        # phase rows on certain terminals.
+        self._flush_push_log()
 
         if pushed:
             console.print(f"[green]Pushed {len(pushed)} file(s).[/]")
@@ -1135,7 +1155,9 @@ class SyncEngine:
         """Initialise the per-backend completion counters before a push
         run. Total is the file count; one counter per configured backend
         (primary + every mirror). Initial values are 0 so the first
-        rendered detail reads "googledrive: 0/N · sftp: 0/N"."""
+        rendered detail reads "googledrive: 0/N · sftp: 0/N". Also
+        clears the per-file ↑ message buffer (flushed by the caller
+        after the Progress block exits)."""
         primary_name = (
             getattr(self.storage, "backend_name", "") or self.config.backend
         )
@@ -1145,6 +1167,15 @@ class SyncEngine:
         with self._push_counter_lock:
             self._push_counter_total = len(items)
             self._push_counters = {name: 0 for name in names}
+        self._push_log_buffer = []
+
+    def _flush_push_log(self) -> None:
+        """Emit every buffered ↑ line as console output. Called by
+        push()/sync() AFTER the live Progress region exits so the
+        prints don't fight with Rich's cursor management."""
+        for line in self._push_log_buffer:
+            console.print(line)
+        self._push_log_buffer = []
 
     def _bump_push_counter(self, backend_name: str) -> None:
         """Increment the per-backend completion counter and refresh the
@@ -1191,7 +1222,8 @@ class SyncEngine:
             backend_name=primary_name,
         )
         self._bump_push_counter(primary_name)
-        console.print(f"  [cyan]↑[/] {state.rel_path}")
+        # Buffer the ↑ line; flushed after the Progress block exits.
+        self._push_log_buffer.append(f"  [cyan]↑[/] {state.rel_path}")
 
         # Tier 2: fan out to write-replica mirrors. Failures are recorded
         # per-backend in the manifest as `pending_retry` (transient/UNKNOWN)
@@ -1288,7 +1320,11 @@ class SyncEngine:
             for fut in as_completed(futs):
                 name, ok, err, cls = fut.result()
                 if ok:
-                    console.print(f"  [cyan]↑[/] {rel_path} [dim](mirror: {name})[/]")
+                    # Buffer alongside the primary's ↑; flushed after the
+                    # Progress region exits to avoid Rich-cursor drift.
+                    self._push_log_buffer.append(
+                        f"  [cyan]↑[/] {rel_path} [dim](mirror: {name})[/]"
+                    )
                 else:
                     color = "yellow" if (cls and cls.is_retryable) else "red"
                     console.print(

@@ -262,6 +262,7 @@ claude-mirror watch --once --quiet      # single polling cycle (cron-friendly: *
 claude-mirror watch-all                 # watch every config in ~/.config/claude_mirror/
 claude-mirror log                       # who pushed what, when, across machines
 claude-mirror inbox                     # show + clear pending notifications
+claude-mirror status --json | jq '.result.summary'   # script-friendly output
 ```
 
 Per-project gitignore-style exclusions: drop a `.claude_mirror_ignore` at the project root for `**`/`!negation`/`/anchored`/`dir/` rules that complement YAML `exclude_patterns`. Full syntax in [docs/admin.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md#claude_mirror_ignore--project-tree-exclusions).

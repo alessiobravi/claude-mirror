@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import io
+import json as _json
 import os
 import signal
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 # Suppress gRPC / abseil INFO noise on macOS before gRPC is imported
 os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
@@ -44,6 +46,120 @@ def _get_version() -> str:
 console = Console(force_terminal=True)
 
 DEFAULT_CONFIG = str(Path.home() / ".config" / "claude_mirror" / "default.yaml")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# JSON output mode (v0.5.39)
+#
+# Five read-only commands (status, history, inbox, log, snapshots) accept
+# `--json`. When set, the command:
+#   * suppresses ALL Rich output (tables, banners, progress lines) by
+#     swapping the module-level `console` for a quiet console that writes
+#     to /dev/null,
+#   * emits a single flat JSON document to stdout shaped as
+#         {"version": 1, "command": "<name>", "result": {...}}
+#   * on error, writes a JSON error envelope to stderr shaped as
+#         {"version": 1, "command": "<name>", "error": {"type": ..., "message": ...}}
+#     and exits 1.
+#
+# Schema is v1. Future breaking changes bump to v2 with both shapes
+# supported during transition. `result` is per-command (see the
+# command bodies and docs/cli-reference.md "JSON output" section).
+# ──────────────────────────────────────────────────────────────────────────
+
+JSON_SCHEMA_VERSION = 1
+
+
+class _JsonMode:
+    """Context manager: swap the module-level `console` for a quiet one
+    for the lifetime of a `--json` command, restore on exit.
+
+    Rich-rendering helpers (`_build_status_renderable`, `SnapshotManager.show_*`,
+    progress bars in `make_phase_progress`) all reach for the module-level
+    `console`. Replacing it for the duration of a `--json` command is the
+    least invasive way to silence them without rewriting every helper.
+
+    The quiet console writes to an in-memory `io.StringIO` rather than
+    to a real /dev/null file handle. This avoids leaking an open file
+    descriptor to Python 3.14's unraisable-exception finalizer (which
+    pytest treats as a test failure under `filterwarnings = "error"`)
+    and keeps the silencing fully in-process.
+    """
+
+    def __init__(self) -> None:
+        self._saved: Optional[Console] = None
+        self._saved_snap: Optional[Console] = None
+        self._saved_sync: Optional[Console] = None
+        self._sink: Optional[io.StringIO] = None
+
+    def __enter__(self) -> "_JsonMode":
+        import claude_mirror.cli as _cli_mod
+        from claude_mirror import snapshots as _snap_mod
+        from claude_mirror import sync as _sync_mod
+        self._saved = _cli_mod.console
+        self._saved_snap = _snap_mod.console
+        self._saved_sync = getattr(_sync_mod, "console", None)
+        self._sink = io.StringIO()
+        quiet = Console(file=self._sink, force_terminal=False, no_color=True, quiet=True)
+        _cli_mod.console = quiet
+        _snap_mod.console = quiet
+        if self._saved_sync is not None:
+            _sync_mod.console = quiet
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        import claude_mirror.cli as _cli_mod
+        from claude_mirror import snapshots as _snap_mod
+        from claude_mirror import sync as _sync_mod
+        if self._saved is not None:
+            _cli_mod.console = self._saved
+        if self._saved_snap is not None:
+            _snap_mod.console = self._saved_snap
+        if self._saved_sync is not None:
+            _sync_mod.console = self._saved_sync
+        if self._sink is not None:
+            try:
+                self._sink.close()
+            except Exception:
+                pass
+            self._sink = None
+
+
+def _emit_json_success(command: str, result: Any) -> None:
+    """Emit a v1 success envelope to stdout: {version, command, result}.
+
+    Uses indent=2 + sort_keys=False + ensure_ascii=False so the output is
+    human-readable, diff-friendly, and preserves UTF-8 paths verbatim.
+    """
+    doc = {
+        "version": JSON_SCHEMA_VERSION,
+        "command": command,
+        "result": result,
+    }
+    sys.stdout.write(
+        _json.dumps(doc, indent=2, sort_keys=False, ensure_ascii=False)
+    )
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def _emit_json_error(command: str, exc: BaseException) -> None:
+    """Emit a v1 error envelope to stderr: {version, command, error},
+    then exit 1. `exc.__class__.__name__` is the `error.type`."""
+    doc = {
+        "version": JSON_SCHEMA_VERSION,
+        "command": command,
+        "error": {
+            "type": exc.__class__.__name__,
+            "message": str(exc),
+        },
+    }
+    sys.stderr.write(
+        _json.dumps(doc, indent=2, sort_keys=False, ensure_ascii=False)
+    )
+    sys.stderr.write("\n")
+    sys.stderr.flush()
+    sys.exit(1)
 
 
 def _resolve_config(config_path: str) -> str:
@@ -1674,7 +1790,13 @@ def _auth_check(config: Config) -> None:
               help="Live-update the status display, refreshing every WATCH "
                    "seconds (1-3600). Press Ctrl+C to exit. Suggested interval: "
                    "5 to 30 seconds.")
-def status(config_path: str, short: bool, pending: bool, by_backend: bool, watch_interval: Optional[int]) -> None:
+@click.option("--json", "json_output", is_flag=True, default=False,
+              help="Emit a single flat JSON document to stdout instead of "
+                   "the Rich table. All Rich output is suppressed; on error, "
+                   "a JSON error envelope is written to stderr and the "
+                   "process exits 1. Schema: v1.")
+def status(config_path: str, short: bool, pending: bool, by_backend: bool,
+           watch_interval: Optional[int], json_output: bool) -> None:
     """Show sync status of all configured project files.
 
     By default, prints a single snapshot of sync state and exits. With
@@ -1688,6 +1810,13 @@ def status(config_path: str, short: bool, pending: bool, by_backend: bool, watch
     both at once errors out cleanly.
     """
     if pending and by_backend:
+        if json_output:
+            _emit_json_error(
+                "status",
+                ValueError(
+                    "--pending and --by-backend are mutually exclusive"
+                ),
+            )
         console.print(
             "[red]--pending and --by-backend are mutually exclusive.[/] "
             "Pick one: --pending shows ONLY non-OK / unseeded entries; "
@@ -1695,6 +1824,25 @@ def status(config_path: str, short: bool, pending: bool, by_backend: bool, watch
             "per backend."
         )
         sys.exit(1)
+
+    # JSON path: build a flat result dict and emit it. Suppresses ALL
+    # Rich output (tables, banners, progress lines) via _JsonMode. Watch
+    # mode is incompatible with --json (a streaming live region is not a
+    # single JSON document); we ignore --watch when --json is set.
+    if json_output:
+        try:
+            with _JsonMode():
+                resolved = _resolve_config(config_path)
+                engine, _, _ = _load_engine(resolved, with_pubsub=False)
+                states = engine.get_status()
+            result = _status_result_dict(resolved, engine, states)
+            _emit_json_success("status", result)
+            return
+        except SystemExit:
+            raise
+        except BaseException as e:
+            _emit_json_error("status", e)
+
     engine, _, _ = _load_engine(_resolve_config(config_path), with_pubsub=False)
 
     if watch_interval is None:
@@ -1740,6 +1888,61 @@ def _status_watch_sleep(interval: int) -> None:
     surfaced as "Aborted!" exit_code 1 in CI on Python 3.11/3.12/3.13.
     """
     time.sleep(interval)
+
+
+def _status_result_dict(
+    config_path: str,
+    engine: SyncEngine,
+    states: list,
+) -> dict:
+    """Build the v1 `status --json` result payload.
+
+    Mirrors the Rich table content but in a flat JSON-serialisable form:
+        result.config_path     — absolute path to the active config YAML
+        result.summary         — counts per Status enum value (snake_case keys)
+        result.files           — list of {path, status, local_hash, remote_hash, manifest_hash}
+
+    Status keys in `summary` use the lowercased Status.value strings
+    (`in_sync`, `local_ahead`, `drive_ahead`, `conflict`, `new_local`,
+    `new_drive`, `deleted_local`) plus `remote_ahead`/`new_remote` aliases
+    so the v1 schema example in docs matches what consumers actually get.
+    """
+    summary: dict[str, int] = {
+        "in_sync": 0,
+        "local_ahead": 0,
+        "remote_ahead": 0,
+        "conflict": 0,
+        "new_local": 0,
+        "new_remote": 0,
+        "deleted_local": 0,
+    }
+    files: list[dict] = []
+    for s in states:
+        # Convert Status enum to the schema key. The internal Status enum
+        # uses `drive_ahead` / `new_drive` (legacy from the Drive-only
+        # era); the JSON schema exposes them under the storage-agnostic
+        # `remote_ahead` / `new_remote` aliases per the v1 spec.
+        status_value = s.status.value
+        summary_key = {
+            "drive_ahead": "remote_ahead",
+            "new_drive": "new_remote",
+        }.get(status_value, status_value)
+        if summary_key in summary:
+            summary[summary_key] += 1
+        manifest_entry = engine.manifest.get(s.rel_path)
+        manifest_hash = manifest_entry.synced_hash if manifest_entry else None
+        files.append({
+            "path": s.rel_path,
+            "status": summary_key,
+            "local_hash": s.local_hash,
+            "remote_hash": s.drive_hash,
+            "manifest_hash": manifest_hash or None,
+        })
+    return {
+        "config_path": str(Path(config_path).resolve()) if config_path else "",
+        "summary": summary,
+        "files": files,
+    }
 
 
 def _build_status_renderable(
@@ -3233,12 +3436,59 @@ def reload() -> None:
 
 @cli.command()
 @click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
-def snapshots(config_path: str) -> None:
+@click.option("--json", "json_output", is_flag=True, default=False,
+              help="Emit a single flat JSON document to stdout instead of "
+                   "the Rich table. All Rich output is suppressed; on error, "
+                   "a JSON error envelope is written to stderr and the "
+                   "process exits 1. Schema: v1.")
+def snapshots(config_path: str, json_output: bool) -> None:
     """List all snapshots stored on Drive."""
+    if json_output:
+        try:
+            with _JsonMode():
+                config = Config.load(_resolve_config(config_path))
+                storage = _create_storage(config)
+                snap = SnapshotManager(config, storage)
+                snapshot_list = snap.list()
+            result = [_snapshot_entry_to_json(s) for s in snapshot_list]
+            _emit_json_success("snapshots", result)
+            return
+        except SystemExit:
+            raise
+        except BaseException as e:
+            _emit_json_error("snapshots", e)
     config = Config.load(_resolve_config(config_path))
     storage = _create_storage(config)
     snap = SnapshotManager(config, storage)
     snap.show_list()
+
+
+def _snapshot_entry_to_json(entry: dict) -> dict:
+    """Project a SnapshotManager.list() dict into the v1 JSON schema.
+
+    Schema: {timestamp, format, file_count, size_bytes_or_null, source_backend}
+    `size_bytes` is null when not recorded by the backend (full-format
+    snapshots and older blobs manifests don't track total bytes
+    end-to-end). `source_backend` is the primary backend name as that's
+    where `.list()` looks today.
+    """
+    files_changed = entry.get("files_changed", [])
+    file_count = entry.get("total_files")
+    if not isinstance(file_count, int):
+        # Fallback: the metadata may have lost total_files; use the
+        # length of files_changed as an upper bound only when nothing
+        # better is available.
+        file_count = len(files_changed) if isinstance(files_changed, list) else 0
+    size_bytes = entry.get("size_bytes")
+    if not isinstance(size_bytes, int):
+        size_bytes = None
+    return {
+        "timestamp": entry.get("timestamp", ""),
+        "format": entry.get("format", "?"),
+        "file_count": file_count,
+        "size_bytes": size_bytes,
+        "source_backend": entry.get("source_backend", "primary"),
+    }
 
 
 @cli.command()
@@ -3649,7 +3899,12 @@ def gc(do_delete: bool, dry_run: bool, skip_confirm: bool,
                    "or Nd / Nw / Nm / Ny relative duration.")
 @click.option("--config", "config_path", default="",
               help="Config file path. Auto-detected from cwd if omitted.")
-def history(path: str, since: str, until: str, config_path: str) -> None:
+@click.option("--json", "json_output", is_flag=True, default=False,
+              help="Emit a single flat JSON document to stdout instead of "
+                   "the Rich timeline table. All Rich output is suppressed; "
+                   "on error, a JSON error envelope is written to stderr "
+                   "and the process exits 1. Schema: v1.")
+def history(path: str, since: str, until: str, config_path: str, json_output: bool) -> None:
     """Show every snapshot that contains PATH, grouped by version.
 
     Walks every snapshot's manifest and reports which ones contain the
@@ -3680,6 +3935,42 @@ def history(path: str, since: str, until: str, config_path: str) -> None:
     \b
       claude-mirror restore <timestamp> <path> --output ~/tmp/recovery
     """
+    if json_output:
+        try:
+            with _JsonMode():
+                from .snapshots import parse_relative_or_iso_date as _parse_date
+                since_dt = _parse_date(since, flag_label="--since") if since else None
+                until_dt = _parse_date(until, flag_label="--until") if until else None
+                if since_dt is not None and until_dt is not None and since_dt > until_dt:
+                    raise ValueError(
+                        f"--since ({since}) is later than --until ({until}); "
+                        "no snapshots can match an empty range."
+                    )
+                config = Config.load(_resolve_config(config_path))
+                storage = _create_storage(config)
+                snap = SnapshotManager(config, storage)
+                history_data = snap.history(path, since=since_dt, until=until_dt)
+            versions: list[dict] = []
+            for entry in history_data.get("entries", []):
+                versions.append({
+                    "timestamp": entry.get("timestamp", ""),
+                    "hash": entry.get("hash"),
+                    "size": entry.get("size"),
+                    "version": entry.get("version", "?"),
+                    "format": entry.get("format", "?"),
+                })
+            result = {
+                "path": history_data.get("path", path),
+                "versions": versions,
+                "distinct_versions": history_data.get("distinct_versions", 0),
+                "total_appearances": history_data.get("total_appearances", 0),
+            }
+            _emit_json_success("history", result)
+            return
+        except SystemExit:
+            raise
+        except BaseException as e:
+            _emit_json_error("history", e)
     config = Config.load(_resolve_config(config_path))
     storage = _create_storage(config)
     snap = SnapshotManager(config, storage)
@@ -4352,8 +4643,25 @@ def migrate_snapshots(
 
 @cli.command()
 @click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
-def inbox(config_path: str) -> None:
+@click.option("--json", "json_output", is_flag=True, default=False,
+              help="Emit a single flat JSON document to stdout instead of "
+                   "the human-readable lines. The inbox is still cleared. "
+                   "Schema: v1; result.events is the list of inbox event "
+                   "dicts (empty list when no events are pending).")
+def inbox(config_path: str, json_output: bool) -> None:
     """Show and clear pending notifications for this project."""
+    if json_output:
+        try:
+            with _JsonMode():
+                resolved = _resolve_config(config_path)
+                config = Config.load(resolved)
+                notifications = read_and_clear_inbox(config.project_path)
+            _emit_json_success("inbox", {"events": list(notifications)})
+            return
+        except SystemExit:
+            raise
+        except BaseException as e:
+            _emit_json_error("inbox", e)
     try:
         resolved = _resolve_config(config_path)
         config = Config.load(resolved)
@@ -4508,8 +4816,52 @@ def test_notify() -> None:
 @cli.command()
 @click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
 @click.option("--limit", default=20, show_default=True, help="Number of events to show.")
-def log(config_path: str, limit: int) -> None:
+@click.option("--json", "json_output", is_flag=True, default=False,
+              help="Emit a single flat JSON document to stdout instead of "
+                   "the Rich table. result is a list of activity-log "
+                   "entries newest-first; empty list when the log is empty "
+                   "or absent. Schema: v1.")
+def log(config_path: str, limit: int, json_output: bool) -> None:
     """Show recent sync activity from collaborators."""
+    if json_output:
+        try:
+            with _JsonMode():
+                config = Config.load(_resolve_config(config_path))
+                storage = _create_storage(config)
+                logs_folder_id = storage.get_file_id(LOGS_FOLDER, config.root_folder)
+                log_file_id = (
+                    storage.get_file_id(SYNC_LOG_NAME, logs_folder_id)
+                    if logs_folder_id else None
+                )
+                if not log_file_id:
+                    _emit_json_success("log", [])
+                    return
+                raw = storage.download_file(log_file_id)
+                sync_log = SyncLog.from_bytes(raw)
+            events = sync_log.events[-limit:]
+            payload: list[dict] = []
+            # Newest-first to match the Rich render.
+            for event in reversed(events):
+                payload.append({
+                    "timestamp": event.timestamp,
+                    "user": event.user,
+                    "machine": event.machine,
+                    "action": event.action,
+                    "files": list(event.files),
+                    "project": event.project,
+                    # snapshot_timestamp is reserved by the v1 schema;
+                    # SyncEvent does not record one today, so we always
+                    # emit null. Future versions that thread snapshot
+                    # timestamps through to the log will populate this.
+                    "snapshot_timestamp": None,
+                })
+            _emit_json_success("log", payload)
+            return
+        except SystemExit:
+            raise
+        except BaseException as e:
+            _emit_json_error("log", e)
+
     config = Config.load(_resolve_config(config_path))
     storage = _create_storage(config)
 

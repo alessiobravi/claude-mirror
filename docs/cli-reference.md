@@ -63,6 +63,229 @@ claude-mirror-install     [--uninstall]
 
 ---
 
+## JSON output (`--json`)
+
+Five read-only commands accept `--json`, which makes them emit a single flat JSON document to stdout instead of the Rich table and suppress every banner / progress / colour. Designed for piping into `jq`, scripting from Claude Code skills, and automation that needs structured state without screen-scraping ANSI output.
+
+Supported commands:
+- `claude-mirror status --json`
+- `claude-mirror history PATH --json`
+- `claude-mirror inbox --json`
+- `claude-mirror log --json`
+- `claude-mirror snapshots --json`
+
+Exit codes match the non-JSON path: `0` on success (an empty inbox is a success and produces `{... "result": {"events": []}}`), `1` on any actual error (config not found, network failure, malformed snapshot). On error, a JSON error envelope is written to **stderr** rather than the success document on stdout, so a script can `2>/dev/null` the failure stream without losing structured info.
+
+### Top-level envelope (v1 schema)
+
+Every successful response is a single JSON object shaped like:
+
+```json
+{
+  "version": 1,
+  "command": "<subcommand>",
+  "result": { /* command-specific payload */ }
+}
+```
+
+- `version` is an integer, currently `1`. A future breaking change will bump to `2`; both shapes will be supported during the transition.
+- `command` matches the CLI subcommand name (`status`, `history`, `inbox`, `log`, `snapshots`).
+- `result` is the per-command payload (see below). The schema is flat — version-tagged at the top level rather than per-field, so consumers gate on `doc["version"] == 1` once.
+
+Errors are written to stderr in the same envelope shape:
+
+```json
+{
+  "version": 1,
+  "command": "<subcommand>",
+  "error": {
+    "type": "FileNotFoundError",
+    "message": "config not found: /home/user/.config/claude_mirror/foo.yaml"
+  }
+}
+```
+
+`error.type` is the Python exception class name; `error.message` is the human-readable detail.
+
+Output is formatted with `indent=2`, key order preserved, UTF-8 in strings (no `«` escaping for unicode home paths). Pipe through `python3 -c 'import json,sys; json.load(sys.stdin)'` to sanity-check that any output is a valid JSON document.
+
+### `status --json`
+
+```json
+{
+  "version": 1,
+  "command": "status",
+  "result": {
+    "config_path": "/home/alice/.config/claude_mirror/notes.yaml",
+    "summary": {
+      "in_sync": 5,
+      "local_ahead": 1,
+      "remote_ahead": 0,
+      "conflict": 0,
+      "new_local": 0,
+      "new_remote": 0,
+      "deleted_local": 0
+    },
+    "files": [
+      {
+        "path": "CLAUDE.md",
+        "status": "in_sync",
+        "local_hash": "8b1a9953c4611296a827abf8c47804d7",
+        "remote_hash": "8b1a9953c4611296a827abf8c47804d7",
+        "manifest_hash": "8b1a9953c4611296a827abf8c47804d7"
+      },
+      {
+        "path": "memory/notes.md",
+        "status": "local_ahead",
+        "local_hash": "ad0234829205b9033196ba818f7a872b",
+        "remote_hash": "5d41402abc4b2a76b9719d911017c592",
+        "manifest_hash": "5d41402abc4b2a76b9719d911017c592"
+      }
+    ]
+  }
+}
+```
+
+`status` values are the storage-agnostic aliases: `in_sync`, `local_ahead`, `remote_ahead`, `conflict`, `new_local`, `new_remote`, `deleted_local`. The internal Status enum's `drive_ahead`/`new_drive` legacy values are NOT exposed in the JSON; consumers see `remote_ahead` / `new_remote`.
+
+`--watch` is incompatible with `--json` (a streaming live region is not a single JSON document) and is ignored when `--json` is set. `--pending` and `--by-backend` are mutually exclusive; passing both with `--json` produces a JSON error envelope on stderr and exits 1.
+
+Hash fields are nullable: `local_hash` is null when the file is remote-only, `remote_hash` is null when the file hasn't been pushed yet, `manifest_hash` is null when the manifest has no record of the file.
+
+### `history PATH --json`
+
+```json
+{
+  "version": 1,
+  "command": "history",
+  "result": {
+    "path": "memory/notes.md",
+    "versions": [
+      {
+        "timestamp": "2026-05-08T10-00-00Z",
+        "hash": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "size": null,
+        "version": "v2",
+        "format": "blobs"
+      },
+      {
+        "timestamp": "2026-05-07T10-00-00Z",
+        "hash": "cafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00d",
+        "size": null,
+        "version": "v1",
+        "format": "blobs"
+      }
+    ],
+    "distinct_versions": 2,
+    "total_appearances": 2
+  }
+}
+```
+
+`versions` is newest-first. Each entry's `version` label is a stable `v1`, `v2`, ... assigned by SHA-256 — consecutive identical hashes share the same label. For `full`-format snapshots the hash is `null` (we'd have to download every file body to compute it) and the `version` field is `"?"`.
+
+### `inbox --json`
+
+```json
+{
+  "version": 1,
+  "command": "inbox",
+  "result": {
+    "events": [
+      {
+        "timestamp": "2026-05-08T10:00:00Z",
+        "user": "alice",
+        "machine": "laptop",
+        "action": "push",
+        "files": ["memory/notes.md"],
+        "project": "research"
+      }
+    ]
+  }
+}
+```
+
+The whole document is one JSON object — NOT JSONL — even though the inbox is stored as JSONL on disk. The inbox is cleared after a successful read (same semantics as the Rich path). On an empty inbox the result is `{"events": []}` with exit 0 — empty is success, not an error. Unlike the Rich path (which silently exits 0 if the config can't be loaded so PreToolUse hooks stay quiet), the `--json` path surfaces config errors on stderr so scripts can act on them.
+
+### `log --json`
+
+```json
+{
+  "version": 1,
+  "command": "log",
+  "result": [
+    {
+      "timestamp": "2026-05-08T11:00:00Z",
+      "user": "bob",
+      "machine": "desktop",
+      "action": "push",
+      "files": ["b.md", "c.md"],
+      "project": "research",
+      "snapshot_timestamp": null
+    },
+    {
+      "timestamp": "2026-05-07T10:00:00Z",
+      "user": "alice",
+      "machine": "laptop",
+      "action": "push",
+      "files": ["a.md"],
+      "project": "research",
+      "snapshot_timestamp": null
+    }
+  ]
+}
+```
+
+Newest-first, capped by `--limit` (default 20). `snapshot_timestamp` is reserved by the v1 schema; current `SyncEvent` records don't track which snapshot a push generated, so it's always `null`. A future version that threads snapshot timestamps through to the activity log will populate this field — consumers should treat `null` as "unknown" rather than "no snapshot".
+
+### `snapshots --json`
+
+```json
+{
+  "version": 1,
+  "command": "snapshots",
+  "result": [
+    {
+      "timestamp": "2026-05-08T10-00-00Z",
+      "format": "blobs",
+      "file_count": 12,
+      "size_bytes": null,
+      "source_backend": "primary"
+    },
+    {
+      "timestamp": "2026-05-07T09-00-00Z",
+      "format": "full",
+      "file_count": 10,
+      "size_bytes": null,
+      "source_backend": "primary"
+    }
+  ]
+}
+```
+
+Newest-first. `size_bytes` is `null` when not recorded (full-format snapshots and older blobs manifests don't track end-to-end byte totals). `source_backend` is `"primary"` today — `snapshots` lists from the primary backend; in a future release it may report the actual backend name when listing per-mirror.
+
+### Common piping recipes
+
+```bash
+# What's out of sync?
+claude-mirror status --json | jq '.result.files[] | select(.status != "in_sync")'
+
+# Count snapshots
+claude-mirror snapshots --json | jq '.result | length'
+
+# Latest pushed file per user
+claude-mirror log --json | jq '.result | group_by(.user) | map({user: .[0].user, latest: .[0].timestamp})'
+
+# All distinct versions of a file
+claude-mirror history memory/notes.md --json | jq '.result.versions[] | {version, timestamp}'
+
+# Drain inbox into a script
+claude-mirror inbox --json | jq -r '.result.events[] | "[\(.timestamp)] \(.user)@\(.machine): \(.action) \(.files | join(","))"'
+```
+
+---
+
 ## Setup
 
 ### `init`

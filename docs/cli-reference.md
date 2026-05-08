@@ -6,7 +6,11 @@ Every `claude-mirror` subcommand, grouped by topic. For deeper walkthroughs see 
 
 ## Full command list
 
+The global `--profile NAME` flag (since v0.5.49) goes on the `claude-mirror` command itself, BEFORE the subcommand: `claude-mirror --profile work push`. It applies the named credentials profile from `~/.config/claude_mirror/profiles/NAME.yaml` to the project config at load time. See [profiles.md](profiles.md) for the full walkthrough.
+
 ```
+claude-mirror [--profile NAME] <subcommand> ...   # global flag (since v0.5.49)
+
 claude-mirror init        [--wizard]
                         [--backend googledrive|dropbox|onedrive|webdav|sftp]
                         [--project PATH]
@@ -53,6 +57,10 @@ claude-mirror migrate-snapshots --to {blobs|full} [--dry-run] [--keep-source] [-
 claude-mirror log               [--limit N] [--config PATH]
 claude-mirror inbox       [--config PATH]
 claude-mirror find-config [PATH]
+claude-mirror profile list
+claude-mirror profile show       NAME
+claude-mirror profile create     NAME --backend BACKEND [--description TEXT] [--force]
+claude-mirror profile delete     NAME [--delete] [--yes]   # dry-run by default; --delete to actually delete
 claude-mirror test-notify
 claude-mirror check-update
 claude-mirror update            [--apply] [--yes]   # one-shot upgrade: dry-run by default, --apply to execute
@@ -293,6 +301,8 @@ claude-mirror inbox --json | jq -r '.result.events[] | "[\(.timestamp)] \(.user)
 
 Create a new project config in `~/.config/claude_mirror/<project>.yaml`. Pass `--wizard` for an interactive walkthrough that prompts for the backend and its required fields, or pass `--backend NAME` plus the backend-specific flags for a non-interactive setup. Auto-derives the token file path from the credentials file (Google Drive) or project name (other backends).
 
+Combine with the global `--profile NAME` flag (since v0.5.49) — `claude-mirror --profile work init --wizard --backend googledrive` — to inherit credential-bearing fields from a named profile. The wizard skips every credentials prompt the profile already supplies, and the resulting project YAML is written with `profile: work` at the top so the same inheritance applies on every later command. See [profiles.md](profiles.md).
+
 `--auto-pubsub-setup` (Drive only, since v0.5.47): after the post-auth smoke test passes, idempotently create the Pub/Sub topic, the per-machine subscription, and the IAM grant for Drive's push-notification service account (`apps-storage-noreply@google.com` -> `roles/pubsub.publisher`) on the topic. Skipped silently if the Pub/Sub OAuth scope wasn't granted at auth time, and on every non-googledrive backend. See [backends/google-drive.md](backends/google-drive.md#auto-create-pubsub-topic--subscription--iam-grant---auto-pubsub-setup-since-v0547) for sample output and edge cases.
 
 See [README — Step 1: Initialize](../README.md#step-1-initialize) for the wizard transcripts and the full flag table, and the per-backend pages for what each backend needs:
@@ -305,6 +315,8 @@ See [README — Step 1: Initialize](../README.md#step-1-initialize) for the wiza
 ### `auth`
 
 Authenticate the configured backend. Google Drive opens a browser; Dropbox prints an authorization URL and reads the code from stdin; OneDrive prints a device code; WebDAV validates the URL/username/password in-process; SFTP validates the SSH key/password against the server. Tokens are written to the project's `token_file` with `chmod 0600`. `--check` only verifies the existing token (does not start a fresh login).
+
+Combines with the global `--profile NAME` flag — `claude-mirror --profile work auth` writes the OAuth token to the path declared on the profile rather than the project YAML, which is exactly what you want when several projects share the same profile (one OAuth flow → one token reused everywhere).
 
 ### `claude-mirror-install`
 
@@ -460,6 +472,26 @@ Print the config file path that matches the current working directory (or `PATH`
 
 See [README — find-config](../README.md#find-config).
 
+### `profile` (since v0.5.49)
+
+Manage the credentials-profile registry under `~/.config/claude_mirror/profiles/`. A profile bundles credential-bearing fields (`credentials_file`, `token_file`, `dropbox_app_key`, `onedrive_client_id`, WebDAV creds, SFTP host info) for one logical account so multiple project YAMLs can share them via `profile: NAME` references or the global `--profile NAME` flag.
+
+```
+claude-mirror profile list
+claude-mirror profile show NAME
+claude-mirror profile create NAME --backend BACKEND [--description TEXT] [--force]
+claude-mirror profile delete NAME [--delete] [--yes]
+```
+
+- `list` — table of every profile with backend + description + on-disk path.
+- `show NAME` — print the raw YAML to stdout.
+- `create NAME --backend ...` — interactive scaffold; only collects credential-bearing fields, NOT project-specific ones (`drive_folder_id`, `dropbox_folder`, etc.). `--force` overwrites an existing profile YAML.
+- `delete NAME` — remove the profile YAML. Dry-run by default; `--delete` arms the action and prompts for typed `YES`; `--yes` skips the prompt.
+
+Profile resolution at `Config.load`: the global `--profile NAME` flag wins over the YAML's `profile: NAME` field which wins over no-profile. When both a profile and the project YAML define the same field, **the project value wins** — the profile is the default, the project is the escape hatch.
+
+See [profiles.md](profiles.md) for sample profile YAMLs per backend, the precedence rule worked through with examples, and common workflows.
+
 ### `test-notify`
 
 Send a test desktop notification (and a test Slack message, if Slack is configured) to verify the notification pipeline.
@@ -528,7 +560,8 @@ Slack-specific fields (`slack_enabled`, `slack_webhook_url`, `slack_channel`) ar
 
 ## See also
 
-- [admin.md](admin.md) — snapshots, retention, watcher daemon, notifications.
+- [admin.md](admin.md) — snapshots, retention, watcher daemon, notifications, credentials profiles.
+- [profiles.md](profiles.md) — credentials profiles in depth: sample profile YAMLs per backend, precedence rule, common multi-project workflows.
 - [conflict-resolution.md](conflict-resolution.md) — what `sync` does when both sides changed.
 - [README — Daily usage](../README.md#part-4--daily-usage) — narrative walkthrough of the daily commands.
 - [README — Slack notifications](../README.md#slack-notifications) — Slack-specific config and webhook setup.

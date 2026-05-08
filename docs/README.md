@@ -17,6 +17,7 @@ Per-backend setup, config fields, and troubleshooting:
 ## Operations and admin
 
 - [admin.md](admin.md) — snapshots, retention, `gc` / `prune` / `forget`, doctor, watcher service, multi-backend Tier 2 setup, auto-start
+- [profiles.md](profiles.md) — credentials profiles: share `credentials_file` / `token_file` / app keys across multiple project YAMLs via `~/.config/claude_mirror/profiles/<name>.yaml`
 - [conflict-resolution.md](conflict-resolution.md) — interactive conflict prompts, `$EDITOR` merge, three-way diff
 - [cli-reference.md](cli-reference.md) — every command, every flag
 

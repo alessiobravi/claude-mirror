@@ -9,6 +9,30 @@ import yaml
 
 CONFIG_DIR = Path.home() / ".config" / "claude_mirror"
 
+# Module-level override used by `Config.load` when no explicit
+# `profile_override` argument is passed. The CLI's global `--profile NAME`
+# flag (since v0.5.49) sets this once, before any subcommand runs, so
+# every downstream Config.load() picks the profile up without each
+# command having to thread it through. Tests should set/restore this
+# via monkeypatch rather than touching the global directly.
+_GLOBAL_PROFILE_OVERRIDE: str = ""
+
+
+def set_global_profile_override(name: str) -> None:
+    """Set the process-wide profile override consulted by `Config.load`.
+
+    Empty string clears the override. Idempotent: callable multiple
+    times. The CLI calls this from the global click-group invoke()
+    handler before dispatching to a subcommand.
+    """
+    global _GLOBAL_PROFILE_OVERRIDE
+    _GLOBAL_PROFILE_OVERRIDE = name or ""
+
+
+def get_global_profile_override() -> str:
+    """Return the current process-wide profile override (or empty string)."""
+    return _GLOBAL_PROFILE_OVERRIDE
+
 
 @dataclass
 class Config:
@@ -254,13 +278,86 @@ class Config:
         return f"{self.pubsub_topic_id}-{safe}"
 
     @classmethod
-    def load(cls, path: str) -> Config:
+    def load(cls, path: str, *, profile_override: str = "") -> Config:
+        """Load a project config from `path`, applying any referenced profile.
+
+        Profile resolution rules (since v0.5.49):
+
+          1. If `profile_override` is set (the global `--profile NAME` flag
+             on the CLI), load that profile and merge it in regardless of
+             whether the YAML carries its own `profile:` field — the flag
+             wins and acts as a one-shot override.
+          2. Otherwise, if the module-level `_GLOBAL_PROFILE_OVERRIDE` was
+             set by `set_global_profile_override` (the CLI does this from
+             the global click-group invoke() handler before dispatching
+             a subcommand), use that profile.
+          3. Otherwise, if the YAML has a top-level `profile: NAME` field,
+             load that profile and merge it in.
+          4. Otherwise, no merging — the YAML loads as-is.
+
+        Project YAML values override profile values for any field both
+        define (see `apply_profile` for the precedence rule).
+        """
         with open(path) as f:
-            data = yaml.safe_load(f)
+            data = yaml.safe_load(f) or {}
+
+        # Pull the per-YAML profile reference out before anything else so
+        # `Config(**data)` doesn't trip on the unknown `profile` key.
+        yaml_profile_name = data.pop("profile", None) or ""
+        profile_name = (
+            profile_override
+            or _GLOBAL_PROFILE_OVERRIDE
+            or yaml_profile_name
+        )
+
+        if profile_name:
+            # Local import to avoid a config<->profiles cycle at import time.
+            from .profiles import load_profile, apply_profile
+            profile_data = load_profile(profile_name)
+            # Drop description: it's comment-only, not a Config field.
+            profile_data = {
+                k: v for k, v in profile_data.items() if k != "description"
+            }
+            data = apply_profile(profile_data, data)
+            # When a profile is in play, drop any keys the dataclass
+            # doesn't know about — profile YAMLs may carry metadata
+            # the Config dataclass intentionally doesn't model. Without
+            # a profile, we keep the historical behaviour (TypeError on
+            # unknown YAML keys) so hand-typo'd configs still surface.
+            data = {
+                k: v for k, v in data.items() if k in cls.__dataclass_fields__
+            }
+
         return cls(**data)
 
-    def save(self, path: str) -> None:
+    def save(
+        self,
+        path: str,
+        *,
+        profile: str = "",
+        strip_fields: tuple[str, ...] = (),
+    ) -> None:
+        """Persist the config to `path` as YAML.
+
+        Args:
+            profile:      If non-empty, a top-level `profile: NAME` key is
+                          written before the rest of the data. `Config.load`
+                          will then merge the named profile in on every load.
+            strip_fields: Tuple of field names to OMIT from the written
+                          YAML. Used together with `profile` to keep
+                          credential-bearing fields out of the project
+                          YAML — the profile re-supplies them at load
+                          time. Without strip_fields, the dataclass's
+                          `__post_init__`-filled defaults would be
+                          serialised and re-win over the profile (per
+                          `apply_profile`'s truthy-wins rule), defeating
+                          the whole point of `profile:` references.
+        """
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         data = asdict(self)
+        for k in strip_fields:
+            data.pop(k, None)
+        if profile:
+            data = {"profile": profile, **data}
         with open(path, "w") as f:
             yaml.dump(data, f, default_flow_style=False)

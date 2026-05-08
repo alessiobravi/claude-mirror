@@ -409,6 +409,24 @@ claude-mirror does NOT currently persist upload-session URLs / IDs to disk betwe
 
 ---
 
+## Credentials profiles
+
+For users running multiple projects through the same account (one Google account → 5 projects, one Dropbox app → 3 projects, etc.), the `--profile NAME` flag and the `claude-mirror profile` subcommand group let credential-bearing fields (`credentials_file`, `token_file`, `dropbox_app_key`, `onedrive_client_id`, WebDAV creds, SFTP host/key) live in one shared YAML at `~/.config/claude_mirror/profiles/<name>.yaml`. Project YAMLs reference the profile by name and inherit those fields.
+
+See [docs/profiles.md](profiles.md) for the full walkthrough — sample profile YAMLs for every backend, the project-wins-over-profile precedence rule, the `profile create` / `list` / `show` / `delete` subcommands, and common workflows (one work account + 5 projects; one personal Google + one work Google sharing a single laptop). Profiles are optional — a single-project setup never needs them.
+
+### Destructive ops are dry-run by default
+
+Six commands can permanently delete data: `forget`, `prune`, `gc`, `delete`, `migrate-snapshots --no-keep-source`, and `profile delete`. All six follow the same convention:
+
+1. **No flag → dry-run.** The command prints what would be deleted, exits 0, and changes nothing on disk or remote.
+2. **`--delete` → arms the action**. The command asks you to type the literal word `YES` (uppercase, exact). Anything else aborts.
+3. **`--delete --yes` → skips the typed-`YES` prompt.** Required for non-interactive scripts and CI.
+
+This keeps a careless `claude-mirror forget --keep-last 5` (without `--delete`) safe by default, and the typed-`YES` gate prevents a stuck-shell autocomplete from triggering a real delete. Same convention applies to `claude-mirror profile delete NAME` — no flag is a dry-run, `--delete` plus typed `YES` actually removes the profile YAML.
+
+---
+
 ## Auto-start the watcher
 
 Use `claude-mirror watch-all` to watch every project in a single process. It auto-discovers all configs in `~/.config/claude_mirror/` and starts one notification listener per project, each in its own thread. Projects using different backends are handled transparently — each thread picks the right notifier for its backend (Pub/Sub for Google Drive, long-polling for Dropbox, periodic polling for OneDrive, WebDAV, and SFTP):

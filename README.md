@@ -19,7 +19,7 @@ Built originally for Claude Code projects (where most context lives in markdown)
 
 **Supported backends:** Google Drive, Dropbox, Microsoft OneDrive, any WebDAV server (Nextcloud, OwnCloud, Apache mod_dav, Synology/QNAP NAS, Box.com, etc.), and any SFTP/SSH-accessible server (VPS, NAS, shared hosting, self-hosted Linux). Each project picks its own primary backend independently — different projects on the same machine can use different backends.
 
-**Quality gates:** Every commit and pull request runs **673 automated tests** on Python 3.11, 3.12, 3.13, and 3.14 in parallel via GitHub Actions — covering the 3-way diff sync core, both snapshot formats, path-traversal safety, conflict resolution, auth flows, all five backends (with HTTP-level / SSH-level mocking), the notifier inbox under concurrent writers, the Discord / Teams / Generic webhook notifiers, the watcher daemon's SIGHUP hot-reload, the `--json` output mode for `status / history / inbox / log / snapshots`, the `.claude_mirror_ignore` parser, the bandwidth-throttle token-bucket integration across every backend, the Drive BYO wizard's URL templating + input validation + post-auth smoke test, the Drive Pub/Sub auto-setup logic (topic + per-machine subscription + IAM grant via `--auto-pubsub-setup`), the deep `doctor --backend` checks for **all five backends** — googledrive (Drive API / Pub/Sub topic / subscription / IAM grant), dropbox (token shape / app-key / account smoke / scopes / folder access), onedrive (token cache / Azure GUID / scopes / Graph drive-item probe), webdav (PROPFIND / DAV class / ETag / oc:checksums), and sftp (host fingerprint / key perms / exec_command / auth) — and the `seed-mirror` auto-detect logic. CI must be green before any PR can merge. See [`CONTRIBUTING.md`](https://github.com/alessiobravi/claude-mirror/blob/main/CONTRIBUTING.md) for the test conventions and how to run them locally.
+**Quality gates:** Every commit and pull request runs **697 automated tests** on Python 3.11, 3.12, 3.13, and 3.14 in parallel via GitHub Actions — covering the 3-way diff sync core, both snapshot formats, path-traversal safety, conflict resolution, auth flows, all five backends (with HTTP-level / SSH-level mocking), the notifier inbox under concurrent writers, the Discord / Teams / Generic webhook notifiers, the watcher daemon's SIGHUP hot-reload, the `--json` output mode for `status / history / inbox / log / snapshots`, the `.claude_mirror_ignore` parser, the bandwidth-throttle token-bucket integration across every backend, the credentials-profile resolution + the merge-precedence rule (project YAML wins over profile defaults), the Drive BYO wizard's URL templating + input validation + post-auth smoke test, the Drive Pub/Sub auto-setup logic (topic + per-machine subscription + IAM grant via `--auto-pubsub-setup`), the deep `doctor --backend` checks for **all five backends** — googledrive (Drive API / Pub/Sub topic / subscription / IAM grant), dropbox (token shape / app-key / account smoke / scopes / folder access), onedrive (token cache / Azure GUID / scopes / Graph drive-item probe), webdav (PROPFIND / DAV class / ETag / oc:checksums), and sftp (host fingerprint / key perms / exec_command / auth) — and the `seed-mirror` auto-detect logic. CI must be green before any PR can merge. See [`CONTRIBUTING.md`](https://github.com/alessiobravi/claude-mirror/blob/main/CONTRIBUTING.md) for the test conventions and how to run them locally.
 
 ---
 
@@ -151,6 +151,7 @@ The trimmed README covers install, your first project, daily-usage cheatsheet, n
 
 **Operations & admin**:
 - [docs/admin.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md) — snapshots, retention, `gc` / `prune` / `forget`, doctor, watcher service, multi-backend Tier 2 setup, auto-start
+- [docs/profiles.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/profiles.md) — credentials profiles: factor `credentials_file` / `token_file` / app keys out of every project YAML
 - [docs/conflict-resolution.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/conflict-resolution.md) — interactive conflict prompts, `$EDITOR` merge, three-way diff
 - [docs/cli-reference.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/cli-reference.md) — every command, every flag
 
@@ -238,6 +239,20 @@ claude-mirror push       # upload the local-ahead files; creates a snapshot
 ### Multiple projects on the same machine
 
 Repeat `init --wizard` once per project. Every project gets its own config file at `~/.config/claude_mirror/<project>.yaml`. Different projects on the same machine can use different backends — Drive for one, SFTP for another, WebDAV for a third. All commands auto-detect the right config from the current working directory.
+
+### Multiple accounts and mixed backends
+
+When several projects share the same account (one Google account → 5 projects, one Dropbox app → 3 projects), use **credentials profiles** to factor the duplicated credential fields out of the per-project YAMLs:
+
+```bash
+claude-mirror profile create work --backend googledrive    # one-time scaffold
+cd ~/projects/research
+claude-mirror --profile work init --wizard                  # inherits credentials, prompts only for project-specific fields
+cd ~/projects/strategy
+claude-mirror --profile work init --wizard                  # same profile, different folder/topic
+```
+
+The global `--profile NAME` flag (since v0.5.49) goes BEFORE the subcommand. After init, each project YAML carries `profile: work` at the top so subsequent `push`/`pull`/`sync` commands pick the profile up automatically. Project YAML values still win over profile defaults, so any one project can override a single field as a per-project escape hatch. See [docs/profiles.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/profiles.md) for the full walkthrough.
 
 For team-shared / multi-backend / multi-user setups, see [docs/scenarios.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/scenarios.md).
 

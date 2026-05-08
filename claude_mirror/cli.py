@@ -285,6 +285,10 @@ _NO_WATCHER_CHECK_CMDS = {
     # `seed-mirror` is one-shot mirror initialization; the watcher hint
     # is unrelated and would distract from the seed summary.
     "seed-mirror",
+    # `profile` (since v0.5.49) is a credentials-registry management
+    # group — list/show/create/delete operate on profile YAMLs, never
+    # on a project, so the watcher hint is unrelated noise.
+    "profile",
 }
 
 
@@ -823,8 +827,34 @@ class _CLIGroup(click.Group):
 
 @click.group(cls=_CLIGroup)
 @click.version_option()
-def cli() -> None:
+@click.option(
+    "--profile", "profile_name", default="", metavar="NAME",
+    help=(
+        "Apply credentials profile NAME (~/.config/claude_mirror/profiles/"
+        "NAME.yaml) on top of the project config. Profile values supply "
+        "credentials/identity fields the project YAML omits; project values "
+        "win when both define the same field. See `claude-mirror profile --help`."
+    ),
+)
+def cli(profile_name: str) -> None:
     """Sync Claude project MD files across machines via cloud storage."""
+    # Stash the resolved profile name in a module-level slot so every
+    # `Config.load` call downstream picks it up without each subcommand
+    # having to thread the argument through. See
+    # `claude_mirror.config.set_global_profile_override` for the contract.
+    if profile_name:
+        # Validate up-front: fail fast if the named profile doesn't
+        # exist, with the same helpful list of available profiles that
+        # `load_profile` produces. Doing this here means a typo on the
+        # global flag aborts before the subcommand starts work.
+        from .profiles import load_profile
+        try:
+            load_profile(profile_name)
+        except FileNotFoundError as e:
+            console.print(f"[red]✗ {e}[/]")
+            sys.exit(1)
+    from .config import set_global_profile_override
+    set_global_profile_override(profile_name)
 
 
 _DEFAULT_CREDENTIALS = str(CONFIG_DIR / "credentials.json")
@@ -1055,6 +1085,7 @@ def _run_wizard(
     backend_default: str = "googledrive",
     *,
     auto_pubsub_setup: bool = False,
+    profile_data: Optional[dict] = None,
 ) -> dict:
     """Interactive wizard that collects all init parameters. Returns a dict of values.
 
@@ -1069,7 +1100,18 @@ def _run_wizard(
     helper, creating the Pub/Sub topic, per-machine subscription, and
     Drive's IAM grant on the topic without a second OAuth flow. Off by
     default (additive behaviour); ignored on non-googledrive backends.
+
+    `profile_data` (since v0.5.49) — when set, every credential-bearing
+    field already supplied by the named profile (`credentials_file`,
+    `token_file`, `dropbox_app_key`, etc.) is SKIPPED in the prompt
+    sequence. The wizard only collects project-specific fields
+    (`drive_folder_id`, `dropbox_folder`, `sftp_folder`, ...) and the
+    returned dict carries the profile-supplied values verbatim so the
+    caller can include them in the eventual Config (or, when writing
+    the YAML with `profile: NAME` reference, ignore them and let the
+    profile re-supply them at load time).
     """
+    profile_data = dict(profile_data or {})
     console.print("\n[bold cyan]claude-mirror setup wizard[/]\n")
     console.print("Press Enter to accept the [dim]default[/] shown in brackets.\n")
 
@@ -1118,6 +1160,21 @@ def _run_wizard(
     sftp_folder = ""
     poll_interval = 30  # default; only meaningful for onedrive/webdav/sftp
 
+    # ── Profile pre-fill banner ───────────────────────────────────────
+    # When the wizard runs under `--profile NAME`, announce which fields
+    # the profile is going to supply so the user knows why some prompts
+    # are skipped further down.
+    if profile_data:
+        supplied = sorted(
+            k for k in profile_data
+            if k not in ("backend", "description") and profile_data[k]
+        )
+        if supplied:
+            console.print(
+                "[dim]Profile-supplied fields (will be skipped): "
+                f"{', '.join(supplied)}[/]\n"
+            )
+
     if backend == "googledrive":
         # ── GCP project ID FIRST ────────────────────────────────────────
         # Asked before everything else in the Drive flow so we can
@@ -1126,15 +1183,21 @@ def _run_wizard(
         # (lowercase letter start, 6-30 chars, hyphens/digits ok) at
         # the prompt — typos no longer cascade into a mysterious first-
         # sync failure later.
-        console.print(
-            "\n[dim]GCP project ID: found in Google Cloud Console → project selector "
-            "(e.g. my-project-123). If you don't have one yet, hit Ctrl-C, create one "
-            f"at {_byo_wizard.project_create_url()} and re-run the wizard.[/]\n"
-        )
-        gcp_project_id = click.prompt(
-            "GCP project ID",
-            value_proc=_byo_wizard.validate_gcp_project_id,
-        )
+        if profile_data.get("gcp_project_id"):
+            gcp_project_id = profile_data["gcp_project_id"]
+            console.print(
+                f"[dim]GCP project ID supplied by profile:[/] {gcp_project_id}\n"
+            )
+        else:
+            console.print(
+                "\n[dim]GCP project ID: found in Google Cloud Console → project selector "
+                "(e.g. my-project-123). If you don't have one yet, hit Ctrl-C, create one "
+                f"at {_byo_wizard.project_create_url()} and re-run the wizard.[/]\n"
+            )
+            gcp_project_id = click.prompt(
+                "GCP project ID",
+                value_proc=_byo_wizard.validate_gcp_project_id,
+            )
 
         # ── Offer to auto-open the project-scoped Cloud Console URLs ───
         # Default Yes; on No (or webbrowser failure) we still print the
@@ -1159,15 +1222,21 @@ def _run_wizard(
                 console.print(f"  {label}: {url}")
 
         # ── Credentials file (validated: exists + JSON + installed.client_id) ──
-        console.print(
-            "\n[dim]Credentials file: the OAuth2 'Desktop app' client JSON "
-            "downloaded from Google Cloud Console (NOT a service-account key).[/]"
-        )
-        credentials_file = click.prompt(
-            "Credentials file",
-            default=_DEFAULT_CREDENTIALS,
-            value_proc=_byo_wizard.validate_credentials_file,
-        )
+        if profile_data.get("credentials_file"):
+            credentials_file = profile_data["credentials_file"]
+            console.print(
+                f"[dim]Credentials file supplied by profile:[/] {credentials_file}\n"
+            )
+        else:
+            console.print(
+                "\n[dim]Credentials file: the OAuth2 'Desktop app' client JSON "
+                "downloaded from Google Cloud Console (NOT a service-account key).[/]"
+            )
+            credentials_file = click.prompt(
+                "Credentials file",
+                default=_DEFAULT_CREDENTIALS,
+                value_proc=_byo_wizard.validate_credentials_file,
+            )
 
         # ── Drive folder ID (validated: looks like a folder ID, not a URL) ──
         console.print(
@@ -1191,11 +1260,17 @@ def _run_wizard(
         )
     elif backend == "dropbox":
         # Dropbox app key
-        console.print(
-            "\n[dim]Dropbox app key: create an app at dropbox.com/developers and copy the app key.[/]"
-            "\n[dim]  Required scopes: files.content.read, files.content.write[/]\n"
-        )
-        dropbox_app_key = click.prompt("Dropbox app key")
+        if profile_data.get("dropbox_app_key"):
+            dropbox_app_key = profile_data["dropbox_app_key"]
+            console.print(
+                f"[dim]Dropbox app key supplied by profile.[/]\n"
+            )
+        else:
+            console.print(
+                "\n[dim]Dropbox app key: create an app at dropbox.com/developers and copy the app key.[/]"
+                "\n[dim]  Required scopes: files.content.read, files.content.write[/]\n"
+            )
+            dropbox_app_key = click.prompt("Dropbox app key")
 
         # Dropbox folder
         console.print(
@@ -1207,13 +1282,19 @@ def _run_wizard(
         )
     elif backend == "onedrive":
         # OneDrive client ID
-        console.print(
-            "\n[dim]Azure app client ID: register an app at portal.azure.com → App registrations.[/]"
-            "\n[dim]  Platform: Mobile and desktop applications[/]"
-            "\n[dim]  Redirect URI: https://login.microsoftonline.com/common/oauth2/nativeclient[/]"
-            "\n[dim]  API permissions: Files.ReadWrite, offline_access[/]\n"
-        )
-        onedrive_client_id = click.prompt("Azure app client ID")
+        if profile_data.get("onedrive_client_id"):
+            onedrive_client_id = profile_data["onedrive_client_id"]
+            console.print(
+                f"[dim]Azure app client ID supplied by profile.[/]\n"
+            )
+        else:
+            console.print(
+                "\n[dim]Azure app client ID: register an app at portal.azure.com → App registrations.[/]"
+                "\n[dim]  Platform: Mobile and desktop applications[/]"
+                "\n[dim]  Redirect URI: https://login.microsoftonline.com/common/oauth2/nativeclient[/]"
+                "\n[dim]  API permissions: Files.ReadWrite, offline_access[/]\n"
+            )
+            onedrive_client_id = click.prompt("Azure app client ID")
 
         # OneDrive folder
         console.print(
@@ -1225,12 +1306,18 @@ def _run_wizard(
         )
     elif backend == "webdav":
         # WebDAV URL
-        console.print(
-            "\n[dim]WebDAV URL: the full URL to the sync folder on your server.[/]"
-            "\n[dim]  Nextcloud example: https://cloud.example.com/remote.php/dav/files/USER/claude-mirror/[/]"
-            "\n[dim]  Generic example:   https://my-server.com/dav/claude-mirror/[/]\n"
-        )
-        webdav_url = click.prompt("WebDAV URL")
+        if profile_data.get("webdav_url"):
+            webdav_url = profile_data["webdav_url"]
+            console.print(
+                f"[dim]WebDAV URL supplied by profile:[/] {webdav_url}\n"
+            )
+        else:
+            console.print(
+                "\n[dim]WebDAV URL: the full URL to the sync folder on your server.[/]"
+                "\n[dim]  Nextcloud example: https://cloud.example.com/remote.php/dav/files/USER/claude-mirror/[/]"
+                "\n[dim]  Generic example:   https://my-server.com/dav/claude-mirror/[/]\n"
+            )
+            webdav_url = click.prompt("WebDAV URL")
 
         # Reject http:// unless the user explicitly opts in. Basic-auth
         # over http transmits credentials and file payloads in cleartext
@@ -1255,86 +1342,122 @@ def _run_wizard(
             webdav_insecure_http = False
 
         # Username
-        console.print(
-            "\n[dim]Username for WebDAV authentication (basic auth).[/]\n"
-        )
-        webdav_username = click.prompt("Username")
-
-        # Password
-        console.print(
-            "\n[dim]Password or app password. Stored in the token file.[/]"
-            "\n[dim]  Nextcloud: generate an app password in Settings → Security.[/]\n"
-        )
-        import getpass
-        webdav_password = getpass.getpass("Password: ")
-    elif backend == "sftp":
-        # Host
-        console.print(
-            "\n[dim]SFTP host: hostname or IP of the SSH/SFTP server.[/]"
-            "\n[dim]  Example: storage.example.com  or  10.0.0.42[/]\n"
-        )
-        while True:
-            sftp_host = click.prompt("SFTP host").strip()
-            if sftp_host:
-                break
-            console.print("[red]Host cannot be empty.[/]")
-
-        # Port
-        console.print(
-            "\n[dim]SFTP port: TCP port for SSH on the server (default 22).[/]\n"
-        )
-        while True:
-            sftp_port = click.prompt("SFTP port", default=22, type=int)
-            if 1 <= sftp_port <= 65535:
-                break
+        if profile_data.get("webdav_username"):
+            webdav_username = profile_data["webdav_username"]
             console.print(
-                "[red]Port must be in range 1..65535.[/]"
+                f"[dim]WebDAV username supplied by profile:[/] {webdav_username}\n"
             )
-
-        # Username
-        console.print(
-            "\n[dim]Username for SSH/SFTP login.[/]\n"
-        )
-        while True:
-            sftp_username = click.prompt("SFTP username").strip()
-            if sftp_username:
-                break
-            console.print("[red]Username cannot be empty.[/]")
-
-        # Auth choice — key (default) or password
-        console.print(
-            "\n[dim]Authentication method:[/]"
-            "\n[dim]  k = SSH private key (recommended)[/]"
-            "\n[dim]  p = password (LAN/test only — stored plain in YAML)[/]\n"
-        )
-        auth_choice = click.prompt(
-            "Authenticate with [k]ey or [p]assword?",
-            default="k",
-            type=click.Choice(["k", "p"], case_sensitive=False),
-        ).lower()
-
-        if auth_choice == "k":
-            console.print(
-                "\n[dim]Path to your SSH private key. Tilde-expanded.[/]\n"
-            )
-            raw_key = click.prompt(
-                "SSH private key file", default="~/.ssh/id_ed25519"
-            )
-            sftp_key_file = str(Path(raw_key).expanduser())
-            if not Path(sftp_key_file).exists():
-                console.print(
-                    f"[yellow]⚠ Key file not found at "
-                    f"{sftp_key_file} on this machine — accepting anyway "
-                    f"(it may exist on the deployment host).[/]"
-                )
         else:
             console.print(
-                "\n[red]⚠ Password will be stored in plain text in the "
-                "YAML config.[/] Recommended only for closed-LAN setups; "
-                "switch to key-based auth for any internet-reachable server.\n"
+                "\n[dim]Username for WebDAV authentication (basic auth).[/]\n"
+            )
+            webdav_username = click.prompt("Username")
+
+        # Password
+        if profile_data.get("webdav_password"):
+            webdav_password = profile_data["webdav_password"]
+            console.print("[dim]WebDAV password supplied by profile.[/]\n")
+        else:
+            console.print(
+                "\n[dim]Password or app password. Stored in the token file.[/]"
+                "\n[dim]  Nextcloud: generate an app password in Settings → Security.[/]\n"
             )
             import getpass
-            sftp_password = getpass.getpass("SFTP password: ")
+            webdav_password = getpass.getpass("Password: ")
+    elif backend == "sftp":
+        # Host
+        if profile_data.get("sftp_host"):
+            sftp_host = profile_data["sftp_host"]
+            console.print(
+                f"[dim]SFTP host supplied by profile:[/] {sftp_host}\n"
+            )
+        else:
+            console.print(
+                "\n[dim]SFTP host: hostname or IP of the SSH/SFTP server.[/]"
+                "\n[dim]  Example: storage.example.com  or  10.0.0.42[/]\n"
+            )
+            while True:
+                sftp_host = click.prompt("SFTP host").strip()
+                if sftp_host:
+                    break
+                console.print("[red]Host cannot be empty.[/]")
+
+        # Port
+        if profile_data.get("sftp_port"):
+            sftp_port = int(profile_data["sftp_port"])
+            console.print(
+                f"[dim]SFTP port supplied by profile:[/] {sftp_port}\n"
+            )
+        else:
+            console.print(
+                "\n[dim]SFTP port: TCP port for SSH on the server (default 22).[/]\n"
+            )
+            while True:
+                sftp_port = click.prompt("SFTP port", default=22, type=int)
+                if 1 <= sftp_port <= 65535:
+                    break
+                console.print(
+                    "[red]Port must be in range 1..65535.[/]"
+                )
+
+        # Username
+        if profile_data.get("sftp_username"):
+            sftp_username = profile_data["sftp_username"]
+            console.print(
+                f"[dim]SFTP username supplied by profile:[/] {sftp_username}\n"
+            )
+        else:
+            console.print(
+                "\n[dim]Username for SSH/SFTP login.[/]\n"
+            )
+            while True:
+                sftp_username = click.prompt("SFTP username").strip()
+                if sftp_username:
+                    break
+                console.print("[red]Username cannot be empty.[/]")
+
+        # Auth (key or password) — skipped when profile supplies one.
+        if profile_data.get("sftp_key_file") or profile_data.get("sftp_password"):
+            sftp_key_file = profile_data.get("sftp_key_file", "")
+            sftp_password = profile_data.get("sftp_password", "")
+            console.print(
+                "[dim]SFTP authentication credentials supplied by profile.[/]\n"
+            )
+        else:
+            # Auth choice — key (default) or password
+            console.print(
+                "\n[dim]Authentication method:[/]"
+                "\n[dim]  k = SSH private key (recommended)[/]"
+                "\n[dim]  p = password (LAN/test only — stored plain in YAML)[/]\n"
+            )
+            auth_choice = click.prompt(
+                "Authenticate with [k]ey or [p]assword?",
+                default="k",
+                type=click.Choice(["k", "p"], case_sensitive=False),
+            ).lower()
+
+            if auth_choice == "k":
+                console.print(
+                    "\n[dim]Path to your SSH private key. Tilde-expanded.[/]\n"
+                )
+                raw_key = click.prompt(
+                    "SSH private key file", default="~/.ssh/id_ed25519"
+                )
+                sftp_key_file = str(Path(raw_key).expanduser())
+                if not Path(sftp_key_file).exists():
+                    console.print(
+                        f"[yellow]⚠ Key file not found at "
+                        f"{sftp_key_file} on this machine — accepting anyway "
+                        f"(it may exist on the deployment host).[/]"
+                    )
+            else:
+                console.print(
+                    "\n[red]⚠ Password will be stored in plain text in the "
+                    "YAML config.[/] Recommended only for closed-LAN setups; "
+                    "switch to key-based auth for any internet-reachable server.\n"
+                )
+                import getpass
+                sftp_password = getpass.getpass("SFTP password: ")
 
         # known_hosts file
         console.print(
@@ -1381,20 +1504,26 @@ def _run_wizard(
         )
 
     # Token file
-    if backend == "googledrive":
-        derived_token = _derive_token_file(credentials_file)
-    elif backend == "dropbox":
-        derived_token = str(CONFIG_DIR / f"dropbox-{project_name}-token.json")
-    elif backend == "onedrive":
-        derived_token = str(CONFIG_DIR / f"onedrive-{project_name}-token.json")
-    elif backend == "webdav":
-        derived_token = str(CONFIG_DIR / f"webdav-{project_name}-token.json")
-    elif backend == "sftp":
-        derived_token = str(CONFIG_DIR / f"sftp-{project_name}-token.json")
+    if profile_data.get("token_file"):
+        token_file = profile_data["token_file"]
+        console.print(
+            f"[dim]Token file supplied by profile:[/] {token_file}\n"
+        )
     else:
-        derived_token = str(CONFIG_DIR / f"{backend}-{project_name}-token.json")
-    raw_token = click.prompt("Token file", default=derived_token)
-    token_file = str(Path(raw_token).expanduser())
+        if backend == "googledrive":
+            derived_token = _derive_token_file(credentials_file)
+        elif backend == "dropbox":
+            derived_token = str(CONFIG_DIR / f"dropbox-{project_name}-token.json")
+        elif backend == "onedrive":
+            derived_token = str(CONFIG_DIR / f"onedrive-{project_name}-token.json")
+        elif backend == "webdav":
+            derived_token = str(CONFIG_DIR / f"webdav-{project_name}-token.json")
+        elif backend == "sftp":
+            derived_token = str(CONFIG_DIR / f"sftp-{project_name}-token.json")
+        else:
+            derived_token = str(CONFIG_DIR / f"{backend}-{project_name}-token.json")
+        raw_token = click.prompt("Token file", default=derived_token)
+        token_file = str(Path(raw_token).expanduser())
 
     # Config file path
     derived_config = str(CONFIG_DIR / f"{project_name}.yaml")
@@ -1668,9 +1797,35 @@ def init(
     """Initialize claude-mirror for a project.
 
     Run with --wizard for interactive setup, or pass all flags directly.
+
+    Combine with the global --profile flag (e.g.
+    `claude-mirror --profile work init --wizard --backend googledrive`)
+    to inherit credential-bearing fields (credentials_file, token_file,
+    dropbox_app_key, etc.) from a named profile so the wizard / flag set
+    only collects the project-specific fields (drive_folder_id, dropbox_folder,
+    sftp_folder, ...).
     """
     # Ensure config directory exists before anything else
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Pick up the global --profile flag, if any. When set, the credential-
+    # bearing fields supplied by the profile are exempt from the wizard's
+    # prompt set and from the flag-mode required-fields check; the resulting
+    # project YAML is written with `profile: NAME` at the top so the same
+    # inheritance applies on every subsequent load.
+    from .config import get_global_profile_override
+    from .profiles import load_profile as _load_profile_data
+    profile_name = get_global_profile_override()
+    profile_data: dict[str, Any] = {}
+    if profile_name:
+        try:
+            profile_data = _load_profile_data(profile_name)
+        except FileNotFoundError as e:
+            # The CLI group's invoke() already validates --profile up
+            # front, so this branch is only reached if someone calls
+            # init() directly. Match the group-level error shape.
+            console.print(f"[red]✗ {e}[/]")
+            sys.exit(1)
 
     backend = backend_opt
 
@@ -1678,6 +1833,7 @@ def init(
         values = _run_wizard(
             backend_default=backend_opt,
             auto_pubsub_setup=auto_pubsub_setup,
+            profile_data=profile_data,
         )
         backend          = values["backend"]
         project_path     = values["project_path"]
@@ -1711,13 +1867,20 @@ def init(
         token_file       = values["token_file"]
         config_path      = values["config_path"]
     else:
+        # Helper: is this credential-bearing field already supplied by
+        # the active profile? When True, the corresponding CLI flag is
+        # NOT required.
+        def _from_profile(key: str) -> bool:
+            return bool(profile_data.get(key))
+
         # Validate required flags per backend
         if backend == "googledrive":
             missing = [
                 name for name, val in [
                     ("--project", project),
                     ("--drive-folder-id", drive_folder_id),
-                    ("--gcp-project-id", gcp_project_id),
+                    ("--gcp-project-id",
+                     gcp_project_id or profile_data.get("gcp_project_id", "")),
                     ("--pubsub-topic-id", pubsub_topic_id),
                 ] if not val
             ]
@@ -1725,7 +1888,8 @@ def init(
             missing = [
                 name for name, val in [
                     ("--project", project),
-                    ("--dropbox-app-key", dropbox_app_key),
+                    ("--dropbox-app-key",
+                     dropbox_app_key or profile_data.get("dropbox_app_key", "")),
                     ("--dropbox-folder", dropbox_folder),
                 ] if not val
             ]
@@ -1733,7 +1897,8 @@ def init(
             missing = [
                 name for name, val in [
                     ("--project", project),
-                    ("--onedrive-client-id", onedrive_client_id),
+                    ("--onedrive-client-id",
+                     onedrive_client_id or profile_data.get("onedrive_client_id", "")),
                     ("--onedrive-folder", onedrive_folder),
                 ] if not val
             ]
@@ -1741,9 +1906,12 @@ def init(
             missing = [
                 name for name, val in [
                     ("--project", project),
-                    ("--webdav-url", webdav_url),
-                    ("--webdav-username", webdav_username),
-                    ("--webdav-password", webdav_password),
+                    ("--webdav-url",
+                     webdav_url or profile_data.get("webdav_url", "")),
+                    ("--webdav-username",
+                     webdav_username or profile_data.get("webdav_username", "")),
+                    ("--webdav-password",
+                     webdav_password or profile_data.get("webdav_password", "")),
                 ] if not val
             ]
         elif backend == "sftp":
@@ -1752,12 +1920,19 @@ def init(
             missing = [
                 name for name, val in [
                     ("--project", project),
-                    ("--sftp-host", sftp_host),
-                    ("--sftp-username", sftp_username),
+                    ("--sftp-host",
+                     sftp_host or profile_data.get("sftp_host", "")),
+                    ("--sftp-username",
+                     sftp_username or profile_data.get("sftp_username", "")),
                     ("--sftp-folder", sftp_folder),
                 ] if not val
             ]
-            if not sftp_key_file and not sftp_password:
+            if (
+                not sftp_key_file
+                and not sftp_password
+                and not profile_data.get("sftp_key_file")
+                and not profile_data.get("sftp_password")
+            ):
                 missing.append("--sftp-key-file or --sftp-password")
         else:
             console.print(f"[red]Unknown backend: {backend}[/]")
@@ -1854,6 +2029,40 @@ def init(
         slack_enabled = slack_flag
         snapshot_format = (snapshot_format_opt or "blobs").lower()
 
+    # When a profile is in play, blank out the credential-bearing fields
+    # the profile supplies so the project YAML stores only project-
+    # specific values. On reload, `Config.load` re-merges the profile
+    # (project blanks lose to profile values per `apply_profile`'s
+    # truthy-wins rule), so the runtime Config has the right credentials.
+    if profile_name:
+        if profile_data.get("credentials_file"):
+            credentials_file = ""
+        if profile_data.get("token_file"):
+            token_file = ""
+        if profile_data.get("gcp_project_id"):
+            gcp_project_id = profile_data.get("gcp_project_id", "")
+            # Keep the gcp_project_id on the Config so runtime steps
+            # (auto-pubsub-setup) work; we do NOT blank it because it's
+            # not just a credential — many project YAMLs override it.
+        if profile_data.get("dropbox_app_key"):
+            dropbox_app_key = ""
+        if profile_data.get("onedrive_client_id"):
+            onedrive_client_id = ""
+        if profile_data.get("webdav_url"):
+            webdav_url = ""
+        if profile_data.get("webdav_username"):
+            webdav_username = ""
+        if profile_data.get("webdav_password"):
+            webdav_password = ""
+        if profile_data.get("sftp_host"):
+            sftp_host = ""
+        if profile_data.get("sftp_username"):
+            sftp_username = ""
+        if profile_data.get("sftp_key_file"):
+            sftp_key_file = ""
+        if profile_data.get("sftp_password"):
+            sftp_password = ""
+
     config = Config(
         project_path=project_path,
         drive_folder_id=drive_folder_id,
@@ -1898,7 +2107,28 @@ def init(
         keep_monthly=12,
         keep_yearly=3,
     )
-    config.save(config_path)
+    if profile_name:
+        # Strip any field the profile supplies from the on-disk YAML so
+        # the project file stays slim and changes to the profile
+        # propagate. Fields the profile doesn't set still serialise
+        # normally — e.g. a Drive profile that omits gcp_project_id
+        # leaves the project YAML's gcp_project_id intact.
+        strip = tuple(
+            k for k in (
+                "credentials_file", "token_file",
+                "gcp_project_id",
+                "dropbox_app_key",
+                "onedrive_client_id",
+                "webdav_url", "webdav_username", "webdav_password",
+                "webdav_insecure_http",
+                "sftp_host", "sftp_port", "sftp_username",
+                "sftp_key_file", "sftp_password",
+                "sftp_known_hosts_file", "sftp_strict_host_check",
+            ) if profile_data.get(k) not in (None, "")
+        )
+        config.save(config_path, profile=profile_name, strip_fields=strip)
+    else:
+        config.save(config_path)
     console.print(f"[green]Config saved to:[/]     {config_path}")
     console.print(f"[green]Token file:[/]          {token_file}")
     if backend == "googledrive":
@@ -5191,6 +5421,302 @@ def find_config(path: str) -> None:
             err=True,
         )
     sys.exit(1)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# `claude-mirror profile` subcommand group (since v0.5.49)
+# ──────────────────────────────────────────────────────────────────────────
+#
+# A profile is a YAML under ~/.config/claude_mirror/profiles/<name>.yaml
+# carrying the credential-bearing fields for one logical "account" — Google
+# account / Dropbox app / Azure AD app / WebDAV server / SFTP host. Project
+# YAMLs reference one by name (`profile: work`) and inherit those fields,
+# so a user with five projects on the same Google account doesn't have to
+# duplicate `credentials_file` / `token_file` / `gcp_project_id` five times.
+#
+# `profile create` reuses the same per-backend prompt logic as
+# `init --wizard` but writes the result under profiles/<name>.yaml rather
+# than as a project config; it only prompts for credential-bearing fields
+# (project-specific fields like drive_folder_id are NOT collected here).
+
+@cli.group("profile")
+def profile_group() -> None:
+    """Manage credentials profiles (~/.config/claude_mirror/profiles/).
+
+    A profile bundles the credentials-bearing fields shared across several
+    projects (e.g. one Google account used by five projects). Reference
+    one by name with the global `--profile NAME` flag, or set
+    `profile: NAME` at the top of a project YAML.
+    """
+
+
+@profile_group.command("list")
+def profile_list() -> None:
+    """List every profile under ~/.config/claude_mirror/profiles/."""
+    from .profiles import list_profiles, profile_summary, _profiles_dir
+
+    names = list_profiles()
+    if not names:
+        d = _profiles_dir()
+        console.print(
+            f"[yellow]No profiles configured.[/] Profiles directory: {d}\n"
+            "Create one with [bold]claude-mirror profile create NAME --backend BACKEND[/]."
+        )
+        return
+
+    table = Table(title="Profiles")
+    table.add_column("Name", style="bold")
+    table.add_column("Backend")
+    table.add_column("Description", overflow="fold")
+    table.add_column("Path", style="dim")
+    for n in names:
+        s = profile_summary(n)
+        table.add_row(s["name"], s["backend"] or "[dim](unset)[/]",
+                      s["description"] or "[dim](none)[/]", s["path"])
+    console.print(table)
+
+
+@profile_group.command("show")
+@click.argument("name")
+def profile_show(name: str) -> None:
+    """Print the raw YAML of profile NAME to stdout."""
+    from .profiles import profile_path
+
+    path = profile_path(name)
+    if not path.exists():
+        from .profiles import list_profiles
+        available = list_profiles()
+        if available:
+            avail_str = ", ".join(available)
+            console.print(
+                f"[red]✗ profile '{name}' not found at {path}.[/] "
+                f"Available profiles: {avail_str}."
+            )
+        else:
+            console.print(
+                f"[red]✗ profile '{name}' not found at {path}.[/] "
+                f"No profiles configured yet."
+            )
+        sys.exit(1)
+    click.echo(path.read_text())
+
+
+@profile_group.command("create")
+@click.argument("name")
+@click.option(
+    "--backend", "backend_opt",
+    type=click.Choice(
+        ["googledrive", "dropbox", "onedrive", "webdav", "sftp"],
+        case_sensitive=False,
+    ),
+    required=True,
+    help="Storage backend the profile will hold credentials for.",
+)
+@click.option(
+    "--description", "description", default="",
+    help="Optional human-readable description shown by `profile list`.",
+)
+@click.option(
+    "--force", is_flag=True, default=False,
+    help="Overwrite an existing profile YAML at the target path.",
+)
+def profile_create(
+    name: str, backend_opt: str, description: str, force: bool,
+) -> None:
+    """Interactively scaffold a new credentials profile.
+
+    Prompts for the credential-bearing fields of the chosen backend
+    (credentials_file / token_file / dropbox_app_key / onedrive_client_id
+    / webdav_url+username+password / sftp_host+username+key+folder)
+    and writes the result to
+    ~/.config/claude_mirror/profiles/NAME.yaml. Project-specific fields
+    (drive_folder_id, dropbox_folder, onedrive_folder, webdav-folder
+    suffix, etc.) are NOT collected here — those belong on each project
+    YAML.
+    """
+    from .profiles import profile_path, _profiles_dir
+
+    backend = backend_opt.lower()
+    target = profile_path(name)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if target.exists() and not force:
+        console.print(
+            f"[red]✗ profile '{name}' already exists at {target}.[/]\n"
+            f"Pass [bold]--force[/] to overwrite, or pick a different name."
+        )
+        sys.exit(1)
+
+    console.print(
+        f"\n[bold cyan]Creating profile '{name}' ({backend})[/]\n"
+        f"[dim]Will be written to: {target}[/]\n"
+    )
+
+    profile_data: dict[str, Any] = {"backend": backend}
+    if description:
+        profile_data["description"] = description
+
+    if backend == "googledrive":
+        console.print(
+            "[dim]Credentials file: OAuth2 'Desktop app' client JSON "
+            "downloaded from Google Cloud Console.[/]\n"
+        )
+        creds = click.prompt(
+            "Credentials file", default=_DEFAULT_CREDENTIALS,
+            value_proc=_byo_wizard.validate_credentials_file,
+        )
+        token = click.prompt(
+            "Token file", default=_derive_token_file(creds),
+        )
+        gcp = click.prompt(
+            "GCP project ID (optional, for Pub/Sub)", default="",
+        )
+        profile_data["credentials_file"] = str(Path(creds).expanduser())
+        profile_data["token_file"] = str(Path(token).expanduser())
+        if gcp:
+            profile_data["gcp_project_id"] = gcp
+    elif backend == "dropbox":
+        console.print(
+            "\n[dim]Dropbox app key: from your app at dropbox.com/developers.[/]\n"
+        )
+        app_key = click.prompt("Dropbox app key")
+        token = click.prompt(
+            "Token file", default=str(CONFIG_DIR / f"dropbox-{name}-token.json"),
+        )
+        profile_data["dropbox_app_key"] = app_key
+        profile_data["token_file"] = str(Path(token).expanduser())
+    elif backend == "onedrive":
+        console.print(
+            "\n[dim]Azure app client ID: portal.azure.com → App registrations.[/]\n"
+        )
+        client_id = click.prompt("Azure app client ID")
+        token = click.prompt(
+            "Token file", default=str(CONFIG_DIR / f"onedrive-{name}-token.json"),
+        )
+        profile_data["onedrive_client_id"] = client_id
+        profile_data["token_file"] = str(Path(token).expanduser())
+    elif backend == "webdav":
+        console.print(
+            "\n[dim]WebDAV URL: full URL to the WebDAV root for this account.[/]\n"
+        )
+        url = click.prompt("WebDAV URL")
+        username = click.prompt("Username")
+        import getpass
+        password = getpass.getpass("Password: ")
+        token = click.prompt(
+            "Token file", default=str(CONFIG_DIR / f"webdav-{name}-token.json"),
+        )
+        profile_data["webdav_url"] = url
+        profile_data["webdav_username"] = username
+        profile_data["webdav_password"] = password
+        profile_data["token_file"] = str(Path(token).expanduser())
+        if url.startswith("http://"):
+            profile_data["webdav_insecure_http"] = True
+    elif backend == "sftp":
+        console.print(
+            "\n[dim]SFTP host + auth credentials. The remote folder lives on the "
+            "project YAML, NOT on the profile.[/]\n"
+        )
+        host = click.prompt("SFTP host")
+        port = click.prompt("SFTP port", default=22, type=int)
+        username = click.prompt("SFTP username")
+        auth_choice = click.prompt(
+            "Authenticate with [k]ey or [p]assword?",
+            default="k",
+            type=click.Choice(["k", "p"], case_sensitive=False),
+        ).lower()
+        profile_data["sftp_host"] = host
+        profile_data["sftp_port"] = port
+        profile_data["sftp_username"] = username
+        if auth_choice == "k":
+            key_file = click.prompt(
+                "SSH private key file", default="~/.ssh/id_ed25519",
+            )
+            profile_data["sftp_key_file"] = str(Path(key_file).expanduser())
+        else:
+            import getpass
+            profile_data["sftp_password"] = getpass.getpass("SFTP password: ")
+        profile_data["sftp_known_hosts_file"] = "~/.ssh/known_hosts"
+        token = click.prompt(
+            "Token file", default=str(CONFIG_DIR / f"sftp-{name}-token.json"),
+        )
+        profile_data["token_file"] = str(Path(token).expanduser())
+
+    import yaml as _yaml
+    with open(target, "w") as f:
+        _yaml.dump(profile_data, f, default_flow_style=False, sort_keys=False)
+    # Lock down the profile YAML — token paths plus (for WebDAV) a
+    # password may be written here. 0600 matches the chmod we apply to
+    # token files themselves.
+    try:
+        target.chmod(0o600)
+    except OSError:
+        pass
+
+    console.print(
+        f"\n[green]✓ Profile '{name}' written to[/] {target}\n"
+        f"[dim]Use it with[/] [bold]claude-mirror --profile {name} <command>[/]\n"
+        f"[dim]or set[/] [bold]profile: {name}[/] [dim]at the top of a project YAML.[/]"
+    )
+
+
+@profile_group.command("delete")
+@click.argument("name")
+@click.option(
+    "--delete", "do_delete", is_flag=True, default=False,
+    help="Actually DELETE the profile YAML. WITHOUT this flag, runs in "
+         "dry-run mode (the safe default).",
+)
+@click.option(
+    "--yes", "skip_confirm", is_flag=True, default=False,
+    help="With --delete, skip the typed-YES confirmation prompt. Required "
+         "for non-interactive use.",
+)
+def profile_delete(name: str, do_delete: bool, skip_confirm: bool) -> None:
+    """Delete a credentials profile.
+
+    \b
+    SAFE BY DEFAULT — running without --delete performs a dry-run only.
+    To actually delete, you must:
+      1. pass --delete explicitly, AND
+      2. confirm by typing the literal word YES (or pass --yes).
+    """
+    from .profiles import profile_path
+
+    target = profile_path(name)
+    if not target.exists():
+        console.print(
+            f"[yellow]Profile '{name}' does not exist at {target} — nothing to delete.[/]"
+        )
+        return
+
+    if not do_delete:
+        console.print(
+            f"[bold yellow]🔍 DRY-RUN mode[/] — profile '{name}' at {target} "
+            f"WOULD be deleted.\n"
+            f"To actually delete: [bold cyan]claude-mirror profile delete {name} "
+            f"--delete[/]\n"
+            f"[dim](you'll be asked to type YES to confirm)[/]"
+        )
+        return
+
+    if not skip_confirm:
+        confirmation = click.prompt(
+            f"\nThis will permanently delete profile '{name}' "
+            f"({target}).\n"
+            f"This cannot be undone via claude-mirror.\n"
+            f"Type YES (uppercase, exact) to confirm",
+            default="",
+            show_default=False,
+        )
+        if confirmation != "YES":
+            console.print(
+                "[yellow]Aborted — you typed something other than 'YES'.[/]"
+            )
+            sys.exit(1)
+
+    target.unlink()
+    console.print(f"[green]✓ Profile '{name}' deleted from {target}.[/]")
 
 
 @cli.command("test-notify")

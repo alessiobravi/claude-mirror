@@ -80,6 +80,45 @@ class FileSyncState:
     drive_size: Optional[int] = None    # bytes; None if backend didn't expose size for this entry
 
 
+@dataclass
+class PushPlan:
+    """Read-only preview of what `push()` would do, returned by
+    `SyncEngine.push(dry_run=True)`. No backend writes, no manifest
+    mutations, no notifications. The CLI renders this; the engine
+    populates it from the same `get_status()` pass a real run uses.
+
+    `to_upload` covers LOCAL_AHEAD + NEW_LOCAL (what a real push uploads
+    cleanly). `to_delete` covers DELETED_LOCAL (mirrored deletion on the
+    remote). `conflicts` covers CONFLICT — a real push prompts the user
+    interactively, so dry-run only reports the count + paths and doesn't
+    speculate which side would win. `skipped` covers DRIVE_AHEAD +
+    NEW_DRIVE + IN_SYNC — files a push leaves alone.
+    """
+    to_upload: list[str]
+    to_delete: list[str]
+    conflicts: list[str]
+    skipped: list[str]
+    upload_bytes: int
+    delete_count: int
+    total_files: int
+
+
+@dataclass
+class PullPlan:
+    """Read-only preview of what `pull()` would do, returned by
+    `SyncEngine.pull(dry_run=True)`. No backend reads beyond listing,
+    no local writes, no manifest mutations.
+
+    `to_download` covers DRIVE_AHEAD + NEW_DRIVE (what a real pull writes
+    locally). `skipped` covers everything else (LOCAL_AHEAD, NEW_LOCAL,
+    DELETED_LOCAL, CONFLICT, IN_SYNC) — a real pull never touches those.
+    """
+    to_download: list[str]
+    skipped: list[str]
+    download_bytes: int
+    total_files: int
+
+
 class SyncEngine:
     def __init__(
         self,
@@ -985,7 +1024,93 @@ class SyncEngine:
             "auto_resolved": list(auto_resolved),
         }
 
-    def push(self, paths: Optional[list[str]] = None, force_local: bool = False) -> None:
+    def _plan_push(self, paths: Optional[list[str]] = None) -> PushPlan:
+        """Compute the plan a real push() would execute, without uploading,
+        deleting, snapshotting, or notifying.
+
+        Runs the same status pipeline (`_run_status_phase`) so the user sees
+        the live Local/Remote progress while the engine classifies each file.
+        Returns a PushPlan the CLI renders. Mirrors the dry-run contract of
+        `SnapshotManager.plan_restore()`: callers must treat the engine state
+        (manifest, hash cache, backend) as read-only for the duration of the
+        call. `prune()` on the hash-cache still happens via `get_status()` —
+        that's a local-only optimisation, not a backend write.
+        """
+        with self._make_phase_progress() as progress:
+            states = self._run_status_phase(progress)
+
+        to_upload: list[str] = []
+        to_delete: list[str] = []
+        conflicts: list[str] = []
+        skipped: list[str] = []
+        upload_bytes = 0
+
+        for s in states:
+            if paths and s.rel_path not in paths:
+                continue
+            if s.status in (Status.LOCAL_AHEAD, Status.NEW_LOCAL):
+                to_upload.append(s.rel_path)
+                if s.local_size is not None:
+                    upload_bytes += s.local_size
+            elif s.status == Status.DELETED_LOCAL:
+                to_delete.append(s.rel_path)
+            elif s.status == Status.CONFLICT:
+                conflicts.append(s.rel_path)
+            else:
+                skipped.append(s.rel_path)
+
+        return PushPlan(
+            to_upload=sorted(to_upload),
+            to_delete=sorted(to_delete),
+            conflicts=sorted(conflicts),
+            skipped=sorted(skipped),
+            upload_bytes=upload_bytes,
+            delete_count=len(to_delete),
+            total_files=len(states),
+        )
+
+    def _plan_pull(self, paths: Optional[list[str]] = None) -> PullPlan:
+        """Compute the plan a real pull() would execute, without downloading
+        anything to disk or mutating the manifest.
+
+        Same contract as `_plan_push`: the status phase still runs (so the
+        user sees live progress during classification), but every transfer
+        / write side-effect is skipped.
+        """
+        with self._make_phase_progress() as progress:
+            states = self._run_status_phase(progress)
+
+        to_download: list[str] = []
+        skipped: list[str] = []
+        download_bytes = 0
+
+        for s in states:
+            if paths and s.rel_path not in paths:
+                continue
+            if s.status in (Status.DRIVE_AHEAD, Status.NEW_DRIVE):
+                to_download.append(s.rel_path)
+                if s.drive_size is not None:
+                    download_bytes += s.drive_size
+            else:
+                skipped.append(s.rel_path)
+
+        return PullPlan(
+            to_download=sorted(to_download),
+            skipped=sorted(skipped),
+            download_bytes=download_bytes,
+            total_files=len(states),
+        )
+
+    def push(
+        self,
+        paths: Optional[list[str]] = None,
+        force_local: bool = False,
+        *,
+        dry_run: bool = False,
+    ) -> Optional[PushPlan]:
+        if dry_run:
+            return self._plan_push(paths=paths)
+
         pushed: list[str] = []
         pulled: list[str] = []
         deleted: list[str] = []
@@ -1184,7 +1309,16 @@ class SyncEngine:
                 "on the next push.[/]"
             )
 
-    def pull(self, paths: Optional[list[str]] = None, output_dir: Optional[str] = None) -> None:
+    def pull(
+        self,
+        paths: Optional[list[str]] = None,
+        output_dir: Optional[str] = None,
+        *,
+        dry_run: bool = False,
+    ) -> Optional[PullPlan]:
+        if dry_run:
+            return self._plan_pull(paths=paths)
+
         pulled: list[str] = []
 
         with self._make_phase_progress() as progress:

@@ -34,7 +34,7 @@ from .notifications import NotificationBackend
 from .notifications.pubsub import PubSubNotifier
 from .notifier import Notifier, read_and_clear_inbox
 from .snapshots import SnapshotManager, _human_size
-from .sync import Status, STATUS_LABELS, SyncEngine
+from .sync import PullPlan, PushPlan, Status, STATUS_LABELS, SyncEngine
 
 
 def _get_version() -> str:
@@ -3455,9 +3455,17 @@ def sync(config_path: str, no_prompt: bool, strategy: Optional[str]) -> None:
 @click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
 @click.option("--force-local", is_flag=True, default=False,
               help="Treat local content as authoritative: push all changed files without interactive conflict resolution.")
-def push(files: tuple[Any, ...], config_path: str, force_local: bool) -> None:
+@click.option("--dry-run/--no-dry-run", "dry_run", default=False,
+              help="Preview the run without uploading, downloading, deleting, "
+                   "or modifying the manifest. No network writes, no local "
+                   "writes, no notifications.")
+def push(files: tuple[Any, ...], config_path: str, force_local: bool, dry_run: bool) -> None:
     """Push local changes to Drive. Optionally specify FILES to push."""
     engine, cfg, _ = _load_engine(_resolve_config(config_path))
+    if dry_run:
+        plan = engine.push(list(files) if files else None, dry_run=True)
+        _render_push_plan(plan)
+        return
     engine.push(list(files) if files else None, force_local=force_local)
     _maybe_auto_prune(engine, cfg)
 
@@ -3488,6 +3496,88 @@ def _maybe_auto_prune(engine: SyncEngine, cfg: Config) -> None:
         # because retention couldn't complete. The error is surfaced so
         # the user can investigate, but exit code stays 0.
         console.print(f"[yellow]auto-prune skipped:[/] {e}")
+
+
+def _render_push_plan(plan: PushPlan) -> None:
+    """Render `claude-mirror push --dry-run` output. Mirrors the section
+    layout of `restore --dry-run`: section heading, per-file lists with
+    +/-/~ markers (uploads / deletes / conflicts), trailing summary.
+    No backend writes, no notifications — purely a print."""
+    if not plan.to_upload and not plan.to_delete and not plan.conflicts:
+        console.print(
+            "[dim]Dry-run:[/] nothing to push — every file is in sync "
+            "or would be pulled instead."
+        )
+        return
+
+    table = Table(
+        show_header=True, header_style="bold",
+        title="Push plan (dry-run)",
+    )
+    table.add_column("Action")
+    table.add_column("Path")
+
+    for rel in plan.to_upload:
+        table.add_row("[cyan]+ upload[/]", rel)
+    for rel in plan.to_delete:
+        table.add_row("[yellow]- delete[/]", rel)
+    for rel in plan.conflicts:
+        table.add_row("[red]~ conflict[/]", rel)
+
+    console.print(table)
+
+    parts: list[str] = []
+    if plan.to_upload:
+        parts.append(
+            f"[cyan]Would upload {len(plan.to_upload)} file(s) "
+            f"({_human_size(plan.upload_bytes)})[/]"
+        )
+    if plan.to_delete:
+        parts.append(
+            f"[yellow]Would delete {len(plan.to_delete)} file(s) on remote[/]"
+        )
+    if plan.conflicts:
+        parts.append(
+            f"[red]{len(plan.conflicts)} conflict(s) — "
+            f"a real run would prompt[/]"
+        )
+    console.print("  " + "  ·  ".join(parts))
+    console.print(
+        "[bold]Run without --dry-run to apply.[/] "
+        "[dim]No network writes, no local writes, no notifications were sent.[/]"
+    )
+
+
+def _render_pull_plan(plan: PullPlan) -> None:
+    """Render `claude-mirror pull --dry-run` output. Same shape as
+    `_render_push_plan` but pull-side: + for downloads, summary +
+    "no writes" footer."""
+    if not plan.to_download:
+        console.print(
+            "[dim]Dry-run:[/] nothing to pull — every remote file is "
+            "already present locally."
+        )
+        return
+
+    table = Table(
+        show_header=True, header_style="bold",
+        title="Pull plan (dry-run)",
+    )
+    table.add_column("Action")
+    table.add_column("Path")
+
+    for rel in plan.to_download:
+        table.add_row("[blue]+ download[/]", rel)
+
+    console.print(table)
+    console.print(
+        f"[blue]Would download {len(plan.to_download)} file(s) "
+        f"({_human_size(plan.download_bytes)})[/]"
+    )
+    console.print(
+        "[bold]Run without --dry-run to apply.[/] "
+        "[dim]No network writes, no local writes, no notifications were sent.[/]"
+    )
 
 
 @cli.command()
@@ -3578,9 +3668,20 @@ def diff(path: str, config_path: str, context_lines: int) -> None:
 @click.argument("files", nargs=-1)
 @click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
 @click.option("--output", default="", help="Download files to this directory instead of the project path. Does not update local files or the manifest.")
-def pull(files: tuple[Any, ...], config_path: str, output: str) -> None:
+@click.option("--dry-run/--no-dry-run", "dry_run", default=False,
+              help="Preview the run without uploading, downloading, deleting, "
+                   "or modifying the manifest. No network writes, no local "
+                   "writes, no notifications.")
+def pull(files: tuple[Any, ...], config_path: str, output: str, dry_run: bool) -> None:
     """Pull remote changes from Drive. Optionally specify FILES to pull."""
-    engine, _, _ = _load_engine(_resolve_config(config_path), with_pubsub=not output)
+    engine, _, _ = _load_engine(
+        _resolve_config(config_path),
+        with_pubsub=not output and not dry_run,
+    )
+    if dry_run:
+        plan = engine.pull(list(files) if files else None, dry_run=True)
+        _render_pull_plan(plan)
+        return
     engine.pull(list(files) if files else None, output_dir=output or None)
 
 

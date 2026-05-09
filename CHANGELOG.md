@@ -4,6 +4,25 @@ All notable changes to claude-mirror.
 
 ---
 
+## [Unreleased]
+
+### Added — push --dry-run / pull --dry-run preview mode
+
+A cron-paranoid operator can now preview exactly what a scheduled `claude-mirror push` or `claude-mirror pull` would do, without making any backend writes, local writes, or notification dispatches. Mirrors the existing `restore --dry-run` pattern: the engine exposes a planning function that returns a structured plan dataclass, and the CLI renders that plan as a Rich table with `+`/`-`/`~` markers and a one-line summary, exiting 0.
+
+- `claude_mirror/sync.py` — new `PushPlan` / `PullPlan` dataclasses; `SyncEngine.push()` and `SyncEngine.pull()` gain a keyword-only `dry_run: bool = False` parameter. When set, the engine runs the same `get_status()` classification a real run uses, but skips every `upload_file` / `upload_bytes` / `download_file` / `delete_file` / `manifest.save()` / snapshot creation / notifier publish. Defaults preserve the existing public contract (real-run callers see no change). The planning phase still renders live progress (`Local` / `Remote` rows) so the user sees activity while classification runs.
+- `claude_mirror/cli.py` — `--dry-run / --no-dry-run` flag on both `push` and `pull` Click commands. Help text: "Preview the run without uploading, downloading, deleting, or modifying the manifest. No network writes, no local writes, no notifications." New `_render_push_plan()` / `_render_pull_plan()` helpers print the Rich table + summary footer; the dry-run path explicitly skips `_try_reload_watcher()`, `_maybe_auto_prune()`, and the success-notification publish so it is genuinely side-effect-free. `pull --dry-run` constructs the engine without a notifier (`with_pubsub=False`) so a Pub/Sub setup error in a cron-only environment doesn't surface as a fake failure on a preview command.
+- `tests/test_push_dry_run.py` — new module, 17 tests. Engine-level: every state in the (local × remote × manifest) matrix classifies into the right bucket; `paths=` filter narrows the plan; backend writes (`upload_file` / `upload_bytes` / `delete_file` / `copy_file`) are never called; the on-disk manifest's bytes + mtime are byte-identical before vs after; `dry_run=True` returns a `PushPlan`, `dry_run=False` keeps returning `None`. CLI-level: `--dry-run` exits 0, prints the summary, the manifest file is unchanged on disk, and the backend recorded zero write calls; the `nothing-to-push` branch renders a dim hint instead of an empty table.
+- `tests/test_pull_dry_run.py` — new module, 19 tests. Same shape as the push module, scoped to `DRIVE_AHEAD` / `NEW_DRIVE` (downloads) vs every other state (`skipped`); explicit assertion that `download_file` is never called and that a would-be-pulled file is still absent from local disk after the dry-run.
+- `README.md` — `Daily usage cheatsheet` updated to mention `--dry-run` next to `push` / `pull`.
+- `docs/cli-reference.md` — `### push` and `### pull` subsections gain a one-line note describing the new flag.
+
+### Tests
+- `pytest tests/test_push_dry_run.py tests/test_pull_dry_run.py` — **36 passed locally** on macOS (under 0.5s total; every test under 20ms).
+- `pytest tests/` — **867 passed, 3 skipped locally** on macOS (skips are the existing `mypy not installed` ones, unchanged).
+
+---
+
 ## [0.5.55] — 2026-05-09
 
 Hotfix #3 for v0.5.52. v0.5.54's CI run came back green on Windows + Python 3.11/3.12 but red on Windows + Python 3.13/3.14 with one remaining failure: `test_safe_join_classifies_correctly[foo\x00bar.md-False]`. Strengthens the path-traversal guard.

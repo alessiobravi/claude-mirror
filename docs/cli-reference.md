@@ -344,9 +344,13 @@ See [README — Check sync status](../README.md#check-sync-status).
 
 Upload locally-changed files to the remote, create a snapshot, and publish a notification to all collaborators. With Tier 2 mirrors, uploads to every backend in parallel; the run as a whole succeeds even if one mirror has transient errors. Pass file arguments to push only those specific files. Shows live ETA + transfer rate during the upload phase — see [admin.md "Transfer progress"](admin.md#transfer-progress-live-eta--bytessec).
 
+Pass `--dry-run` to preview the upload plan without making any backend writes, local writes, or notification dispatches — useful for cron-paranoid operators who want to confirm the next scheduled run before it fires. See the [Unreleased entry in the CHANGELOG](../CHANGELOG.md#unreleased) for the full contract.
+
 ### `pull`
 
 Download remote-ahead files and update the local manifest. Pass file arguments to pull only specific files. Use `--output PATH` to download to a separate directory without touching local files or the manifest — useful for previewing remote changes before deciding to merge. Shows live ETA + transfer rate during the download phase — see [admin.md "Transfer progress"](admin.md#transfer-progress-live-eta--bytessec).
+
+Pass `--dry-run` to preview the download plan without making any backend reads, local writes, or notification dispatches — same shape as `push --dry-run`. See the [Unreleased entry in the CHANGELOG](../CHANGELOG.md#unreleased) for the full contract.
 
 ### `sync`
 

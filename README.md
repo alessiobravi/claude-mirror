@@ -269,8 +269,10 @@ claude-mirror status --short            # one-line summary, no table
 claude-mirror status --by-backend       # per-file × per-backend live state (Tier 2 setups)
 claude-mirror push                      # upload local-ahead files; snapshot
 claude-mirror push file1.md file2.md    # push specific files only
+claude-mirror push --dry-run            # preview the upload plan; no network writes, no local writes
 claude-mirror pull                      # download remote-ahead files
 claude-mirror pull --output DIR         # preview to DIR without touching local files
+claude-mirror pull --dry-run            # preview the download plan; no network reads, no local writes
 claude-mirror diff path/to/file.md      # colourised unified diff (remote → local)
 claude-mirror sync                      # full bidirectional with conflict prompts
 claude-mirror sync --no-prompt --strategy keep-local   # cron-friendly: auto-resolve all conflicts

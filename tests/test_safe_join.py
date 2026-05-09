@@ -5,9 +5,10 @@ files outside the destination directory.
 Contract (read from the source, not assumed):
     * Returns a `Path` resolved under `base` when the join is safe.
     * Raises `ValueError` when the resolved path escapes `base`.
-    * `Path.resolve()` raises `ValueError` for embedded NUL bytes — that
-      surfaces as `ValueError` from `_safe_join` too, which is fine for
-      the security contract (the unsafe input is rejected with an exception).
+    * Embedded NUL bytes are rejected explicitly (since v0.5.55) — historically
+      this relied on `Path.resolve()` raising `ValueError`, but Python 3.13+
+      on Windows no longer does. Up-front rejection keeps the security
+      contract uniform across platforms and Python versions.
     * Empty string and `"."` resolve to `base` itself — they are NOT
       traversal but are not useful as a write target either; the caller
       is responsible for not feeding such inputs. We pin the actual
@@ -38,9 +39,10 @@ from claude_mirror.snapshots import _safe_join
 #     so we mark these as safe (current observed behaviour).
 #   * `..foo`, `...`, `.hidden` are LEGAL POSIX filenames whose name merely
 #     STARTS with `..` — must NOT be over-rejected.
-#   * NUL byte in path raises ValueError from `Path.resolve()` itself,
-#     which counts as "rejected with ValueError" — the security contract
-#     is satisfied either way.
+#   * NUL byte in path is rejected explicitly by `_safe_join` (v0.5.55+).
+#     Earlier behaviour relied on `Path.resolve()` raising ValueError, but
+#     Python 3.13+ on Windows no longer does — explicit rejection is
+#     the only platform-independent way to honour the security contract.
 SAFE_JOIN_CASES = [
     # ---- Safe paths --------------------------------------------------------
     ("foo/bar.md", True),

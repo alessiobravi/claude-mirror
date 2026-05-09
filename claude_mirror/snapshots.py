@@ -77,6 +77,15 @@ def _safe_join(base: Path, rel_path: str) -> Path:
     Defends against path-traversal in untrusted backend metadata.
     Raises ValueError if rel_path attempts to escape the destination root.
     """
+    # Explicit NUL-byte rejection: historically we relied on `Path.resolve()`
+    # raising `ValueError` for embedded NULs, but that behaviour changed on
+    # Windows starting with Python 3.13 (resolve no longer surfaces it as
+    # ValueError). Reject up-front so the security contract holds on every
+    # platform / Python version.
+    if "\x00" in rel_path:
+        raise ValueError(
+            f"Refusing to write path containing NUL byte: {rel_path!r}"
+        )
     base_resolved = base.resolve()
     target = (base / rel_path).resolve()
     try:

@@ -4,6 +4,30 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.55] — 2026-05-09
+
+Hotfix #3 for v0.5.52. v0.5.54's CI run came back green on Windows + Python 3.11/3.12 but red on Windows + Python 3.13/3.14 with one remaining failure: `test_safe_join_classifies_correctly[foo\x00bar.md-False]`. Strengthens the path-traversal guard.
+
+### Fixed — Explicit NUL-byte rejection in `_safe_join` (security-contract hardening)
+- `claude_mirror/snapshots.py::_safe_join()` is the last line of defence against backend-supplied metadata writing files outside the destination directory (e.g. a malicious mirror sending `rel_path="../../../etc/passwd"`). It must reject NUL bytes — embedded NULs are a classic path-confusion vector that some downstream consumers (older filesystems, C-string-based tooling) treat as a string terminator.
+- The previous implementation relied on `Path.resolve()` raising `ValueError` for embedded NUL bytes. **That behaviour changed in Python 3.13 on Windows** — `resolve()` no longer raises `ValueError` for NUL bytes there, so `_safe_join("foo\x00bar.md")` returned silently instead of refusing the input. Linux / macOS / Windows-3.11-3.12 all still raised, masking the regression until the v0.5.52 Windows-CI matrix went green on the new Python versions.
+- **Fix:** add an explicit `if "\x00" in rel_path: raise ValueError(...)` guard at the top of `_safe_join()`. Now the contract is platform- and Python-version-independent: NUL bytes are rejected up-front before any `Path.resolve()` call.
+- The security posture is *strictly stronger* than before: even on platforms where `resolve()` still happened to raise `ValueError`, the explicit guard runs first and produces a clearer error message ("Refusing to write path containing NUL byte: ...").
+
+### Updated docs/files
+- `claude_mirror/snapshots.py` — `_safe_join()` gains an explicit NUL-byte guard; comment in source explains the Python 3.13 / Windows root cause so the next reader doesn't remove it as redundant.
+- `tests/test_safe_join.py` — module docstring + parametrize comment updated to describe the new explicit-rejection contract instead of the old "ValueError from resolve()" coincidence. The test data is unchanged.
+- `pyproject.toml` (version 0.5.54 → 0.5.55).
+
+### Tests
+- `pytest tests/test_safe_join.py` — **22 passed locally** on macOS (the test was already correct; only the source rejection mechanism changed).
+- The Python 3.13 / 3.14 Windows runs that flagged the regression in v0.5.54 will now pass.
+
+### Lesson learned
+- Don't rely on platform-specific exception behaviour from stdlib for security-critical guards. `Path.resolve()` raising `ValueError` for NUL bytes was an *implementation detail* of CPython on POSIX + older-Windows, not a contract — and it changed. Up-front explicit checks are the only way to make security guarantees portable across CPython versions.
+
+---
+
 ## [0.5.54] — 2026-05-09
 
 Hotfix #2 for v0.5.52. v0.5.53 fixed the manifest/glob path-separator class of bug; CI on the new Windows runners now flagged 5 more Windows-only failures clustering into 3 distinct root causes.

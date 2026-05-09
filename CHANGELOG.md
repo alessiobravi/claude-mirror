@@ -4,7 +4,9 @@ All notable changes to claude-mirror.
 
 ---
 
-## [Unreleased]
+## [0.5.56] — 2026-05-09
+
+Five new user-facing commands and command modes ship together: `push --dry-run` / `pull --dry-run` preview mode, `log --follow` for live streaming, `status --presence` for collaborator visibility, `claude-mirror health` for monitoring-tool integration, and `claude-mirror clone` for one-shot machine bootstrap. Plus a docs cleanup pass (DOC-CLEAN) fixing 6 stale README anchors trimmed during the v0.5.36 doc split, with two new admin.md subsections ("Filtering which events fire", "Is the watcher actually running?").
 
 ### Added — push --dry-run / pull --dry-run preview mode
 
@@ -113,6 +115,17 @@ The presence-fetch phase appears as a progress row labelled "Presence" with a li
 
 ### Tests
 - `pytest tests/test_clone.py` — **5 passed locally** on macOS; existing init / auth / wizard regressions all still pass after the helper extraction.
+
+### Documentation — DOC-CLEAN cross-link cleanup
+
+- Fixed 6 stale `README.md#...` anchor links in `docs/cli-reference.md` (5) and `docs/conflict-resolution.md` (1). The targets had been trimmed out of `README.md` during the v0.5.36 doc-split, leaving dead links that landed users at the README top instead of the moved content. Each link now points at its current home — README sections that survived (`#your-first-project`, `#daily-usage-cheatsheet`, `#slack-notifications`) or the equivalent destination in `docs/cli-reference.md` (`#diff`) and `docs/admin.md` (`#multi-backend-mirroring-tier-2`).
+- New `### Filtering which events fire` subsection in `docs/admin.md` under `## Notifications` — table of the four dials operators have for shaping notification volume (`*_enabled`, `exclude_patterns` / `.claude_mirror_ignore`, route `on:` filter, route `paths:` filter), with the order-of-evaluation contract spelled out and the heartbeat-event exception documented.
+- New `### Is the watcher actually running?` subsection in `docs/admin.md` under `## Auto-start the watcher` — explicit `launchctl list | grep claude-mirror` (macOS), `systemctl --user status claude-mirror-watch` (Linux), `pgrep -f "claude-mirror watch-all"` (any POSIX), and Windows guidance to use the `--once` polling form via Task Scheduler. Plus log-tail commands per platform and the `claude-mirror reload` re-scan hint.
+
+### Total surface area for v0.5.56
+
+- **918 tests pass locally on macOS** (831 baseline + 87 new): 36 push/pull dry-run + 7 log follow + 17 presence + 22 health + 5 clone.
+- 5 new top-level commands or command modes; 2 new modules (`claude_mirror/_presence.py`, `claude_mirror/_health.py`); `init` and `auth` refactored into reusable `_run_init` / `_run_auth` helpers so the new `clone` command shares the same code path; `_NO_WATCHER_CHECK_CMDS` extended for the new `--json`-quiet `health` command; `--json` envelope schema bumped to v1.1 (additive — `presence` key only emitted when `status --presence` is set).
 
 ---
 

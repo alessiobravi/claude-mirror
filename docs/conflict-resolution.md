@@ -58,4 +58,4 @@ Output is one yellow line per auto-resolved file plus a trailing one-line `Summa
 - [admin.md](admin.md) — restoring an older version from a snapshot if you resolved a conflict the wrong way.
 - [admin.md — Unattended sync via cron](admin.md#unattended-sync-via-cron) — sample crontab entries for `--no-prompt --strategy`.
 - [cli-reference.md](cli-reference.md#sync) — the `sync` command that triggers conflict resolution, including the `--no-prompt --strategy` flag table.
-- [README — Compare local vs remote for a single file](../README.md#compare-local-vs-remote-for-a-single-file) — `claude-mirror diff` for previewing differences before resolving.
+- [cli-reference.md — `diff`](cli-reference.md#diff) — `claude-mirror diff <path>` for previewing local-vs-remote differences before resolving.

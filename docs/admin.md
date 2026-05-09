@@ -500,6 +500,34 @@ For cron-driven setups that prefer a polling tick over a long-running daemon, th
 
 Each `--once` run does exactly one polling cycle, dispatches any inbox events, then exits 0. A persistent watermark in `~/.config/claude_mirror/watch_once_state/` ensures successive runs only surface events that arrived since the previous tick — the very first run after install captures the current log tail and emits nothing, so a fresh cron install does not flood you with weeks of historical events. `--quiet` suppresses the startup banner so cron emails only contain real news. See `claude-mirror watch --help` for the full flag list.
 
+### Is the watcher actually running?
+
+If notifications stop arriving, the first thing to check is whether `watch-all` is still up. claude-mirror prints a yellow `⚠ watcher not running` banner before most subcommands when it isn't, but the explicit checks below are useful in scripts, in remote sessions, or when the banner has been suppressed (`--json`, `--quiet`):
+
+**macOS (launchd, after `claude-mirror-install`):**
+```bash
+launchctl list | grep claude-mirror     # exit 0 with a numeric PID = running
+tail -n 50 ~/Library/Logs/claude-mirror-watch.log  # what it did most recently
+launchctl kickstart -k gui/$(id -u)/com.claude-mirror.watch  # restart it
+```
+
+**Linux (systemd user unit, after `claude-mirror-install`):**
+```bash
+systemctl --user status claude-mirror-watch
+journalctl --user -u claude-mirror-watch -n 50 --no-pager
+systemctl --user restart claude-mirror-watch
+```
+
+**Any platform — manual / one-shot:**
+```bash
+pgrep -f "claude-mirror watch-all"      # PID(s) if running, exit 1 if not
+claude-mirror watch-all                 # foreground run; Ctrl+C to stop
+```
+
+**Windows:** `watch-all` is POSIX-only today (it uses `SIGHUP` for hot-reload). Use the cron-style polling form instead — `claude-mirror watch --once --quiet` from Task Scheduler at the cadence you want.
+
+If the process is alive but a specific project still isn't getting events, run `claude-mirror reload` to send the running watcher a `SIGHUP` (re-scans `~/.config/claude_mirror/` for new configs). If that doesn't help, [`claude-mirror doctor`](#doctor) will tell you whether the project's backend itself is reachable and whether the notification channel (Drive Pub/Sub, Dropbox cursor, OneDrive/WebDAV/SFTP poll loop) is configured correctly.
+
 ### Unattended sync via cron
 
 `claude-mirror watch --once` only PULLS remote changes — it never pushes local edits and never resolves conflicts. For a fully bidirectional cron-driven flow (push local edits, pull remote edits, auto-resolve any conflicts) use `claude-mirror sync --no-prompt --strategy ...`:
@@ -761,6 +789,21 @@ Multiple backends can be enabled simultaneously on the same project — every en
 | **Discord** | Team chat in Discord; want a coloured embed card per event | `https://discord.com/api/webhooks/{id}/{token}` |
 | **Microsoft Teams** | Team chat in Teams; legacy connector or modern Workflows webhook | `https://outlook.office.com/webhook/...` or `https://{tenant}.webhook.office.com/...` |
 | **Generic** | Wiring claude-mirror into n8n / Make / Zapier / a custom dashboard / an internal Slack-replacement | Any URL — claude-mirror POSTs a schema-stable JSON envelope and lets you add custom auth headers |
+
+### Filtering which events fire
+
+claude-mirror exposes four independent dials so you can tune notifications from "everything everywhere" down to "only deletes under `secrets/**`, and only on the security channel". Apply them in this order; later filters operate on whatever the earlier ones let through.
+
+| Dial | Scope | Where it lives | What it controls |
+|---|---|---|---|
+| `*_enabled: false` | Whole backend | Top-level config field (e.g. `slack_enabled`, `discord_enabled`) | Turns the entire integration off — no events of any kind reach that backend |
+| `exclude_patterns` / `.claude_mirror_ignore` | Whole sync | Project-tree exclusions (see [`.claude_mirror_ignore`](#claude_mirror_ignore--project-tree-exclusions)) | Files matching here never enter sync at all, so they never appear in any event payload either |
+| Route `on:` list | Per route | Inside a `*_routes` entry, e.g. `on: [push, delete]` | Drops the entire event if `event.action` isn't in the list — useful for "deletes go to a quieter channel" |
+| Route `paths:` list | Per route | Inside a `*_routes` entry, e.g. `paths: ["secrets/**"]` | Filters `event.files` to those matching at least one glob; if zero files match, the route is skipped — useful for "security channel only sees the security subtree" |
+
+Heartbeat events (`sync` runs that found nothing to do) carry no files, so they bypass `paths:` and always fire on a route whose `on:` list includes `sync` — that is intentional, so a watching channel still gets a periodic "I'm alive" beat.
+
+The legacy single-channel form (`slack_webhook_url` / `discord_webhook_url` / etc. without a `*_routes` block) only honours `*_enabled` and `exclude_patterns` — `on:` and `paths:` are list-form-only. See [Multi-channel routing per project](#multi-channel-routing-per-project) for the full schema.
 
 ### Slack
 

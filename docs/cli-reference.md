@@ -360,7 +360,7 @@ Combine with the global `--profile NAME` flag (since v0.5.49) — `claude-mirror
 
 `--auto-pubsub-setup` (Drive only, since v0.5.47): after the post-auth smoke test passes, idempotently create the Pub/Sub topic, the per-machine subscription, and the IAM grant for Drive's push-notification service account (`apps-storage-noreply@google.com` -> `roles/pubsub.publisher`) on the topic. Skipped silently if the Pub/Sub OAuth scope wasn't granted at auth time, and on every non-googledrive backend. See [backends/google-drive.md](backends/google-drive.md#auto-create-pubsub-topic--subscription--iam-grant---auto-pubsub-setup-since-v0547) for sample output and edge cases.
 
-See [README — Step 1: Initialize](../README.md#step-1-initialize) for the wizard transcripts and the full flag table, and the per-backend pages for what each backend needs:
+See [README — Your first project](../README.md#your-first-project) for the wizard transcripts and the full flag table, and the per-backend pages for what each backend needs:
 - [backends/google-drive.md](backends/google-drive.md)
 - [backends/dropbox.md](backends/dropbox.md)
 - [backends/onedrive.md](backends/onedrive.md)
@@ -433,7 +433,7 @@ Flags:
 | `--json` | off | Emit a single JSON document instead of the Rich render (see [JSON output](#json-output---json)). |
 | `--presence` / `--no-presence` | `--no-presence` | Append a `Recent collaborator activity (last 24h)` table sourced from the shared `_sync_log.json` on the backend. Aggregates by `(user, machine)`; the calling machine's own entries are filtered. Composes with `--watch` (refreshes every tick) and with `--json` (additive `presence` key in the v1.1 envelope; see [`status --json`](#status---json)). |
 
-See [README — Check sync status](../README.md#check-sync-status). For "who else is editing this project right now?" see [admin.md — Who else is editing this project?](admin.md#who-else-is-editing-this-project).
+See [README — Daily usage cheatsheet](../README.md#daily-usage-cheatsheet) for the everyday-flow context around `status`. For "who else is editing this project right now?" see [admin.md — Who else is editing this project?](admin.md#who-else-is-editing-this-project).
 
 ### `push`
 
@@ -592,7 +592,7 @@ Populate a newly-added mirror with files that already exist on the primary. Walk
 
 `--backend` is optional: when omitted, seed-mirror auto-detects the candidate when exactly one configured mirror has unseeded files. If zero mirrors are unseeded it exits cleanly with "Nothing to seed"; if more than one is unseeded it prints the candidate names and asks you to specify `--backend NAME` explicitly.
 
-See [README — Multi-backend mirroring (Tier 2)](../README.md#multi-backend-mirroring-tier-2) for the full Tier 2 walkthrough.
+See [admin.md — Multi-backend mirroring (Tier 2)](admin.md#multi-backend-mirroring-tier-2) for the full Tier 2 walkthrough, and [scenarios.md — Multi-backend redundancy (Tier 2)](scenarios.md#d-multi-backend-redundancy-tier-2) for a worked deployment example.
 
 ---
 
@@ -707,8 +707,6 @@ Sample one-liner for cron — fire a notification on any non-zero exit so monito
 
 Print the config file path that matches the current working directory (or `PATH` if given). Searches all `~/.config/claude_mirror/*.yaml` files for one whose `project_path` matches, falling back to `default.yaml` if none match. The Claude Code skill uses this internally to detect the active project.
 
-See [README — find-config](../README.md#find-config).
-
 ### `profile` (since v0.5.49)
 
 Manage the credentials-profile registry under `~/.config/claude_mirror/profiles/`. A profile bundles credential-bearing fields (`credentials_file`, `token_file`, `dropbox_app_key`, `onedrive_client_id`, WebDAV creds, SFTP host info) for one logical account so multiple project YAMLs can share them via `profile: NAME` references or the global `--profile NAME` flag.
@@ -819,6 +817,6 @@ Slack-specific fields (`slack_enabled`, `slack_webhook_url`, `slack_channel`, an
 - [admin.md](admin.md) — snapshots, retention, watcher daemon, notifications, credentials profiles.
 - [profiles.md](profiles.md) — credentials profiles in depth: sample profile YAMLs per backend, precedence rule, common multi-project workflows.
 - [conflict-resolution.md](conflict-resolution.md) — what `sync` does when both sides changed.
-- [README — Daily usage](../README.md#part-4--daily-usage) — narrative walkthrough of the daily commands.
+- [README — Daily usage cheatsheet](../README.md#daily-usage-cheatsheet) — narrative walkthrough of the daily commands.
 - [README — Slack notifications](../README.md#slack-notifications) — Slack-specific config and webhook setup.
 - [admin.md — Notifications](admin.md#notifications) — Discord, Teams, and Generic webhook setup.

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "claude-mirror"
 version = "0.5.62"
-description = "Mirror & sync Claude Code project markdown across machines + cloud backends (Google Drive, Dropbox, OneDrive, WebDAV, SFTP) with snapshots and Tier 2 multi-backend"
+description = "Mirror & sync Claude Code project markdown across machines + cloud backends (Google Drive, Dropbox, OneDrive, WebDAV, SFTP, FTP/FTPS) with snapshots and Tier 2 multi-backend"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "GPL-3.0-or-later" }
@@ -15,7 +15,7 @@ authors = [
 keywords = [
     "sync", "mirror", "backup", "snapshot", "claude", "claude-code",
     "markdown", "google-drive", "dropbox", "onedrive", "webdav", "sftp",
-    "ssh", "multi-backend",
+    "ssh", "ftp", "ftps", "multi-backend",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -51,6 +51,9 @@ dependencies = [
     "dropbox>=12.0",   # Dropbox backend (always installed — see [project.optional-dependencies] for back-compat aliases)
     "msal>=1.24",      # OneDrive backend (always installed — see [project.optional-dependencies] for back-compat aliases)
     "fusepy>=3.0",     # FUSE mount (always installed — see [project.optional-dependencies] for back-compat aliases). Pure Python; the kernel layer (macFUSE / WinFsp / libfuse) is installed separately per platform and only required at mount time, not install time.
+    # FTP / FTPS backend uses Python's stdlib `ftplib` — no third-party
+    # dependency added. Kept as an explicit note here so future
+    # dependency-audit tooling doesn't think the backend was forgotten.
 ]
 
 # Project URLs — rendered in the right-hand sidebar of the PyPI page

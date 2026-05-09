@@ -446,6 +446,7 @@ _AVAILABLE_BACKENDS: tuple[str, ...] = (
     "onedrive",
     "webdav",
     "sftp",
+    "ftp",
 )
 
 
@@ -468,6 +469,9 @@ def _create_storage(config: Config) -> StorageBackend:
     if backend == "sftp":
         from .backends.sftp import SFTPBackend
         return SFTPBackend(config)
+    if backend == "ftp":
+        from .backends.ftp import FtpBackend
+        return FtpBackend(config)
     raise ValueError(f"Unknown storage backend: {backend}")  # pragma: no cover
 
 
@@ -1277,7 +1281,7 @@ def _run_wizard(
     console.print("\n[bold cyan]claude-mirror setup wizard[/]\n")
     console.print("Press Enter to accept the [dim]default[/] shown in brackets.\n")
 
-    _SUPPORTED_BACKENDS = ("googledrive", "dropbox", "onedrive", "webdav", "sftp")
+    _SUPPORTED_BACKENDS = ("googledrive", "dropbox", "onedrive", "webdav", "sftp", "ftp")
 
     # Backend
     console.print(
@@ -1320,7 +1324,14 @@ def _run_wizard(
     sftp_known_hosts_file = "~/.ssh/known_hosts"
     sftp_strict_host_check = True
     sftp_folder = ""
-    poll_interval = 30  # default; only meaningful for onedrive/webdav/sftp
+    ftp_host = ""
+    ftp_port = 21
+    ftp_username = ""
+    ftp_password = ""
+    ftp_folder = ""
+    ftp_tls = "explicit"
+    ftp_passive = True
+    poll_interval = 30  # default; only meaningful for onedrive/webdav/sftp/ftp
 
     # ── Profile pre-fill banner ───────────────────────────────────────
     # When the wizard runs under `--profile NAME`, announce which fields
@@ -1654,9 +1665,127 @@ def _run_wizard(
                 continue
             sftp_folder = raw_folder.rstrip("/") or "/"
             break
+    elif backend == "ftp":
+        # Host
+        if profile_data.get("ftp_host"):
+            ftp_host = profile_data["ftp_host"]
+            console.print(
+                f"[dim]FTP host supplied by profile:[/] {ftp_host}\n"
+            )
+        else:
+            console.print(
+                "\n[dim]FTP host: hostname or IP of the FTP/FTPS server.[/]"
+                "\n[dim]  Examples: ftp.example.com  |  10.0.0.42  |  "
+                "yourname.cpanel-host.com[/]\n"
+            )
+            while True:
+                ftp_host = click.prompt("FTP host").strip()
+                if ftp_host:
+                    break
+                console.print("[red]Host cannot be empty.[/]")
+
+        # TLS mode FIRST so the port default tracks the chosen mode.
+        if profile_data.get("ftp_tls"):
+            ftp_tls = profile_data["ftp_tls"]
+            console.print(
+                f"[dim]FTP TLS mode supplied by profile:[/] {ftp_tls}\n"
+            )
+        else:
+            console.print(
+                "\n[dim]TLS mode:[/]"
+                "\n[dim]  explicit = FTPS via AUTH TLS on port 21 "
+                "(recommended; works with most modern hosts)[/]"
+                "\n[dim]  implicit = legacy FTPS on port 990 (entire "
+                "channel TLS-wrapped from byte 0)[/]"
+                "\n[dim]  off      = cleartext FTP — credentials travel "
+                "UNENCRYPTED. LAN-only.[/]\n"
+            )
+            ftp_tls = click.prompt(
+                "TLS mode",
+                default="explicit",
+                type=click.Choice(
+                    ["off", "explicit", "implicit"], case_sensitive=False,
+                ),
+            ).lower()
+
+        if ftp_tls == "off":
+            console.print(
+                "\n[red]⚠ Cleartext FTP selected.[/] Username + password "
+                "will travel UNENCRYPTED on every connection. Acceptable "
+                "ONLY for trusted local-network use (e.g. a NAS on a LAN). "
+                "For internet-facing servers, switch to TLS mode "
+                "[bold]explicit[/] or use the SFTP backend.\n"
+            )
+
+        # Port (with mode-aware default).
+        if profile_data.get("ftp_port"):
+            ftp_port = int(profile_data["ftp_port"])
+            console.print(
+                f"[dim]FTP port supplied by profile:[/] {ftp_port}\n"
+            )
+        else:
+            default_port = 990 if ftp_tls == "implicit" else 21
+            console.print(
+                "\n[dim]FTP port: TCP port for the control channel "
+                f"(default {default_port} for {ftp_tls} TLS mode).[/]\n"
+            )
+            while True:
+                ftp_port = click.prompt(
+                    "FTP port", default=default_port, type=int,
+                )
+                if 1 <= ftp_port <= 65535:
+                    break
+                console.print("[red]Port must be in range 1..65535.[/]")
+
+        # Username
+        if profile_data.get("ftp_username"):
+            ftp_username = profile_data["ftp_username"]
+            console.print(
+                f"[dim]FTP username supplied by profile:[/] {ftp_username}\n"
+            )
+        else:
+            console.print(
+                "\n[dim]Username for FTP login (often the cPanel account "
+                "name on shared hosting).[/]\n"
+            )
+            while True:
+                ftp_username = click.prompt("FTP username").strip()
+                if ftp_username:
+                    break
+                console.print("[red]Username cannot be empty.[/]")
+
+        # Password
+        if profile_data.get("ftp_password"):
+            ftp_password = profile_data["ftp_password"]
+            console.print("[dim]FTP password supplied by profile.[/]\n")
+        else:
+            console.print(
+                "\n[dim]FTP password. Stored chmod-0600 in YAML alongside "
+                "the host.[/]\n"
+            )
+            ftp_password = click.prompt(
+                "FTP password", hide_input=True, default="", show_default=False,
+            )
+
+        # Remote folder
+        console.print(
+            "\n[dim]FTP folder: path on the server where project files "
+            "live. cPanel example: /public_html/claude-mirror/myproject. "
+            "Generic example: claude-mirror/myproject (relative to login "
+            "home directory).[/]\n"
+        )
+        ftp_folder = click.prompt(
+            "FTP folder", default=f"claude-mirror/{project_name}",
+        ).strip()
+
+        # Passive mode
+        ftp_passive = click.confirm(
+            "Use passive mode? (recommended; works through more firewalls)",
+            default=True,
+        )
 
     # Polling interval for backends without push notifications.
-    if backend in ("onedrive", "webdav", "sftp"):
+    if backend in ("onedrive", "webdav", "sftp", "ftp"):
         console.print(
             "\n[dim]Poll interval (seconds): how often the watcher checks for "
             "remote changes. Lower = more responsive, higher = less network use.[/]\n"
@@ -1682,6 +1811,8 @@ def _run_wizard(
             derived_token = str(CONFIG_DIR / f"webdav-{project_name}-token.json")
         elif backend == "sftp":
             derived_token = str(CONFIG_DIR / f"sftp-{project_name}-token.json")
+        elif backend == "ftp":
+            derived_token = str(CONFIG_DIR / f"ftp-{project_name}-token.json")
         else:
             derived_token = str(CONFIG_DIR / f"{backend}-{project_name}-token.json")
         raw_token = click.prompt("Token file", default=derived_token)
@@ -1748,7 +1879,15 @@ def _run_wizard(
         console.print(f"  known_hosts:   {sftp_known_hosts_file}")
         console.print(f"  Strict host:   {sftp_strict_host_check}")
         console.print(f"  SFTP folder:   {sftp_folder}")
-    if backend in ("onedrive", "webdav", "sftp"):
+    elif backend == "ftp":
+        console.print(f"  FTP host:      {ftp_host}:{ftp_port}")
+        console.print(f"  TLS mode:      {ftp_tls}")
+        console.print(f"  Username:      {ftp_username}")
+        if ftp_password:
+            console.print(f"  Password:      {'*' * len(ftp_password)}")
+        console.print(f"  FTP folder:    {ftp_folder}")
+        console.print(f"  Passive mode:  {ftp_passive}")
+    if backend in ("onedrive", "webdav", "sftp", "ftp"):
         console.print(f"  Poll interval: {poll_interval}s")
     console.print(f"  Patterns:      {', '.join(patterns)}")
 
@@ -1849,6 +1988,13 @@ def _run_wizard(
         sftp_known_hosts_file=sftp_known_hosts_file,
         sftp_strict_host_check=sftp_strict_host_check,
         sftp_folder=sftp_folder,
+        ftp_host=ftp_host,
+        ftp_port=ftp_port,
+        ftp_username=ftp_username,
+        ftp_password=ftp_password,
+        ftp_folder=ftp_folder,
+        ftp_tls=ftp_tls,
+        ftp_passive=ftp_passive,
         poll_interval=poll_interval,
         slack_enabled=slack_enabled,
         slack_webhook_url=slack_webhook_url,
@@ -1894,8 +2040,21 @@ def _run_wizard(
               help="Reject unknown SFTP host fingerprints. Disable only for one-shot LAN setups.")
 @click.option("--sftp-folder", default="",
               help="Absolute server-side folder path for SFTP storage (must start with '/').")
+@click.option("--ftp-host", default="", help="FTP/FTPS server hostname or IP.")
+@click.option("--ftp-port", default=21, show_default=True, type=int,
+              help="FTP/FTPS control port (1..65535). Default 21; use 990 for implicit FTPS.")
+@click.option("--ftp-username", default="", help="FTP username.")
+@click.option("--ftp-password", default="",
+              help="FTP password (stored chmod-0600 in YAML; cleartext mode warns at every connect).")
+@click.option("--ftp-folder", default="",
+              help="Server-side folder path for FTP storage (e.g. /public_html/claude-mirror or claude-mirror/myproject).")
+@click.option("--ftp-tls", default="explicit", show_default=True,
+              type=click.Choice(["off", "explicit", "implicit"], case_sensitive=False),
+              help="TLS mode: explicit=AUTH TLS on port 21; implicit=legacy FTPS on port 990; off=cleartext (LAN-only).")
+@click.option("--ftp-passive/--no-ftp-passive", "ftp_passive", default=True, show_default=True,
+              help="Use passive mode for FTP data transfers (recommended; works through more firewalls).")
 @click.option("--poll-interval", "poll_interval", default=30, show_default=True, type=int,
-              help="Polling interval in seconds for backends without push notifications (OneDrive, WebDAV, SFTP).")
+              help="Polling interval in seconds for backends without push notifications (OneDrive, WebDAV, SFTP, FTP).")
 @click.option("--slack-webhook-url", default="", help="Slack incoming webhook URL for sync notifications.")
 @click.option("--slack-channel", default="", help="Slack channel override (default: webhook's channel).")
 @click.option("--slack/--no-slack", "slack_flag", default=False, help="Enable/disable Slack notifications.")
@@ -1944,6 +2103,13 @@ def init(
     sftp_known_hosts_file: str,
     sftp_strict_host_check: bool,
     sftp_folder: str,
+    ftp_host: str,
+    ftp_port: int,
+    ftp_username: str,
+    ftp_password: str,
+    ftp_folder: str,
+    ftp_tls: str,
+    ftp_passive: bool,
     poll_interval: int,
     slack_webhook_url: str,
     slack_channel: str,
@@ -1990,6 +2156,13 @@ def init(
         sftp_known_hosts_file=sftp_known_hosts_file,
         sftp_strict_host_check=sftp_strict_host_check,
         sftp_folder=sftp_folder,
+        ftp_host=ftp_host,
+        ftp_port=ftp_port,
+        ftp_username=ftp_username,
+        ftp_password=ftp_password,
+        ftp_folder=ftp_folder,
+        ftp_tls=ftp_tls,
+        ftp_passive=ftp_passive,
         poll_interval=poll_interval,
         slack_webhook_url=slack_webhook_url,
         slack_channel=slack_channel,
@@ -2028,6 +2201,13 @@ def _run_init(
     sftp_known_hosts_file: str,
     sftp_strict_host_check: bool,
     sftp_folder: str,
+    ftp_host: str,
+    ftp_port: int,
+    ftp_username: str,
+    ftp_password: str,
+    ftp_folder: str,
+    ftp_tls: str,
+    ftp_passive: bool,
     poll_interval: int,
     slack_webhook_url: str,
     slack_channel: str,
@@ -2101,6 +2281,13 @@ def _run_init(
         sftp_known_hosts_file = values["sftp_known_hosts_file"]
         sftp_strict_host_check = values["sftp_strict_host_check"]
         sftp_folder      = values["sftp_folder"]
+        ftp_host         = values["ftp_host"]
+        ftp_port         = values["ftp_port"]
+        ftp_username     = values["ftp_username"]
+        ftp_password     = values["ftp_password"]
+        ftp_folder       = values["ftp_folder"]
+        ftp_tls          = values["ftp_tls"]
+        ftp_passive      = values["ftp_passive"]
         poll_interval    = values["poll_interval"]
         slack_enabled    = values["slack_enabled"]
         slack_webhook_url = values["slack_webhook_url"]
@@ -2179,6 +2366,19 @@ def _run_init(
                 and not profile_data.get("sftp_password")
             ):
                 missing.append("--sftp-key-file or --sftp-password")
+        elif backend == "ftp":
+            missing = [
+                name for name, val in [
+                    ("--project", project),
+                    ("--ftp-host",
+                     ftp_host or profile_data.get("ftp_host", "")),
+                    ("--ftp-username",
+                     ftp_username or profile_data.get("ftp_username", "")),
+                    ("--ftp-password",
+                     ftp_password or profile_data.get("ftp_password", "")),
+                    ("--ftp-folder", ftp_folder),
+                ] if not val
+            ]
         else:
             console.print(f"[red]Unknown backend: {backend}[/]")
             sys.exit(1)
@@ -2239,6 +2439,29 @@ def _run_init(
                     "key-based auth for any internet-reachable server."
                 )
 
+        if backend == "ftp":
+            ftp_tls = (ftp_tls or "explicit").lower()
+            if ftp_tls not in ("off", "explicit", "implicit"):
+                console.print(
+                    f"[red]✗ --ftp-tls must be one of off, explicit, "
+                    f"implicit (got {ftp_tls!r}).[/]"
+                )
+                sys.exit(1)
+            if not (1 <= ftp_port <= 65535):
+                console.print(
+                    f"[red]✗ --ftp-port must be in range 1..65535 "
+                    f"(got {ftp_port}).[/]"
+                )
+                sys.exit(1)
+            if ftp_tls == "off":
+                console.print(
+                    "[yellow]⚠ Cleartext FTP enabled.[/] Username + "
+                    "password travel UNENCRYPTED on every connection. "
+                    "Recommended only for trusted local-network use; "
+                    "switch to --ftp-tls explicit (FTPS) or use the "
+                    "SFTP backend for any internet-reachable server."
+                )
+
         project_path = str(Path(project).expanduser().resolve())
         if not Path(project_path).exists():
             if create_project_if_missing:
@@ -2266,6 +2489,9 @@ def _run_init(
             elif backend == "sftp":
                 project_name = Path(project_path).name
                 token_file = str(CONFIG_DIR / f"sftp-{project_name}-token.json")
+            elif backend == "ftp":
+                project_name = Path(project_path).name
+                token_file = str(CONFIG_DIR / f"ftp-{project_name}-token.json")
             else:
                 project_name = Path(project_path).name
                 token_file = str(CONFIG_DIR / f"{backend}-{project_name}-token.json")
@@ -2315,6 +2541,12 @@ def _run_init(
             sftp_key_file = ""
         if profile_data.get("sftp_password"):
             sftp_password = ""
+        if profile_data.get("ftp_host"):
+            ftp_host = ""
+        if profile_data.get("ftp_username"):
+            ftp_username = ""
+        if profile_data.get("ftp_password"):
+            ftp_password = ""
 
     config = Config(
         project_path=project_path,
@@ -2337,6 +2569,13 @@ def _run_init(
         sftp_known_hosts_file=sftp_known_hosts_file,
         sftp_strict_host_check=sftp_strict_host_check,
         sftp_folder=sftp_folder,
+        ftp_host=ftp_host,
+        ftp_port=ftp_port,
+        ftp_username=ftp_username,
+        ftp_password=ftp_password,
+        ftp_folder=ftp_folder,
+        ftp_tls=ftp_tls,
+        ftp_passive=ftp_passive,
         poll_interval=poll_interval,
         slack_enabled=slack_enabled,
         slack_webhook_url=slack_webhook_url,
@@ -2377,6 +2616,8 @@ def _run_init(
                 "sftp_host", "sftp_port", "sftp_username",
                 "sftp_key_file", "sftp_password",
                 "sftp_known_hosts_file", "sftp_strict_host_check",
+                "ftp_host", "ftp_port", "ftp_username",
+                "ftp_password", "ftp_tls", "ftp_passive",
             ) if profile_data.get(k) not in (None, "")
         )
         config.save(config_path, profile=profile_name, strip_fields=strip)
@@ -2400,6 +2641,11 @@ def _run_init(
         console.print(f"[green]SFTP host:[/]           {sftp_host}:{sftp_port}")
         console.print(f"[green]SFTP folder:[/]         {sftp_folder}")
         console.print("\nRun [bold]claude-mirror auth[/] to verify the SFTP connection.")
+    elif backend == "ftp":
+        console.print(f"[green]FTP host:[/]            {ftp_host}:{ftp_port}")
+        console.print(f"[green]FTP TLS mode:[/]        {ftp_tls}")
+        console.print(f"[green]FTP folder:[/]          {ftp_folder}")
+        console.print("\nRun [bold]claude-mirror auth[/] to verify the FTP connection.")
 
     # ── Flag-driven (non-wizard) auto-pubsub-setup path (v0.5.47) ──
     # The wizard branch already ran the smoke test + auto-setup above
@@ -2703,6 +2949,18 @@ def _auth_check(config: Config) -> None:
               help="Reject unknown SFTP host fingerprints.")
 @click.option("--sftp-folder", default="",
               help="Absolute server-side folder path for SFTP storage (must start with '/').")
+@click.option("--ftp-host", default="", help="FTP/FTPS server hostname or IP.")
+@click.option("--ftp-port", default=21, show_default=True, type=int,
+              help="FTP/FTPS control port (1..65535). Default 21; use 990 for implicit FTPS.")
+@click.option("--ftp-username", default="", help="FTP username.")
+@click.option("--ftp-password", default="", help="FTP password (stored chmod-0600 in YAML).")
+@click.option("--ftp-folder", default="",
+              help="Server-side folder path for FTP storage.")
+@click.option("--ftp-tls", default="explicit", show_default=True,
+              type=click.Choice(["off", "explicit", "implicit"], case_sensitive=False),
+              help="TLS mode: explicit (default), implicit (FTPS-on-990), or off (cleartext, LAN-only).")
+@click.option("--ftp-passive/--no-ftp-passive", "ftp_passive", default=True, show_default=True,
+              help="Use passive mode for FTP data transfers.")
 @click.option("--credentials-file", "credentials_file", default=_DEFAULT_CREDENTIALS, show_default=True,
               help="Path to Google OAuth2 credentials JSON for this project (Drive only).")
 @click.option("--token-file", "token_file", default="",
@@ -2741,6 +2999,13 @@ def clone(
     sftp_known_hosts_file: str,
     sftp_strict_host_check: bool,
     sftp_folder: str,
+    ftp_host: str,
+    ftp_port: int,
+    ftp_username: str,
+    ftp_password: str,
+    ftp_folder: str,
+    ftp_tls: str,
+    ftp_passive: bool,
     credentials_file: str,
     token_file: str,
     config_path: str,
@@ -2822,6 +3087,13 @@ def clone(
                 sftp_known_hosts_file=sftp_known_hosts_file,
                 sftp_strict_host_check=sftp_strict_host_check,
                 sftp_folder=sftp_folder,
+                ftp_host=ftp_host,
+                ftp_port=ftp_port,
+                ftp_username=ftp_username,
+                ftp_password=ftp_password,
+                ftp_folder=ftp_folder,
+                ftp_tls=ftp_tls,
+                ftp_passive=ftp_passive,
                 poll_interval=poll_interval,
                 slack_webhook_url="",
                 slack_channel="",
@@ -10644,6 +10916,406 @@ def _run_sftp_deep_checks(path: str, config: "Config") -> list[str]:
     return failures
 
 
+def _ftp_deep_check_factory(
+    config: "Config",
+) -> dict[str, Any]:
+    """Open a probe FTP/FTPS connection for the doctor's deep checks.
+
+    Returns a dict with keys:
+      ftp             — open ftplib.FTP / FTP_TLS, or None on failure.
+      tls_info        — (cipher, protocol_version) tuple when TLS handshake
+                        ran, or None when ftp_tls=off.
+      banner          — server's 220-line greeting (string), or "".
+      transport_error — exception or None.
+
+    Tests monkeypatch this seam so the deep-check chain runs against
+    deterministic stubs without touching a real server.
+    """
+    import ftplib as _ftplib
+    import socket as _socket
+    import ssl as _ssl
+
+    host = (getattr(config, "ftp_host", "") or "").strip()
+    port = int(getattr(config, "ftp_port", 21) or 21)
+    tls_mode = (getattr(config, "ftp_tls", "explicit") or "explicit").lower()
+    username = getattr(config, "ftp_username", "") or ""
+    password = getattr(config, "ftp_password", "") or ""
+    passive = bool(getattr(config, "ftp_passive", True))
+
+    ftp_obj: Optional[_ftplib.FTP] = None
+    tls_info: Optional[tuple[str, str]] = None
+    banner = ""
+    transport_error: Optional[BaseException] = None
+
+    try:
+        if tls_mode == "off":
+            ftp_obj = _ftplib.FTP()
+            banner = ftp_obj.connect(host=host, port=port, timeout=5)
+            ftp_obj.login(user=username, passwd=password)
+        elif tls_mode == "explicit":
+            tls_obj: _ftplib.FTP_TLS = _ftplib.FTP_TLS()
+            banner = tls_obj.connect(host=host, port=port, timeout=5)
+            tls_obj.auth()
+            sock = tls_obj.sock
+            cipher = ""
+            version = ""
+            if sock is not None and hasattr(sock, "cipher"):
+                cipher_tuple = sock.cipher()
+                if cipher_tuple:
+                    cipher = cipher_tuple[0] or ""
+                    version = cipher_tuple[1] or ""
+            tls_info = (cipher, version)
+            tls_obj.login(user=username, passwd=password)
+            tls_obj.prot_p()
+            ftp_obj = tls_obj
+        elif tls_mode == "implicit":
+            ctx = _ssl.create_default_context()
+            sock = _socket.create_connection((host, port), timeout=5)
+            wrapped = ctx.wrap_socket(sock, server_hostname=host)
+            cipher_tuple = wrapped.cipher()
+            tls_info = (
+                cipher_tuple[0] if cipher_tuple else "",
+                cipher_tuple[1] if cipher_tuple else "",
+            )
+            tls_obj = _ftplib.FTP_TLS()
+            tls_obj.sock = wrapped
+            try:
+                tls_obj.file = wrapped.makefile("r", encoding="latin-1")
+            except TypeError:
+                tls_obj.file = wrapped.makefile("r")
+            banner = tls_obj.getresp()
+            tls_obj.welcome = banner
+            tls_obj.login(user=username, passwd=password)
+            tls_obj.prot_p()
+            ftp_obj = tls_obj
+        else:
+            transport_error = ValueError(
+                f"unsupported ftp_tls mode {tls_mode!r}"
+            )
+    except BaseException as e:  # noqa: BLE001
+        transport_error = e
+        if ftp_obj is not None:
+            try:
+                ftp_obj.close()
+            except Exception:
+                pass
+            ftp_obj = None
+
+    if ftp_obj is not None:
+        try:
+            ftp_obj.set_pasv(passive)
+        except Exception:
+            pass
+
+    return {
+        "ftp": ftp_obj,
+        "tls_info": tls_info,
+        "banner": banner or "",
+        "transport_error": transport_error,
+    }
+
+
+def _run_ftp_deep_checks(path: str, config: "Config") -> list[str]:
+    """FTP-specific deep diagnostic checks (BACKEND-FTP).
+
+    Mirrors `_run_sftp_deep_checks`. Six checks:
+
+      1. TCP connect to ftp_host:ftp_port reachable.
+      2. Server greeting + protocol banner.
+      3. TLS handshake (when ftp_tls != "off") — surfaces cipher /
+         protocol version.
+      4. Authentication.
+      5. Folder access (cwd to ftp_folder).
+      6. Folder write (STOR + DELE a 1-byte sentinel).
+
+    Plus an advisory line when ftp_tls=off and the host is not loopback
+    or RFC1918 — cleartext FTP against a public IP is risky.
+    """
+    import ftplib as _ftplib
+    import socket as _socket
+
+    failures: list[str] = []
+
+    ftp_host = (getattr(config, "ftp_host", "") or "").strip()
+    ftp_port = int(getattr(config, "ftp_port", 21) or 21)
+    ftp_folder = (getattr(config, "ftp_folder", "") or "").strip()
+    ftp_tls = (getattr(config, "ftp_tls", "explicit") or "explicit").lower()
+    ftp_username = (getattr(config, "ftp_username", "") or "").strip()
+
+    auth_bucket_reported = False
+
+    def _emit_auth_bucket(headline: str, fix_hint: str, summary: str) -> None:
+        nonlocal auth_bucket_reported
+        if auth_bucket_reported:
+            return
+        auth_bucket_reported = True
+        console.print(
+            f"  [red]✗[/] {headline}\n"
+            f"      [yellow]Fix:[/] {fix_hint}"
+        )
+        failures.append(summary)
+
+    # ───── Check 1: TCP reachable ─────
+    try:
+        sock = _socket.create_connection((ftp_host, ftp_port), timeout=5)
+        sock.close()
+        console.print(
+            f"  [green]✓[/] Host reachable: "
+            f"[dim]{ftp_host}:{ftp_port}[/]"
+        )
+    except (_socket.timeout, TimeoutError) as e:
+        console.print(
+            f"  [red]✗[/] Connection to "
+            f"[bold]{ftp_host}:{ftp_port}[/] timed out\n"
+            f"      [yellow]Fix:[/] check that the server is reachable "
+            f"([bold]ping {ftp_host}[/]) and that port "
+            f"[bold]{ftp_port}[/] is open from this machine."
+        )
+        failures.append(
+            f"FTP connection timeout: {ftp_host}:{ftp_port}"
+        )
+        return failures
+    except (ConnectionRefusedError, OSError) as e:
+        console.print(
+            f"  [red]✗[/] Server unreachable: "
+            f"[bold]{ftp_host}:{ftp_port}[/] "
+            f"([dim]{type(e).__name__}: {str(e)[:120]}[/])\n"
+            f"      [yellow]Fix:[/] verify the server is up and port "
+            f"[bold]{ftp_port}[/] is open."
+        )
+        failures.append(
+            f"FTP server unreachable: {ftp_host}:{ftp_port}"
+        )
+        return failures
+
+    # ───── Cleartext-mode advisory ─────
+    if ftp_tls == "off":
+        if not _is_loopback_or_rfc1918_for_doctor(ftp_host):
+            console.print(
+                f"  [yellow]⚠[/] Cleartext FTP enabled against "
+                f"[bold]{ftp_host}[/] (not loopback / RFC1918). "
+                f"Username + password travel UNENCRYPTED on every "
+                f"connection. Recommended only for trusted "
+                f"local-network use; switch to "
+                f"[bold]ftp_tls: explicit[/] or use the SFTP backend "
+                f"for any internet-reachable server."
+            )
+        else:
+            console.print(
+                f"  [yellow]⚠[/] Cleartext FTP enabled "
+                f"(host appears local — loopback or RFC1918 range)."
+            )
+
+    factory_result = _ftp_deep_check_factory(config)
+    ftp_obj = factory_result.get("ftp")
+    tls_info = factory_result.get("tls_info")
+    banner = factory_result.get("banner") or ""
+    transport_error = factory_result.get("transport_error")
+
+    try:
+        # ───── Check 2: greeting / banner ─────
+        if banner:
+            banner_str = str(banner).splitlines()[0][:120]
+            console.print(
+                f"  [green]✓[/] Server banner: [dim]{banner_str}[/]"
+            )
+        elif transport_error is None:
+            console.print(
+                "  [yellow]⚠[/] Server greeting captured no banner — "
+                "non-RFC compliant server, continuing."
+            )
+
+        # ───── Check 3: TLS handshake ─────
+        if ftp_tls != "off":
+            if tls_info is not None:
+                cipher, version = tls_info
+                if cipher or version:
+                    console.print(
+                        f"  [green]✓[/] TLS handshake: "
+                        f"[dim]{version or '?'} / {cipher or '?'}[/]"
+                    )
+                else:
+                    console.print(
+                        "  [yellow]⚠[/] TLS negotiated but cipher / "
+                        "version not surfaced by the socket."
+                    )
+            elif transport_error is None:
+                console.print(
+                    "  [yellow]⚠[/] TLS info unavailable; transport "
+                    "may have negotiated without exposing cipher."
+                )
+
+        # ───── Check 4: authentication ─────
+        if transport_error is not None:
+            exc = transport_error
+            exc_name = type(exc).__name__
+            exc_text = str(exc)
+            if isinstance(exc, _ftplib.error_perm):
+                code = exc_text[:3] if len(exc_text) >= 3 else ""
+                if code == "530":
+                    _emit_auth_bucket(
+                        headline=(
+                            f"FTP authentication rejected by "
+                            f"[bold]{ftp_host}[/] "
+                            f"([dim]{exc_text[:140]}[/])"
+                        ),
+                        fix_hint=(
+                            f"verify [bold]ftp_username[/] / "
+                            f"[bold]ftp_password[/] in [bold]{path}[/]."
+                        ),
+                        summary=f"FTP auth rejected: {ftp_host}",
+                    )
+                    return failures
+            if "ssl" in exc_name.lower() or "tls" in exc_text.lower():
+                _emit_auth_bucket(
+                    headline=(
+                        f"TLS handshake failed against "
+                        f"[bold]{ftp_host}:{ftp_port}[/] "
+                        f"([dim]{exc_name}: {exc_text[:140]}[/])"
+                    ),
+                    fix_hint=(
+                        f"verify the server presents a valid certificate, "
+                        f"or switch [bold]ftp_tls[/] to a mode the "
+                        f"server supports."
+                    ),
+                    summary=f"FTP TLS handshake failed: {ftp_host}",
+                )
+                return failures
+            console.print(
+                f"  [red]✗[/] FTP transport error during auth "
+                f"([dim]{exc_name}: {exc_text[:140]}[/])\n"
+                f"      [yellow]Fix:[/] retry; if the failure persists, "
+                f"check the server's FTP service and the network path."
+            )
+            failures.append(
+                f"FTP transport error: {exc_name}"
+            )
+            return failures
+
+        if ftp_obj is None:
+            console.print(
+                "  [red]✗[/] FTP client could not be opened; see error above."
+            )
+            failures.append("FTP client open failed")
+            return failures
+
+        console.print("  [green]✓[/] Authentication succeeded")
+
+        # ───── Check 5: folder access ─────
+        if ftp_folder:
+            try:
+                ftp_obj.cwd(ftp_folder)
+                console.print(
+                    f"  [green]✓[/] Folder accessible: [dim]{ftp_folder}[/]"
+                )
+            except _ftplib.error_perm as exc:
+                msg = str(exc)
+                code = msg[:3] if len(msg) >= 3 else ""
+                if code == "550":
+                    if "permission" in msg.lower() or "denied" in msg.lower():
+                        _emit_auth_bucket(
+                            headline=(
+                                f"Permission denied entering "
+                                f"[bold]{ftp_folder}[/]"
+                            ),
+                            fix_hint=(
+                                f"user [bold]{ftp_username}[/] lacks "
+                                f"access to [bold]{ftp_folder}[/]. "
+                                f"Adjust server-side ACLs or change "
+                                f"[bold]ftp_folder[/] in [bold]{path}[/]."
+                            ),
+                            summary=(
+                                f"FTP folder permission denied: "
+                                f"{ftp_folder}"
+                            ),
+                        )
+                        return failures
+                    console.print(
+                        f"  [yellow]⚠[/] Configured folder doesn't "
+                        f"exist on the server: [bold]{ftp_folder}[/]\n"
+                        f"      [dim]Hint: create it on the server "
+                        f"(via cPanel file manager / shell), or "
+                        f"`claude-mirror auth` will mkdir it on first "
+                        f"connect.[/]"
+                    )
+                    failures.append(
+                        f"FTP folder not found: {ftp_folder}"
+                    )
+                    return failures
+                console.print(
+                    f"  [red]✗[/] Could not enter folder "
+                    f"[bold]{ftp_folder}[/] "
+                    f"([dim]{msg[:140]}[/])"
+                )
+                failures.append(f"FTP folder access failed: {ftp_folder}")
+                return failures
+
+        # ───── Check 6: folder write (STOR + DELE) ─────
+        sentinel_name = "__claude_mirror_doctor_test"
+        try:
+            ftp_obj.storbinary(
+                f"STOR {sentinel_name}",
+                io.BytesIO(b"x"),
+            )
+        except _ftplib.error_perm as exc:
+            msg = str(exc).lower()
+            if "permission" in msg or "denied" in msg or "550" in msg:
+                _emit_auth_bucket(
+                    headline=(
+                        f"Permission denied writing to "
+                        f"[bold]{ftp_folder}[/]"
+                    ),
+                    fix_hint=(
+                        f"user [bold]{ftp_username}[/] cannot create "
+                        f"files in [bold]{ftp_folder}[/]. Adjust "
+                        f"server-side ACLs."
+                    ),
+                    summary=f"FTP folder write denied: {ftp_folder}",
+                )
+                return failures
+            if "552" in msg or "quota" in msg:
+                console.print(
+                    f"  [red]✗[/] FTP server reported quota / storage "
+                    f"limit ([dim]{exc!s}[/])\n"
+                    f"      [yellow]Fix:[/] free disk space on the "
+                    f"server account."
+                )
+                failures.append(f"FTP quota exceeded: {ftp_folder}")
+                return failures
+            console.print(
+                f"  [red]✗[/] Could not write sentinel file "
+                f"([dim]{exc!s}[/])"
+            )
+            failures.append(
+                f"FTP write failed: {type(exc).__name__}"
+            )
+            return failures
+
+        try:
+            ftp_obj.delete(sentinel_name)
+        except _ftplib.error_perm:
+            pass
+
+        console.print(
+            "  [green]✓[/] Folder writable (STOR + DELE sentinel succeeded)"
+        )
+    finally:
+        if ftp_obj is not None:
+            try:
+                ftp_obj.close()
+            except Exception:
+                pass
+
+    return failures
+
+
+def _is_loopback_or_rfc1918_for_doctor(host: str) -> bool:
+    """Doctor-side wrapper around the backend's host-classification
+    helper. Kept as a thin alias so tests can monkeypatch the doctor's
+    decision independently of the backend's runtime behaviour."""
+    from .backends.ftp import _is_loopback_or_rfc1918
+    return _is_loopback_or_rfc1918(host)
+
 
 def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
     """Run the doctor check sequence for one config + its mirrors.
@@ -10741,6 +11413,11 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
                 "  [dim]·[/] credentials file: skipped (SFTP uses inline "
                 "host/user/key in YAML)"
             )
+        elif backend_name == "ftp":
+            console.print(
+                "  [dim]·[/] credentials file: skipped (FTP uses inline "
+                "host/user/password in YAML)"
+            )
         else:
             creds_path = Path(config.credentials_file)
             if not creds_path.exists():
@@ -10812,6 +11489,37 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
                     "  [green]✓[/] SFTP credentials present in config "
                     "(host + username + folder + key/password)"
                 )
+        elif backend_name == "ftp":
+            ftp_host_v = getattr(config, "ftp_host", "") or ""
+            ftp_user_v = getattr(config, "ftp_username", "") or ""
+            ftp_pw_v = getattr(config, "ftp_password", "") or ""
+            ftp_folder_v = getattr(config, "ftp_folder", "") or ""
+            ftp_missing = []
+            if not ftp_host_v:
+                ftp_missing.append("ftp_host")
+            if not ftp_user_v:
+                ftp_missing.append("ftp_username")
+            if not ftp_pw_v:
+                ftp_missing.append("ftp_password")
+            if not ftp_folder_v:
+                ftp_missing.append("ftp_folder")
+            if ftp_missing:
+                console.print(
+                    f"  [red]✗[/] FTP config incomplete: "
+                    f"missing [bold]{', '.join(ftp_missing)}[/] in "
+                    f"[bold]{path}[/]\n"
+                    f"      [yellow]Fix:[/] run "
+                    f"[bold]claude-mirror init --wizard --config {path}[/] "
+                    f"or edit the YAML to add the missing fields."
+                )
+                failures.append(
+                    f"FTP config incomplete ({', '.join(ftp_missing)}): {path}"
+                )
+            else:
+                console.print(
+                    "  [green]✓[/] FTP credentials present in config "
+                    "(host + username + password + folder)"
+                )
         else:
             token_path = Path(config.token_file)
             if not token_path.exists():
@@ -10878,6 +11586,14 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
                     raise RuntimeError(
                         f"sftp_folder is not a directory: {sftp_folder_v}"
                     )
+            elif backend_name == "ftp":
+                # FTP: connect + cwd into the configured folder. cwd
+                # against a non-directory raises 550, which surfaces as
+                # a connectivity failure with the right fix hint.
+                ftp_client = storage.get_credentials()
+                ftp_folder_v = getattr(config, "ftp_folder", "") or "."
+                if ftp_folder_v:
+                    ftp_client.cwd(ftp_folder_v)
             else:
                 storage.get_credentials()
                 storage.list_folders(config.root_folder, name=None)
@@ -11008,6 +11724,13 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
                     f"([dim]session opened + stat({_sftp_folder_v}) "
                     f"succeeded[/])"
                 )
+            elif backend_name == "ftp":
+                _ftp_folder_v = getattr(config, "ftp_folder", "") or "."
+                console.print(
+                    f"  [green]✓[/] FTP connectivity ok "
+                    f"([dim]session opened + cwd({_ftp_folder_v}) "
+                    f"succeeded[/])"
+                )
             else:
                 console.print(
                     f"  [green]✓[/] backend connectivity ok "
@@ -11125,6 +11848,11 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
         if backend_name == "sftp":
             console.print("\n[bold]SFTP deep checks[/]")
             failures.extend(_run_sftp_deep_checks(path, config))
+
+        # ───── FTP deep checks (BACKEND-FTP) ─────
+        if backend_name == "ftp":
+            console.print("\n[bold]FTP deep checks[/]")
+            failures.extend(_run_ftp_deep_checks(path, config))
 
         # ───── Check 5: project_path exists locally ─────
         # Only check on the primary — every mirror config validated by

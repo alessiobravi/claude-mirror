@@ -74,3 +74,49 @@ class _StopAfterBackend(Exception):
     on the backend prompt without having to script answers to every
     subsequent question."""
     pass
+
+
+class _StopAfterAuth(Exception):
+    """Sentinel — raised once the wizard reaches a known
+    authentication-stage prompt for the FTP wizard branch."""
+    pass
+
+
+def test_run_wizard_ftp_walks_through_prompts(monkeypatch, tmp_path):
+    """BACKEND-FTP regression: choosing the ftp backend at the first
+    prompt must lead the wizard through ftp-specific prompts (host,
+    TLS mode, port, username, password). This test scripts answers and
+    halts at the password (auth) stage."""
+    answers: list[object] = [
+        "ftp",                # Storage backend
+        str(tmp_path),        # Project directory
+        "ftp.example.com",    # FTP host
+        "explicit",           # TLS mode
+        21,                   # FTP port
+        "alice",              # FTP username
+    ]
+    seen_prompts: list[str] = []
+
+    def fake_prompt(label, default=None, **kwargs):
+        seen_prompts.append(str(label))
+        if "password" in str(label).lower():
+            raise _StopAfterAuth()
+        if not answers:
+            raise _StopAfterAuth()
+        return answers.pop(0)
+
+    def fake_confirm(label, default=True):
+        return True
+
+    monkeypatch.setattr(cli_module.click, "prompt", fake_prompt)
+    monkeypatch.setattr(cli_module.click, "confirm", fake_confirm)
+
+    with pytest.raises(_StopAfterAuth):
+        cli_module._run_wizard(backend_default="ftp")
+
+    joined = "\n".join(seen_prompts)
+    assert "FTP host" in joined
+    assert "TLS mode" in joined
+    assert "FTP port" in joined
+    assert "FTP username" in joined
+    assert "FTP password" in joined

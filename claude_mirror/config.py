@@ -224,6 +224,23 @@ class Config:
     # ErrorClass.AUTH rather than silently trusting a possible MITM.
     sftp_strict_host_check: bool = True
     sftp_folder: str = ""  # absolute path on server, e.g. "/home/alice/claude-mirror/myproject"
+    # FTP / FTPS-specific (BACKEND-FTP). Targets the legacy shared-hosting
+    # market (cPanel / DirectAdmin / old WordPress hosts) and NAS devices
+    # that gate on plain FTP. SFTP remains the canonical secure-transfer
+    # backend for internet-reachable servers; FTPS (`ftp_tls=explicit`) is
+    # accepted as a middle-ground, and `ftp_tls=off` is gated behind a loud
+    # warning emitted at every authenticate() because credentials travel
+    # in cleartext on every connection.
+    ftp_host: str = ""
+    ftp_port: int = 21
+    ftp_username: str = ""
+    ftp_password: str = ""
+    ftp_folder: str = ""
+    # `explicit` = AUTH TLS on the standard control port (default + recommended).
+    # `implicit` = legacy FTPS-on-990 (entire control channel in TLS from the
+    # first byte). `off` = cleartext FTP (LAN/test only — see warning above).
+    ftp_tls: str = "explicit"
+    ftp_passive: bool = True
     poll_interval: int = 30    # seconds between polling checks (WebDAV, OneDrive)
     # Slack notifications (optional, per-project)
     slack_enabled: bool = False
@@ -625,6 +642,8 @@ class Config:
             return ""  # WebDAV uses the base URL directly; paths are relative
         if self.backend == "sftp":
             return self.sftp_folder
+        if self.backend == "ftp":
+            return self.ftp_folder
         return self.drive_folder_id
 
     @property

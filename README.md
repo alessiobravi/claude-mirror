@@ -49,6 +49,7 @@ Each backend ships in the base install — `pipx install claude-mirror` enables 
 | **OneDrive** | up to `poll_interval` (default 30s) | Device-code OAuth2 + Azure AD app | [docs/backends/onedrive.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/onedrive.md) |
 | **WebDAV** | up to `poll_interval` (default 30s) | URL + username + app password (Nextcloud, OwnCloud, NAS, Apache mod_dav, Box, Synology, QNAP, ...) | [docs/backends/webdav.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/webdav.md) |
 | **SFTP** | up to `poll_interval` (default 30s) | SSH key (preferred) or password — any OpenSSH-accessible server | [docs/backends/sftp.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/sftp.md) |
+| **FTP / FTPS** | up to `poll_interval` (default 30s) | Host + username + password — cPanel / DirectAdmin / shared hosting / NAS. Plain FTP supported but use FTPS or the SFTP backend wherever possible | [docs/backends/ftp.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/ftp.md) |
 
 ---
 
@@ -65,6 +66,7 @@ Plus, depending on the backend you choose:
 | OneDrive | A Microsoft account and an Azure AD app registration (free, created at [portal.azure.com](https://portal.azure.com)) |
 | WebDAV | A WebDAV server URL + username + app password (e.g. Nextcloud / OwnCloud / NAS / Apache mod_dav) |
 | SFTP | An SSH-accessible server (VPS / NAS / shared hosting / self-hosted Linux) — SSH key recommended, password fallback OK on LAN |
+| FTP / FTPS | An FTP-accessible server (cPanel / DirectAdmin / legacy shared hosting / NAS). FTPS strongly recommended; plain FTP works but transmits credentials in cleartext — LAN-only |
 
 ---
 

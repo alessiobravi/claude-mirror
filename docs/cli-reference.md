@@ -12,7 +12,7 @@ The global `--profile NAME` flag (since v0.5.49) goes on the `claude-mirror` com
 claude-mirror [--profile NAME] <subcommand> ...   # global flag (since v0.5.49)
 
 claude-mirror init        [--wizard]
-                        [--backend googledrive|dropbox|onedrive|webdav|sftp]
+                        [--backend googledrive|dropbox|onedrive|webdav|sftp|ftp]
                         [--project PATH]
                         [--drive-folder-id ID] [--gcp-project-id ID] [--pubsub-topic-id ID]
                         [--credentials-file PATH]
@@ -24,6 +24,9 @@ claude-mirror init        [--wizard]
                         [--sftp-key-file PATH] [--sftp-password PASS]
                         [--sftp-known-hosts-file PATH] [--sftp-strict-host-check/--no-sftp-strict-host-check]
                         [--sftp-folder PATH]
+                        [--ftp-host HOST] [--ftp-port PORT] [--ftp-username USER] [--ftp-password PASS]
+                        [--ftp-folder PATH] [--ftp-tls off|explicit|implicit]
+                        [--ftp-passive/--no-ftp-passive]
                         [--poll-interval SECS]
                         [--slack/--no-slack] [--slack-webhook-url URL] [--slack-channel CHAN]
                         [--token-file PATH] [--patterns GLOB ...] [--exclude GLOB ...] [--config PATH]
@@ -41,6 +44,9 @@ claude-mirror clone       --backend googledrive|dropbox|onedrive|webdav|sftp
                         [--sftp-key-file PATH] [--sftp-password PASS]
                         [--sftp-known-hosts-file PATH] [--sftp-strict-host-check/--no-sftp-strict-host-check]
                         [--sftp-folder PATH]
+                        [--ftp-host HOST] [--ftp-port PORT] [--ftp-username USER] [--ftp-password PASS]
+                        [--ftp-folder PATH] [--ftp-tls off|explicit|implicit]
+                        [--ftp-passive/--no-ftp-passive]
                         [--poll-interval SECS]
                         [--token-file PATH] [--patterns GLOB ...] [--exclude GLOB ...] [--config PATH]
                         [--no-pull] [--wizard]
@@ -412,6 +418,7 @@ See [README — Your first project](../README.md#your-first-project) for the wiz
 - [backends/onedrive.md](backends/onedrive.md)
 - [backends/webdav.md](backends/webdav.md)
 - [backends/sftp.md](backends/sftp.md)
+- [backends/ftp.md](backends/ftp.md)
 
 ### `clone`
 

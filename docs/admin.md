@@ -1716,6 +1716,36 @@ Auth-class failures (host fingerprint mismatch, auth rejected, root-path permiss
 - Backend is not `sftp` — the deep section is gated on `backend_name == "sftp"` and silently skipped for everything else.
 - Generic Check 3 (SFTP credentials present in YAML) failed — the deep section still runs, but most checks degrade to "missing credentials" failures pointing back at the YAML.
 
+### FTP deep checks
+
+When `--backend ftp` is in effect (explicitly via the flag, or because the primary / a Tier 2 mirror is `ftp`), the doctor runs an additional six checks targeting failure modes that only show up on FTP / FTPS backends. These complement the generic credentials/connectivity loop above; they don't replace it. Skipped silently for every other backend.
+
+| Check | Failure looks like |
+|---|---|
+| Host reachable | `Connection to HOST:PORT timed out` (fix: `ping HOST`, check port) or `Server unreachable: HOST:PORT` (fix: verify the server is up and the control port is open). Cleartext-mode advisory: when `ftp_tls=off` and the configured host is not loopback / RFC1918, doctor emits a yellow info line warning that credentials travel UNENCRYPTED. When the host IS loopback / RFC1918 the line is softer (LAN-only use is the documented contract). |
+| Server greeting + protocol banner | The 220-line greeting from the server is surfaced as info so you can confirm the backend is talking to the expected box (some shared-hosting providers run idiosyncratic banners that double as the first diagnostic signal). |
+| TLS handshake | Active when `ftp_tls != "off"`. Surfaces the negotiated cipher + protocol version (TLSv1.2 / TLSv1.3) as info. Failures bucket as `TLS handshake failed against HOST:PORT` (fix: verify server certificate, or change `ftp_tls` mode). |
+| Authentication | 530 from the server → AUTH-bucket failure `FTP authentication rejected` (fix: verify `ftp_username` / `ftp_password` in the YAML). Other transport errors during auth (transient, server bug) surface as `FTP transport error during auth`. |
+| Folder access | `cwd ftp_folder` succeeded → green ✓. 550 with "no such" / "not found" → failure `Configured folder doesn't exist on the server` (fix: create it via the host's file manager / shell, or `claude-mirror auth` will mkdir it on first connect). 550 with "permission denied" → AUTH-bucket failure pointing at server-side ACLs. |
+| Folder write | STOR a 1-byte sentinel file `__claude_mirror_doctor_test`, then DELE it. 550-permission → AUTH-bucket failure. 552 (storage exceeded) → `FTP server reported quota / storage limit` failure. Any successful path emits `Folder writable (STOR + DELE sentinel succeeded)`. |
+
+#### Auth-failure bucketing
+
+Auth-class failures (auth rejected, folder permission denied, write permission denied) all funnel through ONE auth-bucket — at most one of these fires per run, and the remaining checks are short-circuited so the user doesn't see three copies of "your access is broken" rooted in the same problem.
+
+#### Cleartext-mode advisory
+
+`ftp_tls: off` is supported but actively discouraged. The backend itself emits a stderr warning at every `authenticate()` call. The doctor adds an additional advisory: a loud warning when the configured host doesn't resolve to a loopback or RFC1918 address (i.e. cleartext FTP against an internet-reachable server), and a softer "host appears local" line when it does.
+
+#### Stdlib-only
+
+The FTP backend uses Python's stdlib `ftplib` — no third-party dependency. The deep-check function lazy-imports `ftplib`, `socket`, and `ssl` to keep generic doctor invocations on other backends fast.
+
+#### When the deep section is skipped
+
+- Backend is not `ftp` — the deep section is gated on `backend_name == "ftp"` and silently skipped for everything else.
+- Generic Check 3 (FTP credentials present in YAML) failed — the deep section still runs, but most checks degrade to "missing credentials" failures pointing back at the YAML.
+
 ### Sample Dropbox deep-check successful output
 
 ```
@@ -1768,7 +1798,7 @@ claude-mirror doctor --backend googledrive                        # generic chec
 claude-mirror doctor --backend onedrive                           # generic checks PLUS OneDrive deep checks (token cache, client_id, scopes, refresh, Graph drive-item probe)
 ```
 
-The `--backend` filter is case-insensitive and accepts `googledrive`, `dropbox`, `onedrive`, `webdav`, or `sftp`. The primary config is always parsed; only the per-backend loop is filtered. Skipped backends print a dim `── skipped: NAME (PATH) — does not match --backend FILTER` line so the output stays self-explanatory.
+The `--backend` filter is case-insensitive and accepts `googledrive`, `dropbox`, `onedrive`, `webdav`, `sftp`, or `ftp`. The primary config is always parsed; only the per-backend loop is filtered. Skipped backends print a dim `── skipped: NAME (PATH) — does not match --backend FILTER` line so the output stays self-explanatory.
 
 ### Where to go next
 
@@ -1790,3 +1820,4 @@ The `--backend` filter is case-insensitive and accepts `googledrive`, `dropbox`,
   - [backends/onedrive.md](backends/onedrive.md)
   - [backends/webdav.md](backends/webdav.md)
   - [backends/sftp.md](backends/sftp.md)
+  - [backends/ftp.md](backends/ftp.md)

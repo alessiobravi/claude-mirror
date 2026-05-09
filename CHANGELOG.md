@@ -78,6 +78,22 @@ Default window is the last 7 days; `--since` and `--until` accept the same vocab
 - `pytest tests/` — **1129 passed, 3 skipped** on macOS (1101 baseline + 28 new).
 - `mypy --strict claude_mirror/` — clean across 42 source files.
 
+### Added — FTP / FTPS storage backend (BACKEND-FTP)
+
+Plain FTP (legacy shared-hosting market: cPanel / DirectAdmin / old WordPress hosts) and FTPS (FTP over TLS) support via Python's stdlib `ftplib`. Cleartext FTP emits a clear warning at every connection — recommended only for trusted local-network use. SFTP remains the canonical choice for secure-file-transfer-over-the-internet. **No new dependencies — entirely stdlib.**
+
+- `claude_mirror/backends/ftp.py` — new `FtpBackend(StorageBackend)` built on `ftplib.FTP` and `ftplib.FTP_TLS`. Three TLS modes: `explicit` (default; AUTH TLS on port 21), `implicit` (legacy FTPS-on-990 with manual socket-wrapping since `ftplib.FTP_TLS` doesn't speak implicit out of the box), and `off` (cleartext — emits a stderr warning at every `authenticate()` call). Passive mode honoured. `MLSD` (RFC 3659) directory listing with a `LIST`-parser fallback for legacy servers. `XSHA256` / `HASH` / `XSHA1` / `XMD5` server-side hash extensions tried first; falls back to streaming the bytes and computing sha256 client-side. `copy_file` falls back to download-then-upload (FTP has no server-side copy primitive). `classify_error` maps 530 → AUTH, 550-permission → PERMISSION, 550-not-found → FILE_REJECTED, 552 → QUOTA, socket / TLS errors → TRANSIENT / AUTH respectively.
+- `claude_mirror/config.py` — seven new `Config` fields: `ftp_host`, `ftp_port` (default 21), `ftp_username`, `ftp_password`, `ftp_folder`, `ftp_tls` (default `explicit`), `ftp_passive` (default True). `root_folder` returns `ftp_folder` when `backend == "ftp"`.
+- `claude_mirror/cli.py` — `ftp` appended to `_AVAILABLE_BACKENDS`, dispatch case appended to `_create_storage`, `--ftp-host` / `--ftp-port` / `--ftp-username` / `--ftp-password` / `--ftp-folder` / `--ftp-tls` / `--ftp-passive/--no-ftp-passive` Click options on both `init` and `clone`. Wizard branch added for the `ftp` backend (host, TLS mode, port with mode-aware default, username, password, folder, passive). `_run_ftp_deep_checks` (six checks: TCP reachable, server greeting, TLS handshake, authentication, folder access, folder write) plus `_ftp_deep_check_factory` seam for offline tests. Cleartext-mode advisory at doctor time when `ftp_tls=off` and the host is not loopback / RFC1918.
+- `tests/test_ftp_backend.py` — 42 unit tests covering the full backend surface (auth happy path / bad creds / connection refused, upload / download / size cap, copy fallback, hash via XSHA256 plus client-side fallback, delete, classify_error matrix, TLS-mode selection, passive vs active, MLSD / LIST fallback, parse helpers, cleartext-warning content, RFC1918 helper).
+- `tests/test_doctor_ftp_deep.py` — 11 deep-check tests covering each of the six checks plus the cleartext advisory branches and the non-ftp-backend skip.
+- `tests/test_init_wizard.py::test_run_wizard_ftp_walks_through_prompts` — regression: choosing `ftp` at the first prompt walks through ftp-specific prompts (host, TLS mode, port, username, password).
+- `tests/test_dyn_comp.py` — extended the hardcoded backend list to include `ftp`.
+- `docs/backends/ftp.md` — new page: cPanel / DirectAdmin / NAS quick starts, full config field reference, cleartext-FTP security note, FTPS modes table, daily-ops notes (no native push, no server-side copy, no native checksum, no atomic upload), doctor deep-check description, troubleshooting (passive vs active, NAT/firewall, TLS handshake failures, MLSD vs LIST, SIZE).
+- `docs/admin.md` — new `### FTP deep checks` subsection with the per-check matrix, auth-failure bucketing, cleartext-mode advisory, stdlib-only note. Doctor `--backend` filter list extended to include `ftp`. Backend index extended with `backends/ftp.md` link.
+- `docs/cli-reference.md` — `--backend` choice list extended to include `ftp` everywhere it appears. New `--ftp-*` flag block on `init` and `clone`. Backend pages list extended.
+- `README.md` — new FTP / FTPS row in the backends table; new row in the prerequisites table.
+
 ---
 
 ## [0.5.62] — 2026-05-09

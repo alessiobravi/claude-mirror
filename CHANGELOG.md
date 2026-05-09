@@ -4,9 +4,11 @@ All notable changes to claude-mirror.
 
 ---
 
-## [0.5.56] — 2026-05-09
+## [0.5.57] — 2026-05-09
 
-Five new user-facing commands and command modes ship together: `push --dry-run` / `pull --dry-run` preview mode, `log --follow` for live streaming, `status --presence` for collaborator visibility, `claude-mirror health` for monitoring-tool integration, and `claude-mirror clone` for one-shot machine bootstrap. Plus a docs cleanup pass (DOC-CLEAN) fixing 6 stale README anchors trimmed during the v0.5.36 doc split, with two new admin.md subsections ("Filtering which events fire", "Is the watcher actually running?").
+Five new user-facing commands and command modes ship together: `push --dry-run` / `pull --dry-run` preview mode, `log --follow` for live streaming, `status --presence` for collaborator visibility, `claude-mirror health` for monitoring-tool integration, and `claude-mirror clone` for one-shot machine bootstrap. Plus a docs cleanup pass (DOC-CLEAN) fixing 6 stale README anchors trimmed during the v0.5.36 doc split, with two new admin.md subsections ("Filtering which events fire", "Is the watcher actually running?"), and a follow-up `mypy --strict` pass that surfaced 5 type-correctness issues across the new code (explicit `return None` on the `push` / `pull` engine paths, `assert plan is not None` narrowing on the `--dry-run` callers, `redact_error(str(exc))` coercion on the presence error path).
+
+**Note on numbering:** v0.5.56 was tagged but had its tag pointed at the mypy-fix commit instead of the release-anchor commit, which made `git log -1 v0.5.56` show only the fix's subject and obscured the feature surface. PyPI's "burn-once" policy on version numbers means re-publishing under the same version is impossible, so v0.5.56 is yanked and v0.5.57 ships the same content with a proper feature-bearing release commit at the tag's pointed-to revision.
 
 ### Added — push --dry-run / pull --dry-run preview mode
 

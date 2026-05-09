@@ -556,6 +556,30 @@ See [docs/admin.md#doctor](https://github.com/alessiobravi/claude-mirror/blob/ma
 
 ---
 
+## Monitoring & alerting
+
+For unattended monitoring (Uptime Kuma, Better Stack, Prometheus textfile-exporter, Datadog, GitHub Actions matrix health checks, ...), reach for `claude-mirror health` rather than `doctor`. Where `doctor` is the verbose human-readable diagnostic you run when something is broken, `health` is the fast structured probe a monitoring tool polls on a schedule. Both share data sources but the surface is tuned for different audiences.
+
+`claude-mirror health` runs six checks (`config_yaml`, `token_present`, `backend_reachable`, `mirrors_reachable`, `watcher_running`, `last_sync_age`) and exits with one of three codes that any monitoring tool can key off:
+
+| Exit | Overall | Meaning |
+|---|---|---|
+| `0` | `ok` | Healthy. |
+| `1` | `warn` | At least one check warned (e.g. `last_sync_age` between 24h and 72h). |
+| `2` | `fail` | At least one check failed. Page now. |
+
+Pass `--json` for a parseable envelope (`{"schema": "v1", "command": "health", "generated_at": ..., "overall": ..., "checks": [...]}`) instead of the Rich table; pass `--no-backends` to skip the network-touching probes for fast local-only checks that don't burn API quota.
+
+Sample one-liner for cron — fire a notification on any non-zero exit so monitoring picks up both `warn` and `fail`:
+
+```cron
+*/1 * * * * /usr/local/bin/claude-mirror health --json --no-backends || /usr/local/bin/notify-monitor
+```
+
+See [docs/cli-reference.md#health](https://github.com/alessiobravi/claude-mirror/blob/main/docs/cli-reference.md#health) for the full check matrix, JSON envelope schema, and integration examples.
+
+---
+
 ## File locations
 
 All token files are written with `chmod 0600` (owner read/write only).

@@ -1208,6 +1208,8 @@ Use Tier 2 (`mirror_config_paths`) for any real mirroring use case. Reach for th
 
 `claude-mirror doctor` is the end-to-end self-test for a project's configuration. It runs every common check that could explain a failed `push`, `pull`, `sync`, or `auth`, and reports each result with a concrete fix command pointing at the right next action — `claude-mirror auth --config ...`, `chmod 600 KEY`, "verify the folder ID in the provider's web UI", and so on. With Tier 2 mirroring configured, every mirror in `mirror_config_paths` gets the same check sequence applied automatically, so one `doctor` invocation diagnoses the whole multi-backend setup.
 
+For unattended monitoring (Uptime Kuma, Better Stack, Prometheus, Datadog, GitHub Actions matrix health checks), reach for [`claude-mirror health`](cli-reference.md#health) instead — it's the structured, fast sibling of doctor that emits a JSON envelope (`schema: v1`) and uses exit codes `0`/`1`/`2` for ok/warn/fail. Doctor is for humans diagnosing a problem; health is for monitoring tools polling every minute. Both share the same data sources (config, token, backend reachability, sync log) but the surfaces are tuned for different audiences — run them side-by-side.
+
 ### Check matrix
 
 The implementation runs the following checks in order. Every per-backend check repeats for each entry in `mirror_config_paths`. The `--backend NAME` flag filters the per-backend loop to one backend; the primary-config parse (Check 1) always runs.

@@ -289,6 +289,12 @@ _NO_WATCHER_CHECK_CMDS = {
     # also gets called specifically when the user already suspects something
     # is wrong, so the watcher hint isn't useful here.
     "doctor",
+    # `health` is the machine-readable monitoring probe — its watcher
+    # check IS one of the structured checks it returns, so a free-text
+    # banner ahead of the table or JSON envelope would either corrupt
+    # the JSON document (`--json` mode) or duplicate the structured
+    # row (table mode).
+    "health",
     # `prune` and `diff` are read-mostly housekeeping — the watcher hint
     # is unrelated and just adds noise to the rendered output.
     "prune", "diff",
@@ -9976,3 +9982,191 @@ def doctor(config_path: str, backend_filter: str) -> None:
         )
         sys.exit(1)
     console.print("\n[green bold]✓ All checks passed.[/]")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# health — machine-readable monitoring probe
+#
+# Sibling of `doctor`: doctor is the verbose human-readable diagnostic
+# you reach for when something is broken; `health` is the fast,
+# structured probe a monitoring tool (Uptime Kuma, Better Stack,
+# Prometheus textfile-exporter, Datadog, GitHub Actions matrix health
+# check, ...) polls every minute. Both share the same data sources
+# (config, token, backend reachability, sync log) but the surfaces are
+# tuned for different audiences.
+#
+# Exit codes are the load-bearing contract for monitoring integration:
+#   0 → overall ok    (every check ok or unsupported)
+#   1 → overall warn  (at least one check warned, none failed)
+#   2 → overall fail  (at least one check failed)
+#
+# `unsupported` rungs (e.g. watcher liveness on Windows) never affect
+# the overall status — they appear in the report for transparency but
+# don't poison a green dashboard with a perpetual yellow row.
+# ──────────────────────────────────────────────────────────────────────────
+@cli.command()
+@click.option("--config", "config_path", default="",
+              help="Config file path. Auto-detected from cwd if omitted.")
+@click.option("--no-backends", "no_backends", is_flag=True, default=False,
+              help="Skip the backend-reachability and mirror probes "
+                   "(and the last-sync-age fetch they share with). "
+                   "Useful for fast local-only checks that must not "
+                   "burn API quota.")
+@click.option("--timeout", "timeout_seconds", type=int, default=10,
+              show_default=True,
+              help="Per-check timeout cap, in seconds. Must be a "
+                   "positive integer.")
+@click.option("--json", "json_output", is_flag=True, default=False,
+              help="Emit a single JSON envelope to stdout (schema v1) "
+                   "instead of the human-readable table. Stdout-only; "
+                   "every banner / progress / colour is suppressed so "
+                   "the output is parseable by `jq`, monitoring tools, "
+                   "and structured-log consumers.")
+@click.pass_context
+def health(
+    ctx: click.Context,
+    config_path: str,
+    no_backends: bool,
+    timeout_seconds: int,
+    json_output: bool,
+) -> None:
+    """Machine-readable health probe for monitoring tools.
+
+    Runs six checks in sequence and emits either a Rich table (default)
+    or a structured JSON envelope (`--json`):
+
+    \b
+      1. config_yaml        — does the project YAML load cleanly?
+      2. token_present      — does the configured token file exist + parse?
+      3. backend_reachable  — light read against the primary backend
+                              (skipped under --no-backends)
+      4. mirrors_reachable  — same probe per Tier 2 mirror, one row each
+                              (skipped under --no-backends)
+      5. watcher_running    — pgrep watch-all liveness (POSIX only;
+                              `unsupported` on Windows)
+      6. last_sync_age      — most-recent _sync_log.json timestamp:
+                              <24h ok / 24-72h warn / >72h fail
+                              (skipped under --no-backends)
+
+    \b
+    Exit codes (the load-bearing contract for monitoring tools):
+      0  overall ok
+      1  overall warn
+      2  overall fail
+
+    \b
+    Examples:
+      claude-mirror health
+      claude-mirror health --json
+      claude-mirror health --json --no-backends
+      claude-mirror health --timeout 5
+    """
+    if timeout_seconds <= 0:
+        ctx.fail(
+            f"--timeout must be a positive integer "
+            f"(got {timeout_seconds})."
+        )
+
+    from ._health import collect_health
+    from ._progress import make_phase_progress
+
+    cfg_path = _resolve_config(config_path)
+
+    if json_output:
+        try:
+            with _JsonMode():
+                report = collect_health(
+                    cfg_path,
+                    include_backends=not no_backends,
+                    timeout_seconds=timeout_seconds,
+                    storage_factory=_create_storage,
+                )
+            click.echo(_json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
+            sys.exit(_exit_code_for_overall(report.overall))
+        except SystemExit:
+            raise
+        except BaseException as e:  # noqa: BLE001 - never crash the monitoring probe
+            click.echo(
+                _json.dumps(
+                    {
+                        "schema": "v1",
+                        "command": "health",
+                        "error": {
+                            "type": type(e).__name__,
+                            "message": str(e),
+                        },
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                err=True,
+            )
+            sys.exit(2)
+
+    console.print(f"[bold]claude-mirror health[/] — {cfg_path}\n")
+    with make_phase_progress(console) as progress:
+        task = progress.add_task(
+            "Health", total=None, detail="running checks…", show_time=True,
+        )
+        report = collect_health(
+            cfg_path,
+            include_backends=not no_backends,
+            timeout_seconds=timeout_seconds,
+            storage_factory=_create_storage,
+        )
+        progress.update(task, detail="completed")
+
+    _render_health_table(report)
+    sys.exit(_exit_code_for_overall(report.overall))
+
+
+def _exit_code_for_overall(overall: str) -> int:
+    """Map the report's overall rung to a Unix exit code.
+
+    Monitoring tools (Uptime Kuma's "exit code != 0" mode, Better
+    Stack's status code matcher, GitHub Actions step-conditional, etc.)
+    key off these. Keep them stable across releases.
+    """
+    if overall == "ok":
+        return 0
+    if overall == "warn":
+        return 1
+    return 2
+
+
+def _render_health_table(report: Any) -> None:
+    """Render a HealthReport as a Rich table with one row per check.
+
+    Color-coded by status (green=ok, yellow=warn, red=fail, dim=unsupported)
+    plus an "Overall" footer line that mirrors the exit-code mapping.
+    """
+    table = Table(title="Health checks", show_header=True, header_style="bold")
+    table.add_column("Check", style="bold")
+    table.add_column("Status")
+    table.add_column("Detail")
+    table.add_column("Latency", justify="right")
+
+    style_for = {
+        "ok": "green",
+        "warn": "yellow",
+        "fail": "red",
+        "unsupported": "dim",
+    }
+
+    for check in report.checks:
+        latency = (
+            f"{check.latency_ms} ms" if check.latency_ms is not None else "-"
+        )
+        style = style_for.get(check.status, "white")
+        table.add_row(
+            check.name,
+            f"[{style}]{check.status}[/]",
+            check.detail,
+            latency,
+        )
+
+    console.print(table)
+    overall_style = style_for.get(report.overall, "white")
+    console.print(
+        f"\nOverall: [{overall_style} bold]{report.overall.upper()}[/]"
+    )

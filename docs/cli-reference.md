@@ -54,6 +54,7 @@ claude-mirror prune             [--keep-last N] [--keep-daily N] [--keep-monthly
                               [--delete] [--yes] [--config PATH]   # dry-run by default; reads keep_* from config
 claude-mirror gc                [--backend NAME] [--delete] [--yes] [--config PATH]   # dry-run by default; --delete to actually delete; --backend targets a specific mirror (Tier 2)
 claude-mirror doctor            [--backend NAME] [--config PATH]   # end-to-end self-test: config + credentials + connectivity + project + manifest (+ deep checks under --backend googledrive or --backend dropbox)
+claude-mirror health            [--no-backends] [--timeout N] [--json] [--config PATH]   # machine-readable monitoring probe; exit 0 ok / 1 warn / 2 fail
 claude-mirror migrate-snapshots --to {blobs|full} [--dry-run] [--keep-source] [--no-update-config] [--config PATH]
 claude-mirror log               [--limit N] [--config PATH]
 claude-mirror inbox       [--config PATH]
@@ -83,6 +84,7 @@ Supported commands:
 - `claude-mirror inbox --json`
 - `claude-mirror log --json`
 - `claude-mirror snapshots --json`
+- `claude-mirror health --json` (uses a sibling envelope shape — see [`### health`](#health) below; exits `0`/`1`/`2` for ok/warn/fail rather than `0`/`1` for ok/error)
 
 Exit codes match the non-JSON path: `0` on success (an empty inbox is a success and produces `{... "result": {"events": []}}`), `1` on any actual error (config not found, network failure, malformed snapshot). On error, a JSON error envelope is written to **stderr** rather than the success document on stdout, so a script can `2>/dev/null` the failure stream without losing structured info.
 
@@ -571,6 +573,91 @@ End-to-end self-test of a project's configuration: config file parses, credentia
 `--backend sftp` additionally runs SFTP-specific deep checks beyond the generic per-backend loop: host fingerprint match against `~/.ssh/known_hosts` (a mismatch is treated as a possible MITM and refuses to connect), SSH key file existence and 0600 permissions, key decryption (or ssh-agent fallback), connection + auth, `exec_command` capability (some `internal-sftp`-jailed accounts disallow shell, in which case claude-mirror falls back to client-side hashing), and root-path `stat`. Auth-class failures bucket into one `SFTP auth failed` line; the fingerprint-mismatch fix-hint deliberately points at `ssh-keygen -R hostname`, not `claude-mirror auth` — fingerprint mismatches are a security incident, not a token problem. See [admin.md#sftp-deep-checks](admin.md#sftp-deep-checks) for the full deep-check matrix and [backends/sftp.md#diagnosing-setup-problems](backends/sftp.md#diagnosing-setup-problems) for sample output.
 
 See [admin.md#doctor](admin.md#doctor) for the full check matrix, sample output, and fix-hint interpretation.
+
+### `health`
+
+Machine-readable health probe for monitoring tools. Sibling of `doctor`: doctor is the human-readable diagnostic, health is the structured, fast probe a monitoring tool polls on a schedule. Both share data sources (config, token, backend reachability, sync log) but the surfaces are tuned for different audiences. Wires into Uptime Kuma, Better Stack, Prometheus textfile-exporter, Datadog, GitHub Actions matrix health checks, and any other tool that keys off Unix exit codes plus a parseable JSON envelope.
+
+Six checks run in sequence:
+
+| Check | What it verifies | Status rungs |
+|---|---|---|
+| `config_yaml` | The project YAML loads cleanly via `Config.load`. | ok / fail |
+| `token_present` | The configured token file exists and parses (or for WebDAV / SFTP: required inline credentials are set in the YAML). No actual auth call — that's `backend_reachable`'s job. | ok / fail |
+| `backend_reachable` | Light read against the primary backend (`list_folders` on the configured root, or `sftp.stat` for SFTP). Latency reported in milliseconds. Skipped under `--no-backends`. | ok / fail |
+| `mirrors_reachable` | Same probe for every Tier 2 mirror in `mirror_config_paths`. One row per mirror, named `mirror_<backend>`. Skipped under `--no-backends`. | ok / fail |
+| `watcher_running` | POSIX-only `pgrep -f "claude-mirror watch-all"`. On Windows the row is `unsupported` (the watch-all daemon is POSIX-only). | ok / warn / unsupported |
+| `last_sync_age` | Most-recent `_sync_log.json` timestamp. `<24h` → ok, `24-72h` → warn, `>72h` → fail. No history yet (fresh install) is `ok` with detail `no sync history yet` — fresh installs aren't unhealthy, they're new. Skipped under `--no-backends`. | ok / warn / fail |
+
+The overall status is the worst non-`unsupported` rung: any `fail` makes overall `fail`; any `warn` makes overall `warn`; otherwise `ok`. `unsupported` rungs never affect the overall, so a green dashboard stays green even though Windows machines surface a stable `unsupported` watcher row.
+
+#### Exit codes
+
+| Exit code | Overall | Meaning |
+|---|---|---|
+| `0` | `ok` | Every check is `ok` (or `unsupported`). Healthy. |
+| `1` | `warn` | At least one check warned, none failed. Investigate soon. |
+| `2` | `fail` | At least one check failed. Page now. |
+
+Monitoring tools (Uptime Kuma's "exit code != 0" mode, Better Stack's status code matcher, GitHub Actions step-conditional, etc.) key off these. Stable across releases.
+
+#### Flags
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--config PATH` | auto-detect from cwd | Point at a specific config YAML. |
+| `--no-backends` | false | Skip the backend-reachability probes and the sync-log fetch. Useful for fast local-only checks that must not burn API quota. |
+| `--timeout N` | `10` | Per-check timeout cap, in seconds. Must be a positive integer; `--timeout 0` and `--timeout -5` exit non-zero with a message naming the flag, before any check runs. |
+| `--json` | false | Emit a JSON envelope to stdout (schema v1) instead of the Rich table. Stdout is JSON-only; every banner / progress / colour is suppressed so the output is parseable by `jq`, monitoring tools, and structured-log consumers. |
+
+#### JSON envelope (schema v1)
+
+```json
+{
+  "schema": "v1",
+  "command": "health",
+  "generated_at": "2026-05-09T08:42:01.482000+00:00",
+  "overall": "ok",
+  "checks": [
+    {"name": "config_yaml",       "status": "ok",          "detail": "/home/alice/.config/claude_mirror/notes.yaml", "latency_ms": 1},
+    {"name": "token_present",     "status": "ok",          "detail": "/home/alice/.config/claude_mirror/token.json", "latency_ms": 0},
+    {"name": "backend_reachable", "status": "ok",          "detail": "reachable (googledrive)",                      "latency_ms": 412},
+    {"name": "watcher_running",   "status": "ok",          "detail": "watch-all running (pid 47281)",                "latency_ms": 18},
+    {"name": "last_sync_age",     "status": "ok",          "detail": "last sync 2.7h ago (2026-05-09T06:00:00+00:00)", "latency_ms": 320}
+  ]
+}
+```
+
+`overall` is one of `"ok"`, `"warn"`, `"fail"`. Each `checks[]` entry has exactly four keys (`name`, `status`, `detail`, `latency_ms`); `latency_ms` is `null` for checks that don't track it. `generated_at` is ISO-8601 UTC.
+
+When the probe itself crashes before it can emit a report (extremely rare — every per-check failure normally lands as a `fail` HealthCheck rather than an exception), an error envelope is written to stderr in the same shape as the other `--json` commands and the process exits 2:
+
+```json
+{
+  "schema": "v1",
+  "command": "health",
+  "error": {
+    "type": "RuntimeError",
+    "message": "<message>"
+  }
+}
+```
+
+#### Examples
+
+```bash
+claude-mirror health
+claude-mirror health --json
+claude-mirror health --json --no-backends
+claude-mirror health --json --config ~/.config/claude_mirror/work.yaml
+claude-mirror health --timeout 5
+```
+
+Sample one-liner for cron — fire a notification on any non-zero exit so monitoring picks up both `warn` and `fail`:
+
+```cron
+*/1 * * * * /usr/local/bin/claude-mirror health --json --no-backends || /usr/local/bin/notify-monitor
+```
 
 ### `find-config`
 

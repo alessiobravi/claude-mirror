@@ -56,6 +56,45 @@ The presence-fetch phase appears as a progress row labelled "Presence" with a li
 ### Tests
 - `pytest tests/test_presence.py` — **17 passed** locally on macOS in 0.23s.
 
+### Added — claude-mirror health for monitoring probes
+
+- New `claude-mirror health` command — the machine-readable, fast sibling of `claude-mirror doctor`. Designed for monitoring tools (Uptime Kuma, Better Stack, Prometheus textfile-exporter, Datadog, GitHub Actions matrix health checks) polling every minute or so.
+- **Six structured checks** in sequence:
+  1. `config_yaml` — does the project YAML load cleanly?
+  2. `token_present` — does the configured token file exist + parse? (For WebDAV / SFTP: required inline credentials present in YAML.)
+  3. `backend_reachable` — light read against the primary backend (`list_folders` on the configured root, or `sftp.stat` for SFTP). Latency reported in milliseconds.
+  4. `mirrors_reachable` — same probe for every Tier 2 mirror in `mirror_config_paths`. One row per mirror, named `mirror_<backend>`.
+  5. `watcher_running` — POSIX-only `pgrep -f "claude-mirror watch-all"`. On Windows the row is `unsupported` (the watch-all daemon is POSIX-only); `unsupported` checks never poison the overall status.
+  6. `last_sync_age` — most-recent `_sync_log.json` timestamp: `<24h` ok, `24-72h` warn, `>72h` fail. No history yet (fresh install) is `ok` with detail "no sync history yet" — fresh installs aren't unhealthy, they're new.
+- **Exit codes** — the load-bearing contract for monitoring-tool integration:
+  - `0` overall ok
+  - `1` overall warn
+  - `2` overall fail
+- **Two output modes:**
+  - Default — Rich table with one row per check, colour-coded (green = ok, yellow = warn, red = fail, dim = unsupported), latency column where present, and an "Overall: OK / WARN / FAIL" footer.
+  - `--json` — single JSON envelope on stdout under the existing v1 schema family. Stdout is JSON-only; the watcher banner and update-check banner are suppressed (additive `health` entry in `_NO_WATCHER_CHECK_CMDS` plus the existing `--json` argv check). Envelope shape: `{"schema": "v1", "command": "health", "generated_at": <ISO8601>, "overall": "ok|warn|fail", "checks": [{"name": ..., "status": ..., "detail": ..., "latency_ms": ...}, ...]}`.
+- **Flags:**
+  - `--config PATH` — auto-detected from cwd if omitted (same pattern as every other read-only command).
+  - `--no-backends` — skip the `backend_reachable`, `mirrors_reachable`, and `last_sync_age` checks. Useful for fast local-only checks that must not burn API quota; pairs well with a high cron frequency.
+  - `--timeout N` — per-check timeout cap, default 10s. Negative or zero values exit non-zero with a message naming the flag, before any check runs.
+  - `--json` — see above.
+- **Worst-rung-wins aggregation:** any `fail` makes overall `fail`; any `warn` makes overall `warn`; otherwise `ok`. `unsupported` rungs (Windows watcher path) are ignored when computing the overall, so a green dashboard stays green.
+- **vs `doctor`** — both share data sources but different audiences: doctor is the human-readable, verbose diagnostic with concrete fix-hint commands you reach for when something is broken; health is the structured, fast probe a monitoring tool polls on a schedule. Run them side-by-side.
+
+### Updated docs/files
+
+- `claude_mirror/_health.py` (new, ~370 lines) — `HealthCheck` / `HealthReport` dataclasses, `collect_health()` orchestrator, per-check helpers (`_check_token_present`, `_probe_backend`, `_check_watcher_running`, `_fetch_sync_log`, `_check_last_sync_age`), `_aggregate_overall()` worst-rung-wins helper, threshold constants `LAST_SYNC_WARN_HOURS = 24` and `LAST_SYNC_FAIL_HOURS = 72`.
+- `claude_mirror/cli.py` — new `health` Click command (~140 lines including docstring), `_render_health_table()` helper, `_exit_code_for_overall()` helper, `health` added to `_NO_WATCHER_CHECK_CMDS` so banners can never leak into the JSON envelope.
+- `tests/test_health.py` (new, **22 tests**) — pure-aggregator tests (worst-rung-wins, `unsupported` ignored, every per-check pathway), CLI tests (`CliRunner` against `--json` and human modes, exit-code mapping for ok/warn/fail, `--timeout 0` and `--timeout -5` rejection). All offline, every test runs in <10 ms.
+- `CHANGELOG.md` — this entry.
+- `README.md` — new "Monitoring & alerting" subsection with a sample cron one-liner.
+- `docs/cli-reference.md` — `### health` subsection added under `## Maintenance`, covering each check, exit codes table, JSON envelope shape with sample, and the "vs doctor" framing.
+- `docs/admin.md` — short paragraph in the Doctor section pointing operators at `health` for unattended monitoring.
+
+### Tests
+
+- `pytest tests/test_health.py` — **22 passed locally** on macOS in 0.22s.
+
 ---
 
 ## [0.5.55] — 2026-05-09

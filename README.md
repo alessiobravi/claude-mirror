@@ -326,6 +326,7 @@ claude-mirror restore --tag v1.0        # restore by tag instead of by timestamp
 claude-mirror ncdu                      # interactive curses TUI of remote disk usage (POSIX only; arrows + Enter to navigate)
 claude-mirror ncdu --non-interactive --top 10   # cron-friendly: print top-10 largest paths and exit
 claude-mirror status --json | jq '.result.summary'   # script-friendly output
+claude-mirror verify --strict           # end-to-end integrity audit: manifest vs remote + snapshot blobs + mount cache
 ```
 
 Per-project gitignore-style exclusions: drop a `.claude_mirror_ignore` at the project root for `**`/`!negation`/`/anchored`/`dir/` rules that complement YAML `exclude_patterns`. Full syntax in [docs/admin.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md#claude_mirror_ignore--project-tree-exclusions).

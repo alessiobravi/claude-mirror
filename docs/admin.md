@@ -392,6 +392,36 @@ Five variants share one engine: a single tagged or timestamped snapshot (`--tag`
 
 fusepy ships in the base install (since v0.5.61) — `pipx install claude-mirror` is enough on the Python side. The platform's kernel layer (macFUSE / WinFsp / libfuse) is installed separately, only required at mount time. Full reference: [`docs/cli-reference.md` — `mount`](cli-reference.md#mount). End-to-end recipe with pitfalls: [Scenario J. Browse / grep / diff snapshots without restoring](scenarios.md#j-browse--grep--diff-snapshots-without-restoring).
 
+### End-to-end integrity audit
+
+`claude-mirror verify` is the proactive drift-detection tool: it confirms claude-mirror's recorded view of reality matches what's actually stored on every backend and in the local mount cache. Pairs with `claude-mirror health` for the full monitoring story — health checks **liveness** (is the system live and reachable?), verify checks **correctness** (do the bytes match the manifest, and do the content-addressed blobs still hash to their filenames?). Inspired by `restic check` and `rclone check`.
+
+Three independent verification phases:
+
+| Phase | What it verifies |
+|---|---|
+| `manifest_vs_remote` | For each entry in `.claude_mirror_manifest.json`, compare the manifest's `synced_remote_hash` against what each configured backend returns from `get_file_hash()`. Drift = backend hash differs. Missing = backend has no record of the file ID. Honours each backend's native hash algorithm (Drive `md5Checksum`, Dropbox `content_hash`, OneDrive `quickXorHash`, WebDAV ETag / `oc:checksums`, SFTP `sha256`). |
+| `snapshot_blobs` | Re-hash every `_claude_mirror_blobs/<hh>/<hash>` blob on each backend; mismatch = corrupted (the content-addressing contract is broken — bit-rot, partial upload, or tampering). |
+| `mount_blob_cache` | Re-hash every entry in the on-disk content-addressed cache populated by [`mount`](#browsing-without-restoring). Corrupted entries are surfaced so the user can evict and refetch on the next mount rather than serve bad bytes. |
+
+Default mode is informational — the report prints, the exit code is `0` whether or not findings were surfaced. `--strict` flips the contract: any drift / missing / corrupted entry exits `1`, which is the signal a daily cron uses to alert on integrity regressions:
+
+```bash
+claude-mirror verify                                    # default: report + exit 0
+claude-mirror verify --strict                           # exit 1 on any finding
+claude-mirror verify --json                             # parseable v1 envelope
+claude-mirror verify --backend dropbox --no-mount-cache # Tier 2: scope to one mirror
+```
+
+Per-phase opt-out flags (`--no-files`, `--no-snapshots`, `--no-mount-cache`) let you focus on one layer at a time. Full reference, sample report, and the JSON envelope spec: [`docs/cli-reference.md` — `verify`](cli-reference.md#verify).
+
+A daily cron alongside `health` covers both halves of the monitoring story:
+
+```cron
+*/5 * * * * /usr/local/bin/claude-mirror health --json --no-backends || /usr/local/bin/notify-monitor
+0 3 * * *   /usr/local/bin/claude-mirror verify --strict --json    || /usr/local/bin/notify-monitor
+```
+
 ---
 
 ## Performance and bandwidth control

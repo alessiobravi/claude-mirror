@@ -56,6 +56,28 @@ Default window is the last 7 days; `--since` and `--until` accept the same vocab
 - `docs/admin.md` — new "Activity stats over a window" subsection under "Who else is editing this project?" pointing at `stats` as the rolled-up companion to `status --presence` and `log`.
 - `README.md` — Daily usage cheatsheet grows a `claude-mirror stats --since 7d` line.
 
+### Added — claude-mirror verify for end-to-end integrity audit (VERIFY)
+
+`claude-mirror verify` is the proactive drift-detection sibling of `claude-mirror health`: where health asks "is the system live and reachable?", verify asks "does claude-mirror's recorded view of reality match what's actually on every backend?" Inspired by `restic check` and `rclone check`, it runs three independent verification phases and surfaces drift / missing entries / corrupted blobs across them.
+
+- **Phase 1 — manifest_vs_remote.** For each entry in the per-project `.claude_mirror_manifest.json`, ask each configured backend (primary + every Tier 2 mirror) for the recorded `synced_remote_hash` and compare against the manifest. Drift = backend hash differs from manifest. Missing = backend has no record of the recorded file ID. Each backend's native hash algorithm is honoured: Drive `md5Checksum`, Dropbox `content_hash`, OneDrive `quickXorHash`, WebDAV ETag / `oc:checksums`, SFTP sha256 — verify trusts each backend's `get_file_hash()` contract.
+- **Phase 2 — snapshot_blobs.** Walk every `_claude_mirror_blobs/<hh>/<hash>` blob on each backend, fetch the bytes, recompute sha256, and compare with the filename. Mismatch = corrupted (the content-addressing contract is broken — bit-rot, partial upload, or tampering).
+- **Phase 3 — mount_blob_cache.** Walk the on-disk content-addressed cache populated by the v0.5.62 MOUNT engine (`~/.cache/claude-mirror/blobs/` on POSIX, `%LOCALAPPDATA%/claude-mirror/Cache/blobs/` on Windows) and re-hash every entry. Corrupted entries are surfaced so the user can evict and refetch on the next mount rather than serve bad bytes.
+- **`--strict` flips drift / missing / corrupted to a hard exit 1** so a daily cron alongside `claude-mirror health` can alert on integrity regressions. Default is exit 0 + report (informational).
+- **`--json` v1 envelope** — same `{version, command, result}` shape as the rest of the read-only `--json` family. Schema bumps stay additive on v1. Stdout-only; the watcher banner is gated via `_NO_WATCHER_CHECK_CMDS` and the `--json` argv check at `_CLIGroup.invoke` so monitoring tools always get a parseable document.
+- **Per-phase opt-out flags** — `--no-files`, `--no-snapshots`, `--no-mount-cache`. All three off is a friendly no-op ("No phases enabled — pass --files / --snapshots / --mount-cache to enable a check.")
+- **Tier 2 backend scoping** — `claude-mirror verify --backend NAME` restricts the manifest + snapshot phases to one specific mirror so an operator can verify just the backend they suspect is drifting.
+- New module `claude_mirror/_verify.py` (~440 lines, pure phase orchestration: `verify_manifest_vs_remote()`, `verify_snapshot_blobs()`, `verify_mount_cache()`, plus the `collect_verify()` aggregator). Reuses `claude_mirror/_mount.py::default_cache_root()` for the mount cache root path so the snapshot-blobs and mount-cache phases share the same on-disk layout contract as the v0.5.62 MOUNT engine.
+- New `verify` command in `claude_mirror/cli.py` with the dual-line phase Progress display (live "manifest vs remote: 422/1245" detail) and a Rich table renderer with attention-coloured nonzero counts.
+- `tests/test_verify.py` — 28 tests covering each phase function (clean / drift / missing / corrupted / per-mirror / pending-retry skip), the `collect_verify()` aggregator, the CLI default-exit-zero contract, the `--strict` exit-one path, the `--json` envelope shape and stdout-only contract, the `--backend NAME` scoping, the friendly empty-state messages, and progress-callback exception swallowing. All offline against `FakeStorageBackend`, every test under 100 ms.
+- `README.md` — Daily usage cheatsheet entry pointing at `claude-mirror verify`.
+- `docs/cli-reference.md` — top-level command list grows the line; new `### verify` subsection with the phase table, a sample table-mode report, the JSON envelope spec, and the exit-code contract.
+- `docs/admin.md` — new "End-to-end integrity audit" subsection under Snapshots and disaster recovery, cross-linking `claude-mirror health` (liveness) and `claude-mirror verify` (correctness) as the proactive monitoring pair.
+
+### Tests
+- `pytest tests/` — **1129 passed, 3 skipped** on macOS (1101 baseline + 28 new).
+- `mypy --strict claude_mirror/` — clean across 42 source files.
+
 ---
 
 ## [0.5.62] — 2026-05-09

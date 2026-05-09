@@ -72,6 +72,7 @@ claude-mirror prune             [--keep-last N] [--keep-daily N] [--keep-monthly
 claude-mirror gc                [--backend NAME] [--delete] [--yes] [--config PATH]   # dry-run by default; --delete to actually delete; --backend targets a specific mirror (Tier 2)
 claude-mirror doctor            [--backend NAME] [--config PATH]   # end-to-end self-test: config + credentials + connectivity + project + manifest (+ deep checks under --backend googledrive or --backend dropbox)
 claude-mirror health            [--no-backends] [--timeout N] [--json] [--config PATH]   # machine-readable monitoring probe; exit 0 ok / 1 warn / 2 fail
+claude-mirror verify            [--backend NAME] [--snapshots/--no-snapshots] [--files/--no-files] [--mount-cache/--no-mount-cache] [--strict] [--json] [--config PATH]   # end-to-end integrity audit: manifest-vs-remote + snapshot blobs + mount cache
 claude-mirror migrate-snapshots --to {blobs|full} [--dry-run] [--keep-source] [--no-update-config] [--config PATH]
 claude-mirror log               [--limit N] [--config PATH]
 claude-mirror stats             [--since DATE/DURATION] [--until DATE/DURATION] [--by backend|user|machine|action|day] [--top N] [--json] [--config PATH]
@@ -920,6 +921,100 @@ Sample one-liner for cron — fire a notification on any non-zero exit so monito
 
 ```cron
 */1 * * * * /usr/local/bin/claude-mirror health --json --no-backends || /usr/local/bin/notify-monitor
+```
+
+### `verify`
+
+End-to-end integrity audit. Sibling of `health`: where health asks "is the system live and reachable?", verify asks "does claude-mirror's recorded view of reality match what's actually on every backend and in the local mount cache?" Inspired by `restic check` and `rclone check`, useful as a daily cron job to catch drift / corruption proactively. See [admin.md#end-to-end-integrity-audit](admin.md#end-to-end-integrity-audit) for the broader monitoring story.
+
+Three independent verification phases run in sequence:
+
+| Phase | What it verifies | Hash algorithm |
+|---|---|---|
+| `manifest_vs_remote` | For each entry in `.claude_mirror_manifest.json`, ask each configured backend (primary + every Tier 2 mirror) for the recorded `synced_remote_hash` and compare against the manifest. Drift = backend hash differs. Missing = backend has no record of the file ID. | Per-backend native: Drive `md5Checksum`, Dropbox `content_hash`, OneDrive `quickXorHash`, WebDAV ETag / `oc:checksums`, SFTP `sha256` |
+| `snapshot_blobs` | Walk every `_claude_mirror_blobs/<hh>/<hash>` blob on each backend, fetch the bytes, recompute sha256, and compare with the filename. Mismatch = corrupted (the content-addressing contract is broken). | sha256 |
+| `mount_blob_cache` | Walk the on-disk content-addressed cache populated by `claude-mirror mount` (see [`mount`](#mount)). Re-hash every entry; corrupted entries are surfaced so the user can evict and refetch on the next mount. | sha256 |
+
+#### Flags
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--config PATH` | auto-detect from cwd | Point at a specific config YAML. |
+| `--backend NAME` | (all) | Tier 2: restrict the manifest + snapshot phases to one backend. The mount-cache phase ignores `--backend` (it's content-addressed, not per-backend). |
+| `--snapshots/--no-snapshots` | `--snapshots` | Include or skip the snapshot-blob integrity check. |
+| `--files/--no-files` | `--files` | Include or skip the manifest-vs-remote file hash check. |
+| `--mount-cache/--no-mount-cache` | `--mount-cache` | Include or skip the mount BlobCache integrity check. |
+| `--strict` | false | Exit `1` if ANY drift / missing / corrupted entry is found. Default exits `0` + report (informational). |
+| `--json` | false | Emit a JSON envelope to stdout (schema v1) instead of the Rich table. Stdout is JSON-only; every banner / progress / colour is suppressed so the output is parseable by `jq`, monitoring tools, and structured-log consumers. |
+
+#### Exit codes
+
+| Exit code | Meaning |
+|---|---|
+| `0` | No findings, OR findings present without `--strict`. |
+| `1` | `--strict` set AND at least one drift / missing / corrupted entry. |
+
+#### Sample report (default Rich table)
+
+```
+claude-mirror verify — primary (googledrive) + 2 mirrors
+
+Integrity verification
+┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━┓
+┃ Phase                ┃ Checked ┃ Verified ┃ Drift ┃ Missing ┃ Corrupted ┃
+┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━┩
+│ manifest vs remote   │    1245 │     1244 │     1 │       0 │         0 │
+│ snapshot blobs       │     387 │      387 │     0 │       0 │         0 │
+│ mount blob cache     │      93 │       92 │     0 │       0 │         1 │
+└──────────────────────┴─────────┴──────────┴───────┴─────────┴───────────┘
+
+Drift detected:
+  - docs/notes.md: manifest expects 'abc123…', remote returns 'def456…' (googledrive)
+
+Corrupted entries detected:
+  - mount_cache 7a/7a3b9d… — bytes hash to 8c4e21…, expected 7a3b9d…
+```
+
+#### JSON envelope (schema v1)
+
+```json
+{
+  "version": 1,
+  "command": "verify",
+  "result": {
+    "checked_at": "2026-05-09T20:00:00+00:00",
+    "phases": [
+      {"name": "manifest_vs_remote", "checked": 1245, "verified": 1244, "drift": 1, "missing": 0, "corrupted": 0},
+      {"name": "snapshot_blobs",     "checked":  387, "verified":  387, "drift": 0, "missing": 0, "corrupted": 0},
+      {"name": "mount_blob_cache",   "checked":   93, "verified":   92, "drift": 0, "missing": 0, "corrupted": 1}
+    ],
+    "drift": [
+      {"path": "docs/notes.md", "backend": "googledrive", "expected": "abc123", "actual": "def456"}
+    ],
+    "corrupted": [
+      {"layer": "mount_cache", "key": "7a/7a3b9d...", "detail": "bytes hash to 8c4e21..., expected 7a3b9d..."}
+    ],
+    "missing": []
+  }
+}
+```
+
+The envelope is the same `{version, command, result}` shape as the rest of the read-only `--json` family. Schema bumps stay additive on v1.
+
+#### Examples
+
+```bash
+claude-mirror verify
+claude-mirror verify --strict
+claude-mirror verify --json
+claude-mirror verify --backend dropbox --no-mount-cache
+claude-mirror verify --no-files --no-snapshots --no-mount-cache
+```
+
+Daily cron alongside `health` for proactive drift detection — `--strict` makes a non-zero exit a real alert:
+
+```cron
+0 3 * * * /usr/local/bin/claude-mirror verify --strict --json || /usr/local/bin/notify-monitor
 ```
 
 ### `find-config`

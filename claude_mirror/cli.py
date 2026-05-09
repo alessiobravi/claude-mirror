@@ -365,6 +365,11 @@ _NO_WATCHER_CHECK_CMDS = {
     # the JSON document (`--json` mode) or duplicate the structured
     # row (table mode).
     "health",
+    # `verify` is the end-to-end integrity audit. Same rationale as
+    # `health` — `--json` mode reserves stdout for the v1 envelope and
+    # the table mode prints its own progress + report; a watcher banner
+    # ahead of either would corrupt the JSON or duplicate noise.
+    "verify",
     # `prune` and `diff` are read-mostly housekeeping — the watcher hint
     # is unrelated and just adds noise to the rendered output.
     "prune", "diff",
@@ -11420,6 +11425,288 @@ def _render_health_table(report: Any) -> None:
     console.print(
         f"\nOverall: [{overall_style} bold]{report.overall.upper()}[/]"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# VERIFY — end-to-end integrity audit (VERIFY)
+#
+# `claude-mirror verify` cross-checks claude-mirror's view of reality
+# against reality itself, in three independent phases:
+#
+#   1. manifest_vs_remote — for each file in the manifest, ask each
+#      configured backend (primary + Tier 2 mirrors) for the recorded
+#      remote hash and compare it against the manifest's
+#      `synced_remote_hash`. Drift / missing / corrupted are surfaced
+#      separately so the user can route fixes.
+#   2. snapshot_blobs — re-hash each `_claude_mirror_blobs/<hh>/<hash>`
+#      blob on every backend; mismatches mean content-addressing is
+#      broken on that backend (bit-rot, partial upload, tampering).
+#   3. mount_blob_cache — re-hash every entry in the v0.5.62 mount
+#      BlobCache so corrupted disk entries can be evicted before the
+#      next mount serves bad bytes.
+#
+# Inspired by `restic check` / `rclone check`. Pairs with
+# `claude-mirror health` (health = liveness; verify = correctness).
+# `--strict` flips the exit code from 0 to 1 when any drift / missing
+# / corrupted entry is found, which is the contract a daily cron uses
+# to alert on integrity regressions.
+# ──────────────────────────────────────────────────────────────────────────
+@cli.command()
+@click.option("--config", "config_path", default="",
+              help="Config file path. Auto-detected from cwd if omitted.")
+@click.option("--backend", "backend_filter", default="", metavar="NAME",
+              help=(
+                  "Restrict verification to a single backend by name "
+                  "(`googledrive`, `dropbox`, `onedrive`, `webdav`, `sftp`, "
+                  "or any Tier 2 mirror name). When omitted, primary + "
+                  "every configured mirror are verified."
+              ),
+              shell_complete=_backend_value_completer)
+@click.option("--snapshots/--no-snapshots", "include_snapshots",
+              default=True, show_default=True,
+              help="Include the snapshot-blob integrity check phase.")
+@click.option("--files/--no-files", "include_files",
+              default=True, show_default=True,
+              help="Include the manifest-vs-remote file hash check phase.")
+@click.option("--mount-cache/--no-mount-cache", "include_mount_cache",
+              default=True, show_default=True,
+              help=(
+                  "Include the mount BlobCache integrity check phase. "
+                  "Walks the on-disk content-addressed cache populated "
+                  "by `claude-mirror mount` and re-hashes each entry."
+              ))
+@click.option("--strict", "strict", is_flag=True, default=False,
+              help=(
+                  "Exit non-zero if ANY drift, missing, or corrupted "
+                  "entry is found. Default is exit 0 + report; `--strict` "
+                  "is for cron / monitoring callers that want a hard "
+                  "failure signal on integrity regressions."
+              ))
+@click.option("--json", "json_output", is_flag=True, default=False,
+              help=(
+                  "Emit a single JSON envelope to stdout (schema v1) "
+                  "instead of the human-readable table. Stdout-only; "
+                  "every banner / progress / colour is suppressed so "
+                  "the output is parseable by `jq`, monitoring tools, "
+                  "and structured-log consumers."
+              ))
+@click.pass_context
+def verify(
+    ctx: click.Context,
+    config_path: str,
+    backend_filter: str,
+    include_snapshots: bool,
+    include_files: bool,
+    include_mount_cache: bool,
+    strict: bool,
+    json_output: bool,
+) -> None:
+    """End-to-end integrity audit (VERIFY).
+
+    Runs three independent verification phases and reports drift,
+    missing entries, and corrupted blobs across them:
+
+    \b
+      1. manifest_vs_remote  — manifest's `synced_remote_hash` vs each
+                                backend's current `get_file_hash()` reply
+      2. snapshot_blobs       — re-hash every `_claude_mirror_blobs/<hh>/
+                                <hash>` blob on each backend
+      3. mount_blob_cache     — re-hash every cached blob in the local
+                                mount cache (`~/.cache/claude-mirror/blobs`)
+
+    \b
+    Flags:
+      --backend NAME          Tier 2: restrict to one mirror (default: all)
+      --no-files              Skip the manifest_vs_remote phase
+      --no-snapshots          Skip the snapshot_blobs phase
+      --no-mount-cache        Skip the mount_blob_cache phase
+      --strict                Exit 1 on any drift / missing / corrupted
+      --json                  Emit a v1 JSON envelope to stdout
+
+    \b
+    Exit codes:
+      0  no findings, OR findings present without `--strict`
+      1  `--strict` set AND at least one finding present
+
+    \b
+    Examples:
+      claude-mirror verify
+      claude-mirror verify --json
+      claude-mirror verify --strict
+      claude-mirror verify --backend dropbox --no-mount-cache
+      claude-mirror verify --no-snapshots --no-files --no-mount-cache
+    """
+    from ._verify import collect_verify
+    from ._mount import default_cache_root
+
+    cfg_path = _resolve_config(config_path)
+    backend_name = backend_filter.strip() or None
+
+    def _build_inputs() -> tuple[
+        Config,
+        tuple[StorageBackend, list[StorageBackend]],
+        Optional[SnapshotManager],
+        Optional[Path],
+    ]:
+        config = Config.load(cfg_path)
+        storage_set = _create_storage_set(config)
+        snap_mgr: Optional[SnapshotManager] = None
+        if include_snapshots:
+            primary, mirrors = storage_set
+            snap_mgr = SnapshotManager(config, primary, mirrors=mirrors)
+        cache_dir: Optional[Path] = (
+            default_cache_root() if include_mount_cache else None
+        )
+        return config, storage_set, snap_mgr, cache_dir
+
+    if json_output:
+        try:
+            with _JsonMode():
+                config, storage_set, snap_mgr, cache_dir = _build_inputs()
+                report = collect_verify(
+                    config,
+                    storage_set,
+                    snapshot_manager=snap_mgr,
+                    blob_cache_dir=cache_dir,
+                    include_files=include_files,
+                    include_snapshots=include_snapshots,
+                    include_mount_cache=include_mount_cache,
+                    backend_filter=backend_name,
+                )
+            _emit_json_success("verify", report.to_dict())
+            sys.exit(_exit_code_for_verify(report.has_findings(), strict))
+        except SystemExit:
+            raise
+        except BaseException as e:  # noqa: BLE001 - integrity probe never crashes
+            _emit_json_error("verify", e)
+
+    config, storage_set, snap_mgr, cache_dir = _build_inputs()
+    primary, mirrors = storage_set
+    primary_label = getattr(primary, "backend_name", "") or config.backend
+    mirror_count = len(mirrors)
+    if backend_name:
+        scope_line = f"scoped to backend [bold]{backend_name}[/]"
+    elif mirror_count:
+        scope_line = (
+            f"primary ([bold]{primary_label}[/]) + {mirror_count} mirror"
+            f"{'s' if mirror_count != 1 else ''}"
+        )
+    else:
+        scope_line = f"primary ([bold]{primary_label}[/])"
+    console.print(f"[bold]claude-mirror verify[/] — {scope_line}\n")
+
+    from ._progress import make_phase_progress
+    with make_phase_progress(console) as progress:
+        task = progress.add_task(
+            "Verify", total=None, detail="running phases…", show_time=True,
+        )
+
+        def _on_progress(
+            phase: str, checked: int, total: Optional[int],
+        ) -> None:
+            label = phase.replace("_", " ")
+            if total:
+                progress.update(task, detail=f"{label}: {checked}/{total}")
+            else:
+                progress.update(task, detail=f"{label}: {checked}")
+
+        report = collect_verify(
+            config,
+            storage_set,
+            snapshot_manager=snap_mgr,
+            blob_cache_dir=cache_dir,
+            include_files=include_files,
+            include_snapshots=include_snapshots,
+            include_mount_cache=include_mount_cache,
+            backend_filter=backend_name,
+            on_progress=_on_progress,
+        )
+        progress.update(task, detail="completed")
+
+    _render_verify_report(report)
+    sys.exit(_exit_code_for_verify(report.has_findings(), strict))
+
+
+def _exit_code_for_verify(has_findings: bool, strict: bool) -> int:
+    """Translate (has_findings, strict) into the documented exit code.
+
+    Default mode (no `--strict`) always exits 0 — verify is informational
+    by default. `--strict` flips drift / missing / corrupted to a hard 1
+    so cron + monitoring integrations can alert on regressions.
+    """
+    if strict and has_findings:
+        return 1
+    return 0
+
+
+def _render_verify_report(report: Any) -> None:
+    """Render a VerifyReport: per-phase counts table + drift / corrupted /
+    missing detail lists. Empty lists are simply omitted, not printed as
+    empty sections."""
+    if not report.phases:
+        console.print(
+            "[dim]No phases enabled — pass --files / --snapshots / "
+            "--mount-cache to enable a check.[/]"
+        )
+        return
+    if all(p.checked == 0 for p in report.phases):
+        console.print("[dim]No files to verify.[/]")
+        return
+
+    table = Table(
+        title="Integrity verification", show_header=True, header_style="bold",
+    )
+    table.add_column("Phase", style="bold")
+    table.add_column("Checked", justify="right")
+    table.add_column("Verified", justify="right")
+    table.add_column("Drift", justify="right")
+    table.add_column("Missing", justify="right")
+    table.add_column("Corrupted", justify="right")
+    for phase in report.phases:
+        table.add_row(
+            phase.name.replace("_", " "),
+            str(phase.checked),
+            str(phase.verified),
+            _styled_count(phase.drift, "yellow"),
+            _styled_count(phase.missing, "yellow"),
+            _styled_count(phase.corrupted, "red"),
+        )
+    console.print(table)
+
+    if report.drift:
+        console.print("\n[bold yellow]Drift detected:[/]")
+        for entry in report.drift:
+            console.print(
+                f"  - [bold]{entry.path}[/]: manifest expects "
+                f"{entry.expected!r}, remote returns {entry.actual!r} "
+                f"([dim]{entry.backend}[/])"
+            )
+    if report.missing:
+        console.print("\n[bold yellow]Missing entries:[/]")
+        for entry in report.missing:
+            console.print(
+                f"  - [bold]{entry.path}[/] not found on "
+                f"[dim]{entry.backend}[/] (expected {entry.expected!r})"
+            )
+    if report.corrupted:
+        console.print("\n[bold red]Corrupted entries detected:[/]")
+        for entry in report.corrupted:
+            suffix = f" — {entry.detail}" if entry.detail else ""
+            console.print(
+                f"  - [bold]{entry.layer}[/] {entry.key}{suffix}"
+            )
+
+    if not report.has_findings():
+        console.print("\n[green]No integrity issues found.[/]")
+
+
+def _styled_count(value: int, attention_style: str) -> str:
+    """Render a count cell with a style only when it is nonzero. Zero
+    rows stay visually quiet so the user's eye lands on the non-zero
+    rows that need attention."""
+    if value == 0:
+        return "0"
+    return f"[{attention_style}]{value}[/]"
 
 
 # ──────────────────────────────────────────────────────────────────────────

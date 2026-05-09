@@ -65,9 +65,12 @@ Decision tree:
 - **Team collaboration on Google Drive infrastructure (most teams)** → **Google Drive**. Best latency (sub-second Pub/Sub), best multi-user story. Costs an hour of GCP project setup the first time.
 - **Microsoft 365 / Office shop** → **OneDrive**. Same multi-user story as Drive at slightly higher latency (polling, not push).
 - **Self-hosted Nextcloud / OwnCloud / Synology / QNAP / Apache mod_dav** → **WebDAV**. Works against anything that speaks WebDAV.
+- **Object-storage / pay-per-byte (Cloudflare R2, Backblaze B2, MinIO, AWS S3, Wasabi, Storj)** → **S3-compatible**. Single backend transparently supports every S3-API provider via the `s3_endpoint_url` config. boto3's default credential chain works for IAM-role machines.
+- **Already have a NAS or Windows file share you mount via SMB** → **SMB/CIFS**. Synology, QNAP, TrueNAS, macOS Sharing, generic Samba — SMB2/3 only with optional per-message AES encryption.
+- **Stuck on legacy shared hosting (cPanel / DirectAdmin) with no SFTP** → **FTP / FTPS**. Stdlib-only, no extra dependencies; use `ftp_tls: explicit` (FTPS) wherever the server supports it.
 - **Belt-and-braces (paranoid about any one provider)** → **Tier 2 mirroring**: pick any primary, mirror to one or more others.
 
-**See also:** [docs/scenarios.md](scenarios.md) for full topology walkthroughs (A through H).
+**See also:** [docs/scenarios.md](scenarios.md) for full topology walkthroughs (A through J, E omitted).
 
 ### Do I need a GCP project for Google Drive?
 
@@ -256,7 +259,7 @@ Both layers must vote "keep" for a file to sync. The `.claude_mirror_ignore` fil
 
 Two complementary patterns:
 
-- **Real-time (preferred)** — `claude-mirror watch-all` running as a launchd / systemd service, started by `claude-mirror-install`. Sub-second latency on Drive (Pub/Sub), seconds on Dropbox (long-poll), `poll_interval` (default 30s) on OneDrive / WebDAV / SFTP.
+- **Real-time (preferred)** — `claude-mirror watch-all` running as a launchd / systemd service, started by `claude-mirror-install`. Sub-second latency on Drive (Pub/Sub), seconds on Dropbox (long-poll), `poll_interval` (default 30s) on OneDrive / WebDAV / SFTP / FTP / S3 / SMB.
 
 - **Scheduled (belt-and-braces)** — cron with `--no-prompt --strategy`. Sample crontab:
 
@@ -455,7 +458,7 @@ Three layers to check, top-down:
 
 1. **Is the watcher running?** `pgrep -fl claude-mirror` should list at least one watch process. If not, `claude-mirror watch-all` (or restart the launchd / systemd service via `claude-mirror-install`).
 
-2. **Is the per-backend channel healthy?** `claude-mirror doctor --backend NAME` runs deep, backend-specific checks for every backend — Drive (Pub/Sub topic + subscription + IAM grant), Dropbox (token shape + scopes + folder access), OneDrive (token cache + Azure GUID + scopes), WebDAV (PROPFIND + DAV class), SFTP (host fingerprint + key perms + auth), S3 (bucket reachable + list + write permissions + region consistency).
+2. **Is the per-backend channel healthy?** `claude-mirror doctor --backend NAME` runs deep, backend-specific checks for every backend — Drive (Pub/Sub topic + subscription + IAM grant), Dropbox (token shape + scopes + folder access), OneDrive (token cache + Azure GUID + scopes), WebDAV (PROPFIND + DAV class), SFTP (host fingerprint + key perms + auth), FTP (host reachable + TLS handshake + auth + folder write), S3 (bucket reachable + list + write permissions + region consistency), SMB (SMB2/3 negotiation + auth + share access + folder write).
 
 3. **(Drive) Is the IAM grant present?** This is the single most common silent failure — about 70% of self-serve Drive setups miss it. The deep `doctor` check reports it explicitly; `claude-mirror init --auto-pubsub-setup --config <path>` adds it idempotently.
 
@@ -492,7 +495,7 @@ A few realistic causes, in descending order of likelihood:
 max_upload_kbps: 500   # cap at 500 KB/s (~4 Mbps)
 ```
 
-Token-bucket implementation, integrated across all 5 backends (since v0.5.45). In Tier 2 setups each mirror has its own field — throttle Drive but not SFTP, or vice versa.
+Token-bucket implementation, integrated across all eight backends (since v0.5.45). In Tier 2 setups each mirror has its own field — throttle Drive but not SFTP, or vice versa.
 
 **See also:** [docs/admin.md — Bandwidth throttling: `max_upload_kbps`](admin.md#bandwidth-throttling-max_upload_kbps).
 

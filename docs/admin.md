@@ -466,7 +466,7 @@ When to set it:
 Seeding         ━━━━━━━━━━━━━━━━━━━━━━━╸━━━━━━━━  31.4/50.0 MB  •  4.2 MB/s  •  0:00:07  •  0:00:04 remaining
 ```
 
-The bar is sized once at the start of the phase by summing local file sizes (for upload) or remote file sizes (for download). Each backend's `upload_file` / `download_file` accepts an optional `progress_callback: Callable[[int], None]` that the engine wires to the bar; the callback is invoked with bytes-since-the-last-call deltas as each chunk completes. All five backends ship a per-chunk hook on the streaming/chunked paths, plus a single final emission for single-shot uploads (Dropbox `files_upload`, the simple PUT path on OneDrive / WebDAV).
+The bar is sized once at the start of the phase by summing local file sizes (for upload) or remote file sizes (for download). Each backend's `upload_file` / `download_file` accepts an optional `progress_callback: Callable[[int], None]` that the engine wires to the bar; the callback is invoked with bytes-since-the-last-call deltas as each chunk completes. Every backend ships a per-chunk hook on the streaming/chunked paths, plus a single final emission for single-shot uploads (Dropbox `files_upload`, the simple PUT path on OneDrive / WebDAV).
 
 When does it show up:
 
@@ -1460,8 +1460,7 @@ The implementation runs the following checks in order. Every per-backend check r
 | Check | Backends | Failure looks like |
 |---|---|---|
 | OAuth credentials file referenced by `credentials_file` exists on disk | googledrive, dropbox, onedrive | `credentials file missing: PATH` — fix is to re-download `credentials.json` from the provider's developer console |
-| Credentials check skipped (inline in YAML or default chain) | webdav, sftp, s3 | info-only line, never a failure |
-| Credentials check skipped (inline in YAML) | webdav, sftp, smb | info-only line, never a failure |
+| Credentials check skipped (inline in YAML or default chain) | webdav, sftp, ftp, s3, smb | info-only line, never a failure |
 
 #### Tokens / inline auth material
 
@@ -1855,12 +1854,11 @@ claude-mirror doctor --backend googledrive                        # generic chec
 claude-mirror doctor --backend onedrive                           # generic checks PLUS OneDrive deep checks (token cache, client_id, scopes, refresh, Graph drive-item probe)
 ```
 
-The `--backend` filter is case-insensitive and accepts `googledrive`, `dropbox`, `onedrive`, `webdav`, `sftp`, or `ftp`. The primary config is always parsed; only the per-backend loop is filtered. Skipped backends print a dim `── skipped: NAME (PATH) — does not match --backend FILTER` line so the output stays self-explanatory.
-The `--backend` filter is case-insensitive and accepts `googledrive`, `dropbox`, `onedrive`, `webdav`, `sftp`, or `smb`. The primary config is always parsed; only the per-backend loop is filtered. Skipped backends print a dim `── skipped: NAME (PATH) — does not match --backend FILTER` line so the output stays self-explanatory.
+The `--backend` filter is case-insensitive and accepts `googledrive`, `dropbox`, `onedrive`, `webdav`, `sftp`, `ftp`, `s3`, or `smb`. The primary config is always parsed; only the per-backend loop is filtered. Skipped backends print a dim `── skipped: NAME (PATH) — does not match --backend FILTER` line so the output stays self-explanatory.
 
 ### Where to go next
 
-- Credentials issues (missing `credentials.json`, OAuth client setup) — see the backend setup pages: [backends/google-drive.md](backends/google-drive.md), [backends/dropbox.md](backends/dropbox.md), [backends/onedrive.md](backends/onedrive.md), [backends/webdav.md](backends/webdav.md), [backends/sftp.md](backends/sftp.md), [backends/smb.md](backends/smb.md).
+- Credentials issues (missing `credentials.json`, OAuth client setup) — see the backend setup pages: [backends/google-drive.md](backends/google-drive.md), [backends/dropbox.md](backends/dropbox.md), [backends/onedrive.md](backends/onedrive.md), [backends/webdav.md](backends/webdav.md), [backends/sftp.md](backends/sftp.md), [backends/ftp.md](backends/ftp.md), [backends/s3.md](backends/s3.md), [backends/smb.md](backends/smb.md).
 - Manifest corruption or surprising sync state — see [conflict-resolution.md](conflict-resolution.md) for how the manifest interacts with the conflict-detection flow.
 - Full flag list — [cli-reference.md#doctor](cli-reference.md#doctor).
 
@@ -1879,3 +1877,5 @@ The `--backend` filter is case-insensitive and accepts `googledrive`, `dropbox`,
   - [backends/webdav.md](backends/webdav.md)
   - [backends/sftp.md](backends/sftp.md)
   - [backends/ftp.md](backends/ftp.md)
+  - [backends/s3.md](backends/s3.md)
+  - [backends/smb.md](backends/smb.md)

@@ -37,7 +37,7 @@ If you sometimes work from a second machine, jump to [Scenario B](#b-personal-mu
 
 ### How to implement
 
-Backend choice: **any backend works**. Pick whichever you already have credentials for. Google Drive and Dropbox are the lowest-friction (consumer accounts, free tier, no infrastructure). SFTP/WebDAV are the right choice if you already operate a NAS or VPS — see [`docs/backends/sftp.md`](./backends/sftp.md) and [`docs/backends/webdav.md`](./backends/webdav.md).
+Backend choice: **any backend works**. Pick whichever you already have credentials for. Google Drive and Dropbox are the lowest-friction (consumer accounts, free tier, no infrastructure). SFTP/WebDAV are the right choice if you already operate a NAS or VPS — see [`docs/backends/sftp.md`](./backends/sftp.md) and [`docs/backends/webdav.md`](./backends/webdav.md). If you already mount a NAS share via SMB, use [`docs/backends/smb.md`](./backends/smb.md). If you already pay for object storage (Cloudflare R2, Backblaze B2, AWS S3, MinIO, Wasabi, Storj, …), use [`docs/backends/s3.md`](./backends/s3.md). If your shared hosting is FTP-only (cPanel / DirectAdmin), use [`docs/backends/ftp.md`](./backends/ftp.md).
 
 A complete config for a single Dropbox-backed project:
 

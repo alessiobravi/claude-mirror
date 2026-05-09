@@ -2,7 +2,7 @@
 
 # Credentials profiles
 
-A *profile* is a YAML file under `~/.config/claude_mirror/profiles/<name>.yaml` that bundles the credential-bearing fields for one logical "account" — a Google account, a Dropbox app, an Azure AD app, a WebDAV server, or an SFTP host. Project YAMLs reference a profile by name (`profile: work` at the top, or the global `--profile work` flag) and inherit the credential fields from it instead of duplicating `credentials_file` / `token_file` / `dropbox_app_key` / `onedrive_client_id` / WebDAV creds / SFTP host info across every project YAML.
+A *profile* is a YAML file under `~/.config/claude_mirror/profiles/<name>.yaml` that bundles the credential-bearing fields for one logical "account" — a Google account, a Dropbox app, an Azure AD app, a WebDAV server, an SFTP host, an FTP server, an S3 bucket / endpoint, or an SMB share. Project YAMLs reference a profile by name (`profile: work` at the top, or the global `--profile work` flag) and inherit the credential fields from it instead of duplicating `credentials_file` / `token_file` / `dropbox_app_key` / `onedrive_client_id` / WebDAV / SFTP / FTP / S3 / SMB credentials across every project YAML.
 
 Profiles are an optional convenience. A user with a single project never needs them. A user with five projects on the same Google account, or one work account + one personal account on the same laptop, gets a much simpler config tree by collapsing the duplicated fields into one place.
 
@@ -174,6 +174,53 @@ description: "VPS SFTP storage"
 ```
 
 `sftp_folder` belongs on the project YAML.
+
+### FTP / FTPS
+
+```yaml
+# ~/.config/claude_mirror/profiles/cpanel.yaml
+backend: ftp
+ftp_host: ftp.example.com
+ftp_port: 21
+ftp_username: alice
+ftp_password: <chmod 0600>
+ftp_tls_mode: explicit   # plain | explicit | implicit
+ftp_passive: true
+description: "Shared-hosting FTPS account"
+```
+
+`ftp_folder` belongs on the project YAML.
+
+### S3-compatible
+
+```yaml
+# ~/.config/claude_mirror/profiles/r2.yaml
+backend: s3
+s3_endpoint_url: https://<account>.r2.cloudflarestorage.com   # blank for AWS
+s3_region: auto                                                # us-east-1 for AWS proper
+s3_access_key_id: AKIA...                                      # or blank to use boto3's default credential chain
+s3_secret_access_key: <secret>                                 # or blank
+s3_use_path_style: false                                       # true for MinIO
+description: "Cloudflare R2 account"
+```
+
+`s3_bucket` and `s3_prefix` belong on the project YAML — one R2 account commonly hosts many buckets.
+
+### SMB / CIFS
+
+```yaml
+# ~/.config/claude_mirror/profiles/synology.yaml
+backend: smb
+smb_server: nas.local
+smb_port: 445
+smb_username: alice
+smb_password: <chmod 0600>
+smb_domain: ""           # AD / NTLM domain; blank for workgroup auth
+smb_encryption: true     # SMB3 per-message encryption
+description: "Synology NAS"
+```
+
+`smb_share` and `smb_folder` belong on the project YAML — one NAS commonly hosts many shares.
 
 ## Subcommand reference
 

@@ -127,9 +127,11 @@ Plus the cleartext-mode advisory when `ftp_tls=off` and the configured host is n
 
 ## See also
 
+- [Documentation index](../README.md) — back to the docs sidebar.
 - [Scenario A — Standalone](../scenarios.md#a-standalone-mirror) for end-to-end usage patterns with this backend.
 - [admin.md](../admin.md) for snapshots, retention policies, and the watcher daemon.
 - [admin.md#ftp-deep-checks](../admin.md#ftp-deep-checks) for the full doctor deep-check matrix.
 - [conflict-resolution.md](../conflict-resolution.md) for handling `sync` conflicts.
 - [cli-reference.md](../cli-reference.md) for the full command list.
 - [backends/sftp.md](sftp.md) — strongly preferred over FTP wherever both are available.
+- [backends/s3.md](s3.md), [backends/smb.md](smb.md) — alternative non-cloud-native backends added in v0.5.65.

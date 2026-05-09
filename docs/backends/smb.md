@@ -156,9 +156,11 @@ SMB deep checks
 
 ## See also
 
+- [Documentation index](../README.md) — back to the docs sidebar.
 - [Scenario A — Standalone](../scenarios.md#a-standalone-mirror) for end-to-end usage patterns with this backend.
 - [admin.md](../admin.md) for snapshots, retention policies, and the watcher daemon.
 - [admin.md#smb-deep-checks](../admin.md#smb-deep-checks) for the full doctor deep-check matrix.
 - [conflict-resolution.md](../conflict-resolution.md) for handling `sync` conflicts.
 - [cli-reference.md](../cli-reference.md) for the full command list.
+- [backends/s3.md](s3.md) — sister v0.5.65 backend (object storage).
 - [backends/sftp.md](sftp.md) — SFTP is the closest peer (path-as-id, inline creds, polling watcher).

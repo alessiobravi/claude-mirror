@@ -33,7 +33,7 @@ skills/               ← Claude Code skill source (installed via `claude-mirror
 ## Test conventions
 
 - **No real network calls.** Every test must run offline. Use `fake_backend` (in-memory) or the `responses` library to stub HTTP at the transport layer.
-- **No real cloud accounts.** Use `mock_oauth_google` / `mock_oauth_dropbox` / `mock_oauth_msal` / `mock_oauth_webdav` fixtures from `conftest.py` for auth-flow tests.
+- **No real cloud accounts.** Use `mock_oauth_google` / `mock_oauth_dropbox` / `mock_oauth_msal` / `mock_oauth_webdav` fixtures, plus the in-memory `FakeS3` and `FakeShare` mocks for S3 and SMB, and the SFTP / FTP fixtures from `conftest.py` for auth-flow and backend tests.
 - **No `~/.config/claude_mirror/` writes.** Every test uses `tmp_path` via the `make_config` factory fixture, which builds a `Config` pointing at temp dirs.
 - **Tests should be fast.** The full suite runs in well under a second today; keep that property. If you need a slow test, mark it with `@pytest.mark.slow` so it can be filtered out.
 - **Warnings are errors.** `pyproject.toml` sets `filterwarnings = "error"` — a `DeprecationWarning` from upstream usually means a future-version breakage to flag. If a specific warning is genuinely unactionable, add it to the `pyproject.toml` filter list with a comment explaining why.
@@ -45,7 +45,7 @@ Run `mypy --strict claude_mirror/` before submitting a PR. CI runs the same chec
 ```bash
 pip install mypy
 mypy --strict claude_mirror/
-# expected: Success: no issues found in 36 source files
+# expected: Success: no issues found in N source files (N grows over time as backends and helpers are added)
 ```
 
 New code must keep the strict-mode pass — every function signature must be fully typed (`def fn(arg: str) -> bool:`), every container annotation must carry generic parameters (`dict[str, Any]`, never bare `dict`), and `Optional[X]` must be explicit (no implicit-`None` defaults).

@@ -13,6 +13,8 @@ Per-backend setup, config fields, and troubleshooting:
 - [OneDrive](backends/onedrive.md) — Azure AD app, device-code login
 - [WebDAV](backends/webdav.md) — Nextcloud / OwnCloud / NAS / Apache mod_dav
 - [SFTP](backends/sftp.md) — SSH keys, host fingerprints, OpenSSH
+- [FTP / FTPS](backends/ftp.md) — cPanel / DirectAdmin / NAS / shared hosting; FTPS modes (explicit / implicit), passive mode
+- [S3-compatible](backends/s3.md) — AWS S3, Cloudflare R2, Backblaze B2, Wasabi, MinIO, Tigris, IDrive E2, Linode Object Storage, DigitalOcean Spaces, Storj, Hetzner Storage Box
 - [SMB/CIFS](backends/smb.md) — Windows file shares, Synology, QNAP, TrueNAS, macOS Sharing
 
 ## Operations and admin
@@ -28,7 +30,7 @@ Per-backend setup, config fields, and troubleshooting:
 
 ## Topology guides
 
-- [scenarios.md](scenarios.md) — seven deployment topologies, end to end:
+- [scenarios.md](scenarios.md) — nine deployment topologies, end to end:
   - **A. Standalone** — local ↔ 1 backend
   - **B. Personal multi-machine** — local ⇄ 1 backend ⇄ local'
   - **C. Multi-user collaboration** — Alice ⇄ shared backend ⇄ Bob
@@ -36,6 +38,8 @@ Per-backend setup, config fields, and troubleshooting:
   - **F. Selective sync** — custom `file_patterns` + exclusions
   - **G. Multi-user + multi-backend (production-realistic)** — shared primary + shared mirror, full Alice/Bob YAMLs
   - **H. Multi-project enterprise** — many configs in `~/.config/claude_mirror/`
+  - **I. Cross-tool AGENTS.md sync** — single `AGENTS.md` shared across Claude Code / Cursor / Codex / Antigravity via the `agents-md` sample profile
+  - **J. Browse / grep / diff snapshots without restoring** — read-only FUSE mount engine with five variants (snapshot / live / per-mirror / all-snapshots-stacked / time-travel)
 
 ## Convention for contributors
 

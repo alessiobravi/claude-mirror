@@ -57,7 +57,7 @@ claude-mirror status --config <config-path>
 
 ## Step 4: Handle remote changes — analyze and merge
 
-When the status shows drive-ahead or conflict files (either discovered via inbox notifications or via status), do **not** pull blindly. Instead, perform a full analysis and merge:
+When the status shows remote-ahead or conflict files (either discovered via inbox notifications or via status), do **not** pull blindly. Instead, perform a full analysis and merge:
 
 ### 4a. Read current local versions
 
@@ -216,18 +216,19 @@ source ~/.zshrc
 To reinstall or inspect the completion script directly:
 
 ```bash
-claude-mirror completion zsh    # emit zsh completion script to stdout
-claude-mirror completion bash   # emit bash completion script to stdout
-claude-mirror completion fish   # emit fish completion script to stdout
+claude-mirror completion zsh         # emit zsh completion script to stdout
+claude-mirror completion bash        # emit bash completion script to stdout
+claude-mirror completion fish        # emit fish completion script to stdout
+claude-mirror completion powershell  # emit PowerShell completion script to stdout
 ```
 
 For users running `claude-mirror` inside Claude Code's own shell snapshot (rather than a real iTerm or Terminal session), tab-completion will not work; the snapshot does not re-source rc files dynamically. Direct the user to test tab-completion in their normal terminal.
 
 ## Error recovery
 
-### Authentication error (`RefreshError` or `Not authenticated`)
+### Authentication error — browser-OAuth backends (Google Drive / Dropbox / OneDrive)
 
-If any command fails with a Google auth error, run:
+If a command on a browser-OAuth backend fails with `RefreshError` or `Not authenticated`, run:
 
 ```bash
 claude-mirror auth --config <config-path>
@@ -235,7 +236,11 @@ claude-mirror auth --config <config-path>
 
 This opens a browser tab on the user's machine for a fresh OAuth login. Once auth completes, retry the original command.
 
-If the user is hitting daily auth expiries, the cause is almost always organisational (Workspace Cloud Session Control reauth interval, GCP project not in the user's Workspace org, or OAuth consent screen still in "Testing" mode). Run `claude-mirror auth --check` to diagnose without re-auth — it inspects the saved token, attempts a refresh, and classifies the failure as either `invalid_grant` (re-auth required) or transient (retry). The README "Authentication expires every day or two (Google Drive)" section has the full checklist; refer the user there rather than guessing.
+If the user is hitting daily auth expiries on Google Drive, the cause is almost always organisational (Workspace Cloud Session Control reauth interval, GCP project not in the user's Workspace org, or OAuth consent screen still in "Testing" mode). Run `claude-mirror auth --check` to diagnose without re-auth — it inspects the saved token, attempts a refresh, and classifies the failure as either `invalid_grant` (re-auth required) or transient (retry). The README "Authentication expires every day or two (Google Drive)" section has the full checklist; refer the user there rather than guessing.
+
+### Authentication error — inline-credential backends (WebDAV / SFTP / FTP / S3 / SMB)
+
+These backends do not have a browser-OAuth flow. An auth failure means the inline credentials in the YAML are wrong (or the host's policy changed). `claude-mirror auth` is a no-op on these backends — fix the YAML field and re-run the original command. Use `claude-mirror doctor --backend NAME --config <config-path>` for diagnosis: it surfaces the specific check that's failing (host fingerprint, server unreachable, bad access key, share permission denied, …) and its fix-hint.
 
 ## Project memory rules
 
@@ -247,13 +252,13 @@ These rules apply whenever the active project has a `memory/` directory or MEMOR
 1. Re-read all changed files
 2. Diff against current memory
 3. Report a clear summary of what changed
-4. Ask for explicit confirmation before writing to memory and pushing to Drive
+4. Ask for explicit confirmation before writing to memory and pushing to remote
 
-**POST-PULL EVALUATION RULE** — When claude-mirror pulls remote changes (inbox notification or status showing drive-ahead files), immediately:
+**POST-PULL EVALUATION RULE** — When claude-mirror pulls remote changes (inbox notification or status showing remote-ahead files), immediately:
 1. Re-read all changed files
 2. Diff against current memory
 3. Produce a structured analysis of what changed and what should be updated in memory (new facts, stale entries, discrepancies across files)
-4. Ask for confirmation before writing to memory or pushing to Drive
+4. Ask for confirmation before writing to memory or pushing to remote
 
 ## Backend recipes
 

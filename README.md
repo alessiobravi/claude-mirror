@@ -14,7 +14,7 @@ Built originally for Claude Code projects (where most context lives in markdown)
 
 - **Multi-cloud redundancy.** Push to multiple backends in parallel (e.g. Google Drive + Dropbox + OneDrive). Any single provider's outage, account suspension, or quota cap never costs you data. Per-mirror retry queues mean a transient failure on one backend never blocks the rest.
 - **Time-travel disaster recovery.** Every push and sync auto-creates a snapshot. `claude-mirror history PATH` shows every version of any file across snapshots; `claude-mirror restore` rolls a single file or the whole project back to any past timestamp. Two storage formats: content-addressed blobs (identical content across snapshots stored once) or full per-snapshot copies.
-- **Near-real-time collaboration.** Pub/Sub (Drive), long-poll (Dropbox), or polling (OneDrive / WebDAV / SFTP) push remote changes to other machines within seconds. Optional per-project Slack webhooks pipe events to a team channel.
+- **Near-real-time collaboration.** Pub/Sub (Drive), long-poll (Dropbox), or polling (OneDrive / WebDAV / SFTP / FTP / S3 / SMB) push remote changes to other machines within seconds. Optional per-project Slack webhooks pipe events to a team channel.
 - **No-loss conflict resolution.** When both sides change a file, interactive choice: keep local, keep remote, open `$EDITOR` for manual merge, or skip. No silent overwrites.
 
 **Supported backends:** Google Drive, Dropbox, Microsoft OneDrive, any WebDAV server (Nextcloud, OwnCloud, Apache mod_dav, Synology/QNAP NAS, Box.com, etc.), any SFTP/SSH-accessible server (VPS, NAS, shared hosting, self-hosted Linux), any S3-compatible object store (AWS S3, Cloudflare R2, Backblaze B2, Wasabi, MinIO, Tigris, IDrive E2, Linode Object Storage, DigitalOcean Spaces, Storj, Hetzner Storage Box, …), any SMB/CIFS share (Windows file shares, Synology / QNAP / TrueNAS NAS devices, macOS Sharing, generic Samba — SMB2/3 only with optional per-message encryption), and FTP / FTPS (legacy shared-hosting providers — cPanel, DirectAdmin, NAS — via Python's stdlib, no new dependency; use FTPS or the SFTP backend wherever possible because plain FTP transmits credentials in cleartext). Each project picks its own primary backend independently — different projects on the same machine can use different backends.
@@ -30,7 +30,7 @@ Built originally for Claude Code projects (where most context lives in markdown)
 - When you push, collaborators are notified in near-real-time:
   - **Google Drive** — Cloud Pub/Sub streaming (sub-second latency)
   - **Dropbox** — `files/list_folder/longpoll` (seconds latency)
-  - **OneDrive / WebDAV / SFTP / S3** — periodic polling (default 30s, configurable)
+  - **OneDrive / WebDAV / SFTP / FTP / S3 / SMB** — periodic polling (default 30s, configurable)
 - Conflicts (both sides changed) are resolved interactively: keep local, keep remote, or open in `$EDITOR` — see [docs/conflict-resolution.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/conflict-resolution.md)
 - A snapshot is saved after every push or sync, enabling point-in-time recovery — see [docs/admin.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md#snapshots-and-disaster-recovery)
 - **Multi-backend mirroring (Tier 2)** — push to multiple backends simultaneously (e.g. Drive + SFTP), with per-backend retry, classified error handling, and snapshot mirroring — see [docs/admin.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md#multi-backend-mirroring-tier-2) and [docs/scenarios.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/scenarios.md#d-multi-backend-redundancy-tier-2)
@@ -40,8 +40,7 @@ Built originally for Claude Code projects (where most context lives in markdown)
 
 ## Supported storage backends
 
-Each backend ships in the base install — `pipx install claude-mirror` enables every backend (now seven, with S3 + FTP added in v0.5.65). Per-backend setup walkthroughs live under [docs/backends/](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/):
-Each backend ships in the base install — `pipx install claude-mirror` enables every one. Per-backend setup walkthroughs live under [docs/backends/](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/):
+Each backend ships in the base install — `pipx install claude-mirror` enables every backend (eight as of v0.5.65, when S3 + SMB joined). Per-backend setup walkthroughs live under [docs/backends/](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/):
 
 | Backend | Latency | Setup | Reference |
 |---|---|---|---|
@@ -128,7 +127,7 @@ You will be prompted to confirm each component before anything is written. To re
 claude-mirror-install --uninstall
 ```
 
-After install, `claude-mirror <TAB>` lists all commands; `claude-mirror init --backend <TAB>` shows the five valid backends. Tab-completion is supported on zsh, bash, fish, and PowerShell — the installer auto-detects your shell from `$SHELL` (or defaults to PowerShell on Windows). To install PowerShell completion manually:
+After install, `claude-mirror <TAB>` lists all commands; `claude-mirror init --backend <TAB>` shows the eight valid backends. Tab-completion is supported on zsh, bash, fish, and PowerShell — the installer auto-detects your shell from `$SHELL` (or defaults to PowerShell on Windows). To install PowerShell completion manually:
 
 ```powershell
 claude-mirror completion powershell | Out-File -Encoding utf8 -Append $PROFILE.CurrentUserAllHosts
@@ -169,7 +168,9 @@ The trimmed README covers install, your first project, daily-usage cheatsheet, n
 - [docs/backends/onedrive.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/onedrive.md) — Azure AD app, device-code login
 - [docs/backends/webdav.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/webdav.md) — Nextcloud / OwnCloud / NAS / Apache mod_dav
 - [docs/backends/sftp.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/sftp.md) — SSH keys, host fingerprints, OpenSSH
-- [docs/backends/s3.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/s3.md) — AWS S3, Cloudflare R2, Backblaze B2, Wasabi, MinIO, Spaces, Storj, Tigris, IDrive E2, Linode, Hetzner
+- [docs/backends/ftp.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/ftp.md) — cPanel / DirectAdmin / NAS, FTPS modes (explicit / implicit), passive mode
+- [docs/backends/s3.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/s3.md) — AWS S3, Cloudflare R2, Backblaze B2, Wasabi, MinIO, Tigris, IDrive E2, Linode Object Storage, DigitalOcean Spaces, Storj, Hetzner Storage Box
+- [docs/backends/smb.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/smb.md) — Windows file shares, Synology / QNAP / TrueNAS NAS, macOS Sharing, generic Samba (SMB2/3 only)
 
 **Operations & admin**:
 - [docs/admin.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md) — snapshots, retention, `gc` / `prune` / `forget`, doctor, watcher service, multi-backend Tier 2 setup, auto-start
@@ -179,7 +180,7 @@ The trimmed README covers install, your first project, daily-usage cheatsheet, n
 - [docs/profiles.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/profiles.md) — credentials profiles: factor `credentials_file` / `token_file` / app keys out of every project YAML
 
 **Topology guides** (pick the one that matches your situation):
-- [docs/scenarios.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/scenarios.md) — eight deployment topologies, end to end:
+- [docs/scenarios.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/scenarios.md) — nine deployment topologies, end to end:
   - **A. Standalone** — local ↔ 1 backend
   - **B. Personal multi-machine** — local ⇄ 1 backend ⇄ local'
   - **C. Multi-user collaboration** — Alice ⇄ shared backend ⇄ Bob
@@ -188,6 +189,7 @@ The trimmed README covers install, your first project, daily-usage cheatsheet, n
   - **G. Multi-user + multi-backend (production-realistic)** — shared primary + shared mirror, full Alice/Bob YAMLs and command-by-command transcript
   - **H. Multi-project enterprise** — many configs in `~/.config/claude_mirror/`
   - **I. Cross-tool AGENTS.md sync** — single `AGENTS.md` shared by Claude Code / Cursor / Codex / Antigravity, narrow pattern set via the [`agents-md`](https://github.com/alessiobravi/claude-mirror/blob/main/docs/profiles/agents-md.yaml) sample profile
+  - **J. Browse / grep / diff snapshots without restoring** — read-only FUSE mount engine with five variants (snapshot / live / per-mirror / all-snapshots-stacked / time-travel)
 
 ---
 
@@ -614,6 +616,9 @@ All token files are written with `chmod 0600` (owner read/write only).
 | `~/.config/claude_mirror/onedrive-<project>-token.json` | MSAL token cache for OneDrive (do not share) |
 | `~/.config/claude_mirror/webdav-<project>-token.json` | WebDAV credentials — URL, username, password in plaintext at `0600`. Prefer an app password. |
 | `~/.config/claude_mirror/sftp-<project>-token.json` | SFTP host-fingerprint cache (key auth uses your `~/.ssh/`; password fallback is plaintext at `0600`) |
+| `~/.config/claude_mirror/ftp-<project>-token.json` | FTP marker file — credentials live inline in the project YAML (host / username / password / folder) |
+| `~/.config/claude_mirror/s3-<project>-token.json` | S3 marker file — access key + secret live inline in the project YAML, or boto3's default credential chain handles them |
+| `~/.config/claude_mirror/smb-<project>-token.json` | SMB marker file — credentials live inline in the project YAML (server / share / username / password / folder) |
 | `~/.config/claude_mirror/<project>.yaml` | Per-project config (auto-named from project directory) |
 | `{project}/.claude_mirror_manifest.json` | Local sync state (do not edit manually) |
 | `{project}/.claude_mirror_hash_cache.json` | Per-project hash cache to skip re-hashing unchanged files. Safe to delete; rebuilt on next run. Add to `.gitignore`. |
@@ -639,7 +644,7 @@ claude-mirror reads older configs and manifests transparently — there is nothi
 
 claude-mirror is provided **as is, without warranty of any kind**, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and noninfringement. By downloading, installing, or running this software you accept full and exclusive responsibility for any consequences of its use, including without limitation:
 
-- **Data loss, corruption, or accidental deletion** of your local files, your remote storage (Google Drive, Dropbox, OneDrive, WebDAV server, SFTP server), or any backups thereof — whether caused by a bug, a misconfiguration, an interrupted sync, a network failure, a backend API change, an authentication problem, or otherwise.
+- **Data loss, corruption, or accidental deletion** of your local files, your remote storage (Google Drive, Dropbox, OneDrive, WebDAV server, SFTP server, FTP/FTPS server, S3 bucket, SMB/CIFS share), or any backups thereof — whether caused by a bug, a misconfiguration, an interrupted sync, a network failure, a backend API change, an authentication problem, or otherwise.
 - **Unintended overwrites** during conflict resolution, `pull`, `push`, or `restore` operations.
 - **Disclosure of file contents** to anyone who has access to the configured remote folder, the Pub/Sub topic, the Slack channel, or the local machine. claude-mirror syncs whatever matches the configured `file_patterns` — review your patterns and `exclude_patterns` carefully before pushing.
 - **Charges or quota consumption** on Google Cloud, Microsoft Azure, Dropbox, or any other third-party service used as a backend.

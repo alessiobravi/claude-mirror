@@ -12,9 +12,7 @@ The global `--profile NAME` flag (since v0.5.49) goes on the `claude-mirror` com
 claude-mirror [--profile NAME] <subcommand> ...   # global flag (since v0.5.49)
 
 claude-mirror init        [--wizard]
-                        [--backend googledrive|dropbox|onedrive|webdav|sftp|ftp]
-                        [--backend googledrive|dropbox|onedrive|webdav|sftp|s3]
-                        [--backend googledrive|dropbox|onedrive|webdav|sftp|smb]
+                        [--backend googledrive|dropbox|onedrive|webdav|sftp|ftp|s3|smb]
                         [--project PATH]
                         [--drive-folder-id ID] [--gcp-project-id ID] [--pubsub-topic-id ID]
                         [--credentials-file PATH]
@@ -41,8 +39,7 @@ claude-mirror init        [--wizard]
                         [--token-file PATH] [--patterns GLOB ...] [--exclude GLOB ...] [--config PATH]
                         [--auto-pubsub-setup]      # googledrive only: auto-create Pub/Sub topic + per-machine subscription + IAM grant after auth
 claude-mirror auth        [--check] [--config PATH]
-claude-mirror clone       --backend googledrive|dropbox|onedrive|webdav|sftp|s3
-claude-mirror clone       --backend googledrive|dropbox|onedrive|webdav|sftp|smb
+claude-mirror clone       --backend googledrive|dropbox|onedrive|webdav|sftp|ftp|s3|smb
                         --project PATH
                         [--drive-folder-id ID] [--gcp-project-id ID] [--pubsub-topic-id ID]
                         [--credentials-file PATH]
@@ -93,7 +90,7 @@ claude-mirror forget            TIMESTAMP... | --before DATE/DURATION | --keep-l
 claude-mirror prune             [--keep-last N] [--keep-daily N] [--keep-monthly N] [--keep-yearly N]
                               [--delete] [--yes] [--include-tagged] [--config PATH]   # dry-run by default; reads keep_* from config; tagged snapshots shielded unless --include-tagged
 claude-mirror gc                [--backend NAME] [--delete] [--yes] [--config PATH]   # dry-run by default; --delete to actually delete; --backend targets a specific mirror (Tier 2)
-claude-mirror doctor            [--backend NAME] [--config PATH]   # end-to-end self-test: config + credentials + connectivity + project + manifest (+ deep checks under --backend googledrive | dropbox | onedrive | webdav | sftp | s3)
+claude-mirror doctor            [--backend NAME] [--config PATH]   # end-to-end self-test: config + credentials + connectivity + project + manifest (+ deep checks under --backend googledrive | dropbox | onedrive | webdav | sftp | ftp | s3 | smb)
 claude-mirror health            [--no-backends] [--timeout N] [--json] [--config PATH]   # machine-readable monitoring probe; exit 0 ok / 1 warn / 2 fail
 claude-mirror verify            [--backend NAME] [--snapshots/--no-snapshots] [--files/--no-files] [--mount-cache/--no-mount-cache] [--strict] [--json] [--config PATH]   # end-to-end integrity audit: manifest-vs-remote + snapshot blobs + mount cache
 claude-mirror migrate-snapshots --to {blobs|full} [--dry-run] [--keep-source] [--no-update-config] [--config PATH]
@@ -437,6 +434,7 @@ See [README — Your first project](../README.md#your-first-project) for the wiz
 - [backends/sftp.md](backends/sftp.md)
 - [backends/ftp.md](backends/ftp.md)
 - [backends/s3.md](backends/s3.md)
+- [backends/smb.md](backends/smb.md)
 
 ### `clone`
 
@@ -449,7 +447,9 @@ One-shot bootstrap from an existing remote project — combines `init` + `auth` 
 - OneDrive — `--onedrive-client-id <CLIENT_ID> --onedrive-folder <PATH>`
 - WebDAV — `--webdav-url <URL> --webdav-username <USER> --webdav-password <PW>` (add `--webdav-insecure-http` only on closed-LAN test setups)
 - SFTP — `--sftp-host <HOST> --sftp-port <PORT> --sftp-username <USER> --sftp-key-file <KEY> --sftp-known-hosts-file <PATH> --sftp-folder <ABS_PATH>` (or `--sftp-password <PW>` instead of a key)
+- FTP / FTPS — `--ftp-host <HOST> --ftp-port <PORT> --ftp-username <USER> --ftp-password <PW> --ftp-folder <PATH> --ftp-tls explicit` (use `implicit` for legacy port-990 servers; `off` only for closed-LAN test setups — credentials are sent in cleartext)
 - S3-compatible — `--s3-bucket <NAME> --s3-region <REGION> --s3-access-key-id <ID> --s3-secret-access-key <KEY> --s3-prefix <PATH>` (add `--s3-endpoint-url <URL>` for non-AWS providers; add `--s3-use-path-style` for MinIO)
+- SMB / CIFS — `--smb-server <HOST> --smb-port <PORT> --smb-share <NAME> --smb-username <USER> --smb-password <PW> --smb-folder <PATH> --smb-encryption` (add `--smb-domain <DOMAIN>` for AD / NTLM environments; SMB2/3 only — SMBv1 rejected as a security gate)
 
 Common flags:
 
@@ -861,6 +861,12 @@ End-to-end self-test of a project's configuration: config file parses, credentia
 `--backend webdav` additionally runs WebDAV-specific deep checks beyond the generic per-backend loop: URL well-formedness, `PROPFIND` on the configured root (HTTP 207 expected), `DAV:` class header detection (class 1+ required for sync), `getetag` presence (used for change detection), `oc:checksums` extension support detection (Nextcloud / OwnCloud advertise MD5/SHA1/SHA256 hashes), and an account-base smoke probe for Nextcloud / OwnCloud URL patterns. Authentication failures (401) bucket into a single `WebDAV auth failed` line. See [admin.md#webdav-deep-checks](admin.md#webdav-deep-checks) for the full deep-check matrix and [backends/webdav.md#diagnosing-setup-problems](backends/webdav.md#diagnosing-setup-problems) for sample output.
 
 `--backend sftp` additionally runs SFTP-specific deep checks beyond the generic per-backend loop: host fingerprint match against `~/.ssh/known_hosts` (a mismatch is treated as a possible MITM and refuses to connect), SSH key file existence and 0600 permissions, key decryption (or ssh-agent fallback), connection + auth, `exec_command` capability (some `internal-sftp`-jailed accounts disallow shell, in which case claude-mirror falls back to client-side hashing), and root-path `stat`. Auth-class failures bucket into one `SFTP auth failed` line; the fingerprint-mismatch fix-hint deliberately points at `ssh-keygen -R hostname`, not `claude-mirror auth` — fingerprint mismatches are a security incident, not a token problem. See [admin.md#sftp-deep-checks](admin.md#sftp-deep-checks) for the full deep-check matrix and [backends/sftp.md#diagnosing-setup-problems](backends/sftp.md#diagnosing-setup-problems) for sample output.
+
+`--backend ftp` additionally runs FTP-specific deep checks beyond the generic per-backend loop: host reachability, control-channel TLS handshake (when `ftp_tls` is `explicit` or `implicit`), authentication, `cwd` into the configured `ftp_folder`, and a write-and-delete sentinel in the root. A cleartext-credentials warning fires whenever `ftp_tls: off` is in the YAML — the warning is informational (some closed-LAN setups intentionally run plain FTP) but the doctor surfaces it so the choice stays visible. See [admin.md#ftp-deep-checks](admin.md#ftp-deep-checks) for the full matrix and [backends/ftp.md#diagnosing-setup-problems](backends/ftp.md#diagnosing-setup-problems) for sample output.
+
+`--backend s3` additionally runs six S3-specific deep checks beyond the generic per-backend loop: credentials shape (`s3_access_key_id` + `s3_secret_access_key` either both set or both blank — blank delegates to boto3's default credential chain), endpoint URL well-formedness (`https://<host>` or empty for AWS), `head_bucket` reachability, list permissions via `list_objects_v2 MaxKeys=1`, write permissions via a `put_object` + `delete_object` of a 1-byte sentinel under `<s3_prefix>/.claude_mirror_doctor`, and region consistency between the configured `s3_region` and the bucket's actual region. Auth-class failures (`NoCredentialsError`, `InvalidAccessKeyId`, `SignatureDoesNotMatch`) bucket into one `S3 auth failed` line. See [admin.md#s3-deep-checks](admin.md#s3-deep-checks) for the full matrix and [backends/s3.md#diagnosing-setup-problems](backends/s3.md#diagnosing-setup-problems) for sample output.
+
+`--backend smb` additionally runs six SMB-specific deep checks beyond the generic per-backend loop: TCP server reachability (`smb_server:smb_port`), SMB2/3 protocol negotiation — **SMBv1 is rejected as a security gate** (the fix-hint points at the server's protocol settings, not at `claude-mirror auth`), authentication via `register_session`, share access via `scandir` against the configured `smb_share`, folder write via a 1-byte sentinel inside `smb_folder`, and an info-only encryption-status line that warns when SMB3 was requested (`smb_encryption: true`) but the server downgraded to plaintext. Auth-class failures bucket into one `SMB auth failed` line. See [admin.md#smb-deep-checks](admin.md#smb-deep-checks) for the full matrix and [backends/smb.md#diagnosing-setup-problems](backends/smb.md#diagnosing-setup-problems) for sample output.
 
 See [admin.md#doctor](admin.md#doctor) for the full check matrix, sample output, and fix-hint interpretation.
 

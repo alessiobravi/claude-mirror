@@ -4,7 +4,9 @@ All notable changes to claude-mirror.
 
 ---
 
-## [Unreleased]
+## [0.5.61] — 2026-05-09
+
+The MOUNT release — every read-shaped FUSE view shipped at once. Five mount variants share one engine: snapshot mount, live remote mount, per-mirror mount (Tier 2), all-snapshots-stacked mount, and time-travel mount. Read-only across all five. **fusepy ships in the base install** — `pipx install claude-mirror` is enough on the Python side, matching the v0.5.10 every-backend-in-base policy. The kernel layer (macFUSE / WinFsp / libfuse) is platform-specific and installed separately, only needed at mount time.
 
 ### Added — read-only FUSE mount package (MOUNT)
 
@@ -18,7 +20,7 @@ Five mount variants share a single read-only FUSE engine, all driven through one
 
 Read-only by design: writes return `EROFS`. The push/pull/sync flow stays the canonical writeback path. Useful for `grep -r`, `diff`, `git log -p` against a specific past state, or opening a snapshot in your editor without committing to a full `restore`.
 
-- **Optional dependency.** Activates with `pipx install 'claude-mirror[mount]'`. Plus the kernel layer for your platform: macOS uses macFUSE (`brew install --cask macfuse`), Linux uses the in-tree libfuse (already kernel-resident on every modern distro), Windows uses WinFsp (https://winfsp.dev). The `mount` command prints the right install hint per platform when fusepy isn't installed.
+- **Base install ships fusepy.** `pipx install claude-mirror` includes the FUSE Python bindings out of the box — no extras flag needed. The legacy `[mount]` extra is retained as a no-op alias so historical install commands keep working. Plus the kernel layer for your platform: macOS uses macFUSE (`brew install --cask macfuse`), Linux uses the in-tree libfuse (already kernel-resident on every modern distro), Windows uses WinFsp (https://winfsp.dev). The `mount` command prints the right kernel-layer install hint per platform when the OS-level FUSE library is missing at runtime.
 - **Content-addressed BlobCache.** Backed by `$XDG_CACHE_HOME/claude-mirror/blobs/`. Once a blob is fetched, it stays valid forever (sha256 == identity) — survives unmount/remount cycles. Default 500MB cap, configurable via `--cache-mb N`. Cold-cache reads pay a network round-trip to the backend; warm-cache reads serve straight from disk.
 - **Cross-platform `umount` wrapper.** `claude-mirror umount /tmp/snap` picks the right unmount tool per platform: `umount` on macOS, `fusermount -u` on Linux. Windows prints a hint pointing the user at Ctrl+C on the foreground mount process (WinFsp processes respond to a clean signal).
 - **Foreground / background.** `--foreground` (default) keeps the process attached to the terminal; Ctrl+C cleanly unmounts via a `try/finally` that calls the FS instance's `cleanup()` hook. `--background` daemonises on POSIX; on Windows it exits with a hint pointing at `--foreground` in a separate console.

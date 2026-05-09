@@ -390,7 +390,7 @@ claude-mirror umount /tmp/snap
 
 Five variants share one engine: a single tagged or timestamped snapshot (`--tag` / `--snapshot`), the live current state of the primary backend or a Tier 2 mirror (`--live` / `--live --backend NAME`), every snapshot stacked under per-timestamp subdirectories (`--all-snapshots`), or the last snapshot taken on or before a date (`--as-of DATE`). All variants are read-only — writes return `EROFS`. Blob bodies are content-addressed and cached forever; the first read pays a network round-trip, subsequent reads serve from `$XDG_CACHE_HOME/claude-mirror/blobs/`.
 
-Mount support is an optional extra: `pipx install 'claude-mirror[mount]'` plus the platform's kernel layer (macFUSE / WinFsp / libfuse). Full reference: [`docs/cli-reference.md` — `mount`](cli-reference.md#mount). End-to-end recipe with pitfalls: [Scenario J. Browse / grep / diff snapshots without restoring](scenarios.md#j-browse--grep--diff-snapshots-without-restoring).
+fusepy ships in the base install (since v0.5.61) — `pipx install claude-mirror` is enough on the Python side. The platform's kernel layer (macFUSE / WinFsp / libfuse) is installed separately, only required at mount time. Full reference: [`docs/cli-reference.md` — `mount`](cli-reference.md#mount). End-to-end recipe with pitfalls: [Scenario J. Browse / grep / diff snapshots without restoring](scenarios.md#j-browse--grep--diff-snapshots-without-restoring).
 
 ---
 

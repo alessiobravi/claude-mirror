@@ -11062,11 +11062,16 @@ def _render_health_table(report: Any) -> None:
 
 
 _MOUNT_INSTALL_HINT = (
-    "Mount support is optional. Install with:\n"
+    "Mount support requires fusepy. fusepy ships in the base install of\n"
+    "claude-mirror (since v0.5.61) — reinstall with:\n"
     "\n"
-    "  pipx install 'claude-mirror[mount]'\n"
+    "  pipx install --force claude-mirror\n"
     "\n"
-    "Plus the kernel layer for your platform:\n"
+    "If you installed with `pip install --no-deps` you can also do:\n"
+    "\n"
+    "  pip install fusepy\n"
+    "\n"
+    "Plus the kernel layer for your platform (one-time, OS-level install):\n"
     "\n"
     "  macOS:   brew install --cask macfuse\n"
     "  Linux:   already kernel-resident on every modern distro\n"
@@ -11260,11 +11265,11 @@ def mount(
     or opening a snapshot in your editor without committing to a full
     `restore`.
 
-    Optional dependency. Install with `pipx install
-    'claude-mirror[mount]'` plus the kernel layer for your platform:
-    macOS uses macFUSE (`brew install --cask macfuse`), Linux uses the
-    in-tree kernel libfuse (already present on every modern distro),
-    Windows uses WinFsp (https://winfsp.dev).
+    fusepy ships in the base install (since v0.5.61) — `pipx install
+    claude-mirror` is enough on the Python side. Plus the kernel layer
+    for your platform: macOS uses macFUSE (`brew install --cask
+    macfuse`), Linux uses the in-tree kernel libfuse (already present
+    on every modern distro), Windows uses WinFsp (https://winfsp.dev).
 
     For background, see docs/scenarios.md "Scenario J. Browse / grep /
     diff snapshots without restoring" and docs/cli-reference.md.

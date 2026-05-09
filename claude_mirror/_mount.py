@@ -63,9 +63,10 @@ def _load_fuse() -> tuple[type[OSError], type[object]]:
             from fuse import FuseOSError, Operations
         except ImportError as exc:
             raise ImportError(
-                "fusepy is required for the mount engine. Install with "
-                "`pipx install 'claude-mirror[mount]'` or "
-                "`pip install fusepy`."
+                "fusepy is required for the mount engine. fusepy ships in the "
+                "base install of claude-mirror (since v0.5.61); reinstall with "
+                "`pipx install --force claude-mirror`. If you installed with "
+                "`--no-deps`, run `pip install fusepy` directly."
             ) from exc
         _FuseOSError_cls = FuseOSError
         _Operations_cls = Operations

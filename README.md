@@ -140,13 +140,7 @@ claude-mirror update --apply            # auto-detects PyPI vs editable; uses pi
 
 `claude-mirror mount` exposes any snapshot — or the live current state of any backend — as a real read-only filesystem path. Useful for `grep -r`, `diff`, or opening a snapshot in your editor without committing to a full `restore`. See the [Browsing snapshots without downloading](#browsing-snapshots-without-downloading) cheatsheet below and the full reference in [docs/scenarios.md — Scenario J](https://github.com/alessiobravi/claude-mirror/blob/main/docs/scenarios.md#j-browse--grep--diff-snapshots-without-restoring).
 
-Activate the optional dependency:
-
-```bash
-pipx install 'claude-mirror[mount]'
-```
-
-Plus the platform's kernel layer (one-time per machine):
+The Python bindings ship in the base install (`pipx install claude-mirror`) — no extras flag needed. You only need to install the platform's kernel layer once per machine:
 
 | Platform | Install |
 |---|---|
@@ -338,7 +332,7 @@ Conflict resolution flow (interactive `keep local / keep remote / merge / skip` 
 
 ### Browsing snapshots without downloading
 
-Optional read-only FUSE mount surface — `grep -r`, `diff`, or open a snapshot in your editor without running `restore`. Requires `pipx install 'claude-mirror[mount]'` plus the platform's kernel layer (see [the Mount install section above](#optional-read-only-fuse-mount-support)).
+Read-only FUSE mount surface — `grep -r`, `diff`, or open a snapshot in your editor without running `restore`. Ships in the base install since v0.5.61; you only need to install the platform's kernel layer separately (see [the Mount install section above](#optional-read-only-fuse-mount-support)).
 
 ```bash
 mkdir /tmp/snap

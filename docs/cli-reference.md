@@ -605,7 +605,7 @@ See [admin.md — Snapshots and disaster recovery](admin.md#snapshots-and-disast
 
 Mount snapshots or live remote state as a read-only FUSE filesystem at MOUNTPOINT. Five variants share one engine. Read-only by design — writes return `EROFS`. The push/pull/sync flow stays the canonical writeback path. See [Scenario J. Browse / grep / diff snapshots without restoring](scenarios.md#j-browse--grep--diff-snapshots-without-restoring) and [admin.md — Browsing without restoring](admin.md#browsing-without-restoring).
 
-**Optional dependency.** Activates with `pipx install 'claude-mirror[mount]'`. Plus the kernel layer for your platform:
+**Base-install dependency.** fusepy ships in the base install (since v0.5.61) — `pipx install claude-mirror` is enough on the Python side. The legacy `[mount]` extra is retained as a no-op alias for back-compat. Plus the platform's kernel layer (one-time per machine):
 
 | Platform | Install |
 |---|---|

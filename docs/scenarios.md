@@ -1093,13 +1093,7 @@ If you actually want to overwrite the project with a snapshot's contents, use `c
 
 ### How to implement
 
-The mount surface is an optional extra. Install it once per machine:
-
-```bash
-pipx install 'claude-mirror[mount]'
-```
-
-Then install the kernel layer for your platform (one-time per machine):
+fusepy ships in the base install (since v0.5.61) — `pipx install claude-mirror` is enough on the Python side. You only need to install the kernel layer once per machine:
 
 | Platform | Install |
 |---|---|

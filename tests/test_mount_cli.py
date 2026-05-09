@@ -170,7 +170,8 @@ def test_mount_optional_dep_guard_prints_install_hint(
         cli, ["mount", "--live", mountpoint],
     )
     assert result.exit_code != 0, result.output
-    assert "claude-mirror[mount]" in result.output
+    assert "fusepy" in result.output
+    assert "claude-mirror" in result.output
     assert "macfuse" in result.output
     assert "WinFsp" in result.output
 

@@ -229,7 +229,7 @@ class StorageBackend(ABC):
         prefix: str = "",
         progress_cb: Optional[Callable[[int, int], None]] = None,
         exclude_folder_names: Optional[set[str]] = None,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """List all non-folder files recursively. Each dict must have: id, name, md5Checksum, relative_path.
 
         If `progress_cb` is provided, backends should call it periodically with
@@ -245,7 +245,7 @@ class StorageBackend(ABC):
         listing (Dropbox, OneDrive, WebDAV) may filter the result instead."""
 
     @abstractmethod
-    def list_folders(self, parent_id: str, name: Optional[str] = None) -> list[dict]:
+    def list_folders(self, parent_id: str, name: Optional[str] = None) -> list[dict[str, Any]]:
         """List subfolders of parent. If name given, filter by exact name. Each dict: id, name, createdTime."""
 
     @abstractmethod
@@ -255,12 +255,26 @@ class StorageBackend(ABC):
         rel_path: str,
         root_folder_id: str,
         file_id: Optional[str] = None,
+        progress_callback: Optional[Callable[[int], None]] = None,
     ) -> str:
-        """Upload a local file. If file_id given, update existing. Returns file ID."""
+        """Upload a local file. If file_id given, update existing. Returns file ID.
+
+        ``progress_callback`` (when provided) is invoked with the number of
+        bytes transferred since the previous call. Backends that don't expose
+        per-chunk progress accept the parameter and ignore it; the engine
+        treats absence of progress events as "transfer is in flight" rather
+        than as a failure.
+        """
 
     @abstractmethod
-    def download_file(self, file_id: str) -> bytes:
-        """Download file content by ID."""
+    def download_file(
+        self,
+        file_id: str,
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> bytes:
+        """Download file content by ID. ``progress_callback`` is invoked
+        with the number of bytes downloaded since the previous call (same
+        contract as ``upload_file``)."""
 
     @abstractmethod
     def upload_bytes(

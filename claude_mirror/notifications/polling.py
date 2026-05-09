@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import threading
-from typing import Callable, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 from ..config import Config
 from ..events import SyncEvent, SyncLog, SYNC_LOG_NAME, LOGS_FOLDER
 from . import NotificationBackend
+
+if TYPE_CHECKING:
+    from ..backends import StorageBackend
 
 
 # Stable identity for an event: SyncEvent has no `id` field, so we
@@ -28,8 +31,7 @@ class PollingNotifier(NotificationBackend):
     have a native push/longpoll mechanism.
     """
 
-    def __init__(self, config: Config, storage) -> None:
-        from ..backends import StorageBackend
+    def __init__(self, config: Config, storage: "StorageBackend") -> None:
         self.config = config
         self._storage: StorageBackend = storage
         self._poll_interval: int = getattr(config, "poll_interval", 30)

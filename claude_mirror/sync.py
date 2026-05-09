@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional, cast
 
 from rich.console import Console
 from rich.progress import (
@@ -16,6 +16,7 @@ from rich.progress import (
     MofNCompleteColumn,
     Progress,
     SpinnerColumn,
+    TaskID,
     TextColumn,
     TimeElapsedColumn,
 )
@@ -38,7 +39,7 @@ from .config import (
 from .events import SyncEvent, SyncLog, SYNC_LOG_NAME, LOGS_FOLDER
 from .hash_cache import HashCache
 from .ignore import IgnoreSet, IGNORE_FILENAME
-from .manifest import Manifest
+from .manifest import FileState, Manifest
 from .merge import MergeHandler
 from .notifications import NotificationBackend
 from .retry import BackoffCoordinator, extract_retry_after_seconds
@@ -112,7 +113,7 @@ class SyncEngine:
         self._hash_cache = HashCache(config.project_path)
         # Pub/Sub publish futures collected during a command and resolved at the end —
         # avoids inline blocking on broker ack for each event we publish.
-        self._pending_publish_futures: list = []
+        self._pending_publish_futures: list[Any] = []
         # Per-backend push-progress counters. _push_file and
         # _fan_out_to_mirrors increment these as each backend completes
         # its upload for a given file; the running total is rendered in
@@ -285,7 +286,7 @@ class SyncEngine:
         local_files = set(self._local_files())
         _local(f"found {len(local_files)} local file(s)")
 
-        def _list_remote() -> dict:
+        def _list_remote() -> dict[str, Any]:
             _remote("connecting")
 
             def _cb(folders_done: int, files_seen: int) -> None:
@@ -419,7 +420,7 @@ class SyncEngine:
         self,
         local_hash: Optional[str],
         drive_hash: Optional[str],
-        manifest_entry,
+        manifest_entry: Optional[FileState],
         local_exists: bool,
         drive_exists: bool,
     ) -> Status:
@@ -492,13 +493,13 @@ class SyncEngine:
 
     def _run_transfer_phase(
         self,
-        items: list,
-        fn: Callable,
+        items: list[Any],
+        fn: Callable[..., Any],
         description: str,
         total_bytes: int,
         outer_progress: Optional[Progress] = None,
         extra_detail: Optional[Callable[[], str]] = None,
-    ) -> tuple[list, list]:
+    ) -> tuple[list[Any], list[Any]]:
         """Run a byte-transfer phase under a Rich transfer-progress UI.
 
         ``fn(item, progress_callback)`` does the actual transfer for one
@@ -543,12 +544,12 @@ class SyncEngine:
                     description, total=None,
                     detail="0 file(s)", show_time=True,
                 )
-                ok, failed = self._parallel(
+                ok_inner, failed_inner = self._parallel(
                     items, fn, description=description,
                     progress=outer_progress, task_id=task,
                     extra_detail=extra_detail,
                 )
-                return ok, failed
+                return ok_inner, failed_inner
             return self._parallel(
                 items, fn, description=description,
                 extra_detail=extra_detail,
@@ -566,8 +567,8 @@ class SyncEngine:
             if was_running:
                 outer_progress.stop()
 
-        succeeded: list = []
-        failed: list = []
+        succeeded: list[Any] = []
+        failed: list[Any] = []
         with make_transfer_progress(console) as tprog:
             task_id = tprog.add_task(description, total=total_bytes, show_time=True)
 
@@ -749,7 +750,7 @@ class SyncEngine:
         self,
         *,
         non_interactive_strategy: Optional[str] = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Bidirectional sync: auto-resolve non-conflicts in parallel, prompt for conflicts.
 
         non_interactive_strategy: when set (one of "keep-local" / "keep-remote"),
@@ -771,10 +772,13 @@ class SyncEngine:
                 "auto_resolved": [{"path": str, "strategy": str}, ...],
             }
         """
-        pushed, pulled, skipped, deleted = [], [], [], []
+        pushed: list[str] = []
+        pulled: list[str] = []
+        skipped: list[str] = []
+        deleted: list[str] = []
         # Audit trail for `--no-prompt --strategy ...`. Each entry is
         # `{"path": str, "strategy": str}`. Empty in the interactive flow.
-        auto_resolved: list[dict] = []
+        auto_resolved: list[dict[str, Any]] = []
 
         # Fresh coordinator per sync() so a previous run's throttle state
         # never leaks into the next invocation.
@@ -1305,13 +1309,13 @@ class SyncEngine:
 
     def _parallel(
         self,
-        items: list,
-        fn: Callable,
+        items: list[Any],
+        fn: Callable[..., Any],
         description: str = "Working",
         progress: Optional[Progress] = None,
-        task_id: Optional[int] = None,
+        task_id: Optional[TaskID] = None,
         extra_detail: Optional[Callable[[], str]] = None,
-    ) -> tuple[list, list]:
+    ) -> tuple[list[Any], list[Any]]:
         """Run fn(item) for each item in parallel with a live progress bar.
         Returns (succeeded, failed) item lists.
 
@@ -1362,7 +1366,8 @@ class SyncEngine:
                     progress.update(task_id, advance=1, detail=_decorate("failed"))
                 return [], [item]
 
-        succeeded, failed = [], []
+        succeeded: list[Any] = []
+        failed: list[Any] = []
         workers = min(self.config.parallel_workers, len(items))
 
         # Render either inside a caller-supplied Progress (composed dual-line
@@ -1380,6 +1385,7 @@ class SyncEngine:
                 transient=True,
             )
             progress.start()
+        assert progress is not None
         try:
             if task_id is None:
                 task_id = progress.add_task(description, total=len(items), show_time=True)
@@ -1424,7 +1430,7 @@ class SyncEngine:
         self,
         states: list[FileSyncState],
         progress: Optional[Progress] = None,
-        task_id: Optional[int] = None,
+        task_id: Optional[TaskID] = None,
     ) -> tuple[list[FileSyncState], list[FileSyncState]]:
         """Run guard checks in parallel. Returns (safe_pushes, new_conflicts).
 
@@ -1436,7 +1442,8 @@ class SyncEngine:
                 progress.update(task_id, total=0, completed=0,
                                 detail="nothing to check")
             return [], []
-        safe, conflicts = [], []
+        safe: list[Any] = []
+        conflicts: list[Any] = []
         workers = min(self.config.parallel_workers, len(states))
         if progress is not None and task_id is not None:
             progress.update(task_id, total=len(states), completed=0,
@@ -1463,7 +1470,7 @@ class SyncEngine:
             progress.update(task_id, detail="completed")
         return safe, conflicts
 
-    def _reset_push_counters(self, items: list) -> None:
+    def _reset_push_counters(self, items: list[Any]) -> None:
         """Initialise the per-backend completion counters before a push
         run. Total is the file count; one counter per configured backend
         (primary + every mirror). Initial values are 0 so the first
@@ -1627,6 +1634,9 @@ class SyncEngine:
         primary_name = (
             getattr(self.storage, "backend_name", "") or self.config.backend
         )
+        # `_push_file` is only called when the local file exists, so
+        # local_hash is guaranteed populated by the status pipeline.
+        assert state.local_hash is not None
         # Update manifest's flat fields + record primary as ok in remotes map.
         self.manifest.update(
             state.rel_path, state.local_hash, file_id,
@@ -1658,7 +1668,7 @@ class SyncEngine:
         push has already succeeded by the time we get here."""
         from .backends import BackendError, ErrorClass
 
-        def _push_one(backend) -> tuple[str, bool, Optional[str], Optional[ErrorClass]]:
+        def _push_one(backend: StorageBackend) -> tuple[str, bool, Optional[str], Optional[ErrorClass]]:
             name = getattr(backend, "backend_name", "") or "unknown"
             # Look up the file ID this mirror has used previously, if any.
             existing = self.manifest.get(rel_path)
@@ -1674,19 +1684,19 @@ class SyncEngine:
                 # rather than each retrying independently.
                 upload_fn = getattr(backend, "_upload_with_retry", None)
                 if upload_fn:
-                    def _do_mirror_upload(fn=upload_fn) -> str:
-                        return fn(
+                    def _do_mirror_upload() -> str:
+                        return cast(str, upload_fn(
                             local_path=local_path,
                             rel_path=rel_path,
-                            root_folder_id=backend.config.root_folder,
+                            root_folder_id=backend.config.root_folder,  # type: ignore[attr-defined]  # backends carry a `config` attribute by convention; not on the abstract base
                             file_id=mirror_file_id,
-                        )
+                        ))
                 else:
                     def _do_mirror_upload() -> str:
                         return backend.upload_file(
                             local_path=local_path,
                             rel_path=rel_path,
-                            root_folder_id=backend.config.root_folder,
+                            root_folder_id=backend.config.root_folder,  # type: ignore[attr-defined]  # backends carry a `config` attribute by convention; not on the abstract base
                             file_id=mirror_file_id,
                         )
                 new_id = self._upload_with_coordinator(_do_mirror_upload, backend)
@@ -1758,6 +1768,10 @@ class SyncEngine:
         # Refuse to write outside the project root, even if the remote metadata
         # claims a relative_path with `..` segments.
         local_path = _safe_join(self._project, state.rel_path)
+        # `_pull_file` is only called for states the status pipeline
+        # classified as REMOTE_NEWER / NEW_DRIVE / DELETED_LOCAL — all
+        # paths require drive_file_id to be populated.
+        assert state.drive_file_id is not None
         content = self.storage.download_file(
             state.drive_file_id, progress_callback=progress_callback,
         )
@@ -1791,6 +1805,9 @@ class SyncEngine:
     ) -> None:
         """Download a remote file to output_dir without touching the project or manifest."""
         dest = _safe_join(output_dir, state.rel_path)
+        # Same precondition as `_pull_file`: pull-target states always
+        # carry a populated drive_file_id by construction.
+        assert state.drive_file_id is not None
         content = self.storage.download_file(
             state.drive_file_id, progress_callback=progress_callback,
         )
@@ -1804,6 +1821,8 @@ class SyncEngine:
         Returns 'pushed', 'pulled', or None if skipped.
         """
         local_content = _safe_join(self._project, state.rel_path).read_text(errors="replace")
+        # Conflict path implies the remote already has a record of the file.
+        assert state.drive_file_id is not None
         drive_bytes = self.storage.download_file(state.drive_file_id)
         drive_content = drive_bytes.decode(errors="replace")
 
@@ -1870,7 +1889,7 @@ class SyncEngine:
         self,
         backend_filter: Optional[str] = None,
         dry_run: bool = False,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Re-attempt previously-failed mirror pushes (state="pending_retry").
 
         Walks the manifest, finds files marked pending_retry on any mirror,
@@ -1962,19 +1981,19 @@ class SyncEngine:
                 try:
                     upload_fn = getattr(backend, "_upload_with_retry", None)
                     if upload_fn:
-                        def _do_retry_upload(fn=upload_fn) -> str:
-                            return fn(
+                        def _do_retry_upload() -> str:
+                            return cast(str, upload_fn(
                                 local_path=local_path,
                                 rel_path=rel_path,
-                                root_folder_id=backend.config.root_folder,
+                                root_folder_id=backend.config.root_folder,  # type: ignore[attr-defined]  # backends carry a `config` attribute by convention; not on the abstract base
                                 file_id=mirror_file_id,
-                            )
+                            ))
                     else:
                         def _do_retry_upload() -> str:
                             return backend.upload_file(
                                 local_path=local_path,
                                 rel_path=rel_path,
-                                root_folder_id=backend.config.root_folder,
+                                root_folder_id=backend.config.root_folder,  # type: ignore[attr-defined]  # backends carry a `config` attribute by convention; not on the abstract base
                                 file_id=mirror_file_id,
                             )
                     new_id = self._upload_with_coordinator(_do_retry_upload, backend)
@@ -2041,7 +2060,7 @@ class SyncEngine:
         self,
         backend_name: str,
         dry_run: bool = False,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Upload every manifest-tracked file to a newly-added mirror that
         has no recorded state for them yet.
 
@@ -2193,13 +2212,13 @@ class SyncEngine:
                         # Wrap in the coordinator so a global throttle
                         # pauses every parallel uploader on one
                         # shared deadline.
-                        def _do_seed_upload(fn=upload_fn) -> str:
-                            return fn(
+                        def _do_seed_upload() -> str:
+                            return cast(str, upload_fn(
                                 local_path=local_path,
                                 rel_path=rel_path,
-                                root_folder_id=target.config.root_folder,
+                                root_folder_id=target.config.root_folder,  # type: ignore[attr-defined]  # backends carry a `config` attribute by convention; not on the abstract base
                                 file_id=None,
-                            )
+                            ))
                         new_id = self._upload_with_coordinator(_do_seed_upload, target)
                         # Retry adapter has no progress hook — emit a
                         # single "transferred N bytes" delta after the
@@ -2211,7 +2230,7 @@ class SyncEngine:
                             return target.upload_file(
                                 local_path=local_path,
                                 rel_path=rel_path,
-                                root_folder_id=target.config.root_folder,
+                                root_folder_id=target.config.root_folder,  # type: ignore[attr-defined]  # backends carry a `config` attribute by convention; not on the abstract base
                                 file_id=None,
                                 progress_callback=_advance,
                             )
@@ -2243,7 +2262,7 @@ class SyncEngine:
         self.manifest.save()
         return self._finish_seed_mirror(result, backend_name)
 
-    def _finish_seed_mirror(self, result: dict, backend_name: str) -> dict:
+    def _finish_seed_mirror(self, result: dict[str, Any], backend_name: str) -> dict[str, Any]:
         """Print the final seed-mirror summary line + the failure hint
         when applicable. Extracted from ``seed_mirror`` so the success
         path and the empty-plan early-return share the same epilogue."""
@@ -2298,7 +2317,15 @@ class SyncEngine:
             ordered = ordered[:effective_cap]
         return ordered
 
-    def _print_summary(self, pushed: list, pulled: list, skipped: list, deleted: list = []) -> None:
+    def _print_summary(
+        self,
+        pushed: list[str],
+        pulled: list[str],
+        skipped: list[str],
+        deleted: Optional[list[str]] = None,
+    ) -> None:
+        if deleted is None:
+            deleted = []
         if not pushed and not pulled and not skipped and not deleted:
             console.print("[green]Everything is in sync.[/]")
             return
@@ -2315,7 +2342,7 @@ class SyncEngine:
         self,
         primary_pushed: list[str],
         snapshot_ts: Optional[str],
-    ) -> dict[str, dict]:
+    ) -> dict[str, dict[str, Any]]:
         """Build the backend_status dict for the Slack rich block from
         the manifest's per-backend RemoteState plus the primary's push
         outcome we already know in-process.
@@ -2329,7 +2356,7 @@ class SyncEngine:
               "error": Optional[str],
           }}
         """
-        result: dict[str, dict] = {}
+        result: dict[str, dict[str, Any]] = {}
         primary_name = (
             getattr(self.storage, "backend_name", "") or self.config.backend
         )
@@ -2490,7 +2517,7 @@ class SyncEngine:
 
     @staticmethod
     def _scope_event_for_route(
-        event: SyncEvent, route: dict
+        event: SyncEvent, route: dict[str, Any]
     ) -> Optional[SyncEvent]:
         """Match ``event`` against a single route's filters.
 
@@ -2576,7 +2603,7 @@ class SyncEngine:
         action: str,
         *,
         snapshot_ts: Optional[str] = None,
-        auto_resolved_files: Optional[list[dict]] = None,
+        auto_resolved_files: Optional[list[dict[str, Any]]] = None,
     ) -> None:
         """Queue a sync event: append it to the in-memory log and fire the publish
         without blocking on broker ack. Log upload + ack waits are flushed once at
@@ -2603,9 +2630,10 @@ class SyncEngine:
             auto_resolved_files=auto_resolved_files,
         )
         try:
-            future = self.notifier.publish_event_async(event)
-            if future is not None:
-                self._pending_publish_futures.append(future)
+            if self.notifier is not None:
+                future = self.notifier.publish_event_async(event)
+                if future is not None:
+                    self._pending_publish_futures.append(future)
             self._append_to_drive_log(event)
         except Exception as e:
             console.print(f"[yellow]Warning: could not publish event: {e}[/]")
@@ -2614,7 +2642,7 @@ class SyncEngine:
         # status block + (when applicable) the ACTION REQUIRED alert
         # for permanent failures, and pass them into post_sync_event so
         # the surfaces shipped in Phase 4 actually fire.
-        backend_status: Optional[dict[str, dict]] = None
+        backend_status: Optional[dict[str, dict[str, Any]]] = None
         failure_alert: Optional[dict[str, str]] = None
         if action in ("push", "sync") and self._mirrors:
             backend_status = self._build_backend_status(files, snapshot_ts)

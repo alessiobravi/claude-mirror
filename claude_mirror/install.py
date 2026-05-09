@@ -15,7 +15,7 @@ import shutil
 import os
 import subprocess
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import click
 
@@ -146,7 +146,7 @@ def install_hook() -> None:
     click.echo(f"  Command: {HOOK_COMMAND}")
 
     # Read and validate existing file before prompting
-    data: dict = {}
+    data: dict[str, Any] = {}
     if SETTINGS_PATH.exists():
         try:
             data = json.loads(SETTINGS_PATH.read_text())
@@ -195,7 +195,7 @@ def uninstall_hook() -> None:
     hooks = data.get("hooks", {})
     pre   = hooks.get("PreToolUse", [])
 
-    new_pre: list = []
+    new_pre: list[Any] = []
     removed = False
     for entry in pre:
         if isinstance(entry, dict):

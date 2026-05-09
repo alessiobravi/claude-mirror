@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Optional
+from typing import Any, Optional
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
@@ -105,7 +105,7 @@ def post_sync_event(
     snapshot_ts: Optional[str] = None,
     snapshot_format: Optional[str] = None,
     total_project_files: Optional[int] = None,
-    backend_status: Optional[dict[str, dict]] = None,
+    backend_status: Optional[dict[str, dict[str, Any]]] = None,
     failure_alert: Optional[dict[str, str]] = None,
 ) -> None:
     """Post a sync event to the project's Slack webhook with rich formatting.
@@ -206,7 +206,7 @@ def post_sync_event(
             f"{file_count} {file_word} in {project}"
         )
 
-    blocks: list[dict] = []
+    blocks: list[dict[str, Any]] = []
 
     # Action-required alert — prepended at the top so it dominates the
     # message regardless of what else is going on. Kept as a `header`
@@ -260,7 +260,7 @@ def post_sync_event(
         blocks.append(_build_backend_status_block(backend_status))
 
     # Context line — snapshot confirmation + project size.
-    context_elements: list[dict] = []
+    context_elements: list[dict[str, Any]] = []
     if snapshot_ts:
         fmt_label = f" ({_sanitise_slack(snapshot_format)})" if snapshot_format else ""
         context_elements.append({
@@ -282,7 +282,7 @@ def post_sync_event(
     if context_elements:
         blocks.append({"type": "context", "elements": context_elements})
 
-    payload: dict = {"text": fallback_text, "blocks": blocks}
+    payload: dict[str, Any] = {"text": fallback_text, "blocks": blocks}
     if config.slack_channel:
         payload["channel"] = config.slack_channel
 
@@ -295,7 +295,7 @@ def post_sync_event(
     _send_webhook(config.slack_webhook_url, payload)
 
 
-def _should_render_backend_status(backend_status: dict[str, dict]) -> bool:
+def _should_render_backend_status(backend_status: dict[str, dict[str, Any]]) -> bool:
     """Render the per-backend section if there are multiple backends OR
     any backend reported a non-ok state. A single ok backend looks like
     Tier 1 and adds no signal, so we suppress the block in that case."""
@@ -306,7 +306,7 @@ def _should_render_backend_status(backend_status: dict[str, dict]) -> bool:
     )
 
 
-def _build_backend_status_block(backend_status: dict[str, dict]) -> dict:
+def _build_backend_status_block(backend_status: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Render the per-backend status section. State → symbol mapping:
        ok → green, pending → yellow, failed → red.
     Sanitises every backend-controlled string before interpolation."""
@@ -348,8 +348,8 @@ def _build_backend_status_block(backend_status: dict[str, dict]) -> dict:
 def _build_failure_alert_blocks(
     failure_alert: dict[str, str],
     machine: str,
-    backend_status: Optional[dict[str, dict]],
-) -> tuple[list[dict], str]:
+    backend_status: Optional[dict[str, dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], str]:
     """Construct the prepended ACTION REQUIRED header + detail blocks.
 
     Returns (blocks, text_fallback). The fallback replaces the default
@@ -402,7 +402,7 @@ def _build_failure_alert_blocks(
     return [header_block, detail_block], text_fallback
 
 
-def _send_webhook(url: str, payload: dict) -> None:
+def _send_webhook(url: str, payload: dict[str, Any]) -> None:
     """Fire-and-forget POST to a Slack incoming webhook URL."""
     data = json.dumps(payload).encode("utf-8")
     req = Request(url, data=data, headers={"Content-Type": "application/json"})

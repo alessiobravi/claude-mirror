@@ -6,7 +6,7 @@ import socket
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 from urllib.parse import quote as urlquote, unquote as urlunquote
 
 import requests
@@ -164,7 +164,7 @@ class WebDAVBackend(StorageBackend):
         local_path: str,
         rel_path: str,
         root_folder_id: str,
-        file_id=None,
+        file_id: Optional[str] = None,
     ) -> str:
         """Upload with exponential backoff on TRANSIENT/UNKNOWN errors.
 
@@ -410,7 +410,13 @@ class WebDAVBackend(StorageBackend):
     # File listing
     # ------------------------------------------------------------------
 
-    def list_files_recursive(self, folder_id: str, prefix: str = "", progress_cb=None, exclude_folder_names=None) -> list[dict]:
+    def list_files_recursive(
+        self,
+        folder_id: str,
+        prefix: str = "",
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+        exclude_folder_names: Optional[set[str]] = None,
+    ) -> list[dict[str, Any]]:
         """List all files recursively using PROPFIND with Depth: infinity.
 
         Falls back to recursive Depth: 1 calls if the server rejects infinity.
@@ -432,10 +438,10 @@ class WebDAVBackend(StorageBackend):
         self,
         root: ET.Element,
         base_folder: str,
-        exclude_folder_names: Optional[set] = None,
-    ) -> list[dict]:
+        exclude_folder_names: Optional[set[str]] = None,
+    ) -> list[dict[str, Any]]:
         """Parse PROPFIND multistat response into file dicts."""
-        results = []
+        results: list[dict[str, Any]] = []
         excluded = exclude_folder_names or set()
         for response in root.findall(_dav_tag("response")):
             if self._is_collection(response):
@@ -471,10 +477,14 @@ class WebDAVBackend(StorageBackend):
             })
         return results
 
-    def _list_recursive_manual(self, folder_id: str, exclude_folder_names: Optional[set] = None) -> list[dict]:
+    def _list_recursive_manual(
+        self,
+        folder_id: str,
+        exclude_folder_names: Optional[set[str]] = None,
+    ) -> list[dict[str, Any]]:
         """Recursively list files using Depth: 1 (fallback). Prunes excluded
         folders at recursion time so we never PROPFIND into them."""
-        results = []
+        results: list[dict[str, Any]] = []
         excluded = exclude_folder_names or set()
         url = self._url(folder_id)
         try:
@@ -540,10 +550,10 @@ class WebDAVBackend(StorageBackend):
             return checksums.text.strip()
         return ""
 
-    def list_folders(self, parent_id: str, name: Optional[str] = None) -> list[dict]:
+    def list_folders(self, parent_id: str, name: Optional[str] = None) -> list[dict[str, Any]]:
         """List subfolders. Returns dicts with id, name, createdTime."""
         url = self._url(parent_id)
-        results = []
+        results: list[dict[str, Any]] = []
         try:
             root = self._propfind(url, depth="1")
         except requests.HTTPError:
@@ -629,7 +639,7 @@ class WebDAVBackend(StorageBackend):
             # Streaming PUT — read the file lazily one block at a time.
             chunk_size = self._STREAM_CHUNK_BYTES
             with open(local_path, "rb") as f:
-                def _gen():
+                def _gen() -> "Iterator[bytes]":
                     while True:
                         block = f.read(chunk_size)
                         if not block:

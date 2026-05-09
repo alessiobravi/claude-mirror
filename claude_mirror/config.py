@@ -4,7 +4,7 @@ import os
 import socket
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Optional
 
 import yaml
 
@@ -45,8 +45,8 @@ def get_global_profile_override() -> str:
 
 
 def _normalise_routes(
-    raw: Optional[list[dict]], field_name: str
-) -> Optional[list[dict]]:
+    raw: Optional[list[dict[str, Any]]], field_name: str
+) -> Optional[list[dict[str, Any]]]:
     """Validate + fill defaults on a `*_routes` list.
 
     Returns ``None`` when ``raw`` is None or empty so the legacy
@@ -77,7 +77,7 @@ def _normalise_routes(
         # Treat empty list as "not configured" so iter_routes still
         # falls back to the legacy single-channel form.
         return None
-    out: list[dict] = []
+    out: list[dict[str, Any]] = []
     for idx, entry in enumerate(raw, start=1):
         if not isinstance(entry, dict):
             raise ValueError(
@@ -122,7 +122,7 @@ def _normalise_routes(
                         f"non-empty string (got {p!r})"
                     )
             paths_list = list(paths_raw)
-        normalised: dict = {
+        normalised: dict[str, Any] = {
             "webhook_url": url.strip(),
             "on": on_list,
             "paths": paths_list,
@@ -282,10 +282,10 @@ class Config:
     # captures the URL. Routes within a single backend fire sequentially.
     # Cross-backend dispatch is independent (Slack's routes never affect
     # Discord's), and each backend's list is evaluated on its own.
-    slack_routes: Optional[list[dict]] = None
-    discord_routes: Optional[list[dict]] = None
-    teams_routes: Optional[list[dict]] = None
-    webhook_routes: Optional[list[dict]] = None
+    slack_routes: Optional[list[dict[str, Any]]] = None
+    discord_routes: Optional[list[dict[str, Any]]] = None
+    teams_routes: Optional[list[dict[str, Any]]] = None
+    webhook_routes: Optional[list[dict[str, Any]]] = None
 
     # Per-event message templating (v0.5.50+).
     #
@@ -319,7 +319,7 @@ class Config:
     slack_template_format: Optional[dict[str, str]] = None
     discord_template_format: Optional[dict[str, str]] = None
     teams_template_format: Optional[dict[str, str]] = None
-    webhook_template_format: Optional[dict[str, dict]] = None
+    webhook_template_format: Optional[dict[str, dict[str, str]]] = None
     # Snapshot format:
     #   "full"  — every snapshot is a full server-side copy of the project tree
     #             into _claude_mirror_snapshots/{ts}/ (legacy default for existing
@@ -519,7 +519,7 @@ class Config:
         self.teams_routes = _normalise_routes(self.teams_routes, "teams_routes")
         self.webhook_routes = _normalise_routes(self.webhook_routes, "webhook_routes")
 
-    def iter_routes(self, backend: str) -> Iterable[dict]:
+    def iter_routes(self, backend: str) -> Iterable[dict[str, Any]]:
         """Yield the resolved route list for ``backend``.
 
         ``backend`` is one of ``"slack" | "discord" | "teams" | "webhook"``.
@@ -572,7 +572,7 @@ class Config:
             return
 
         if enabled and url:
-            pseudo: dict = {
+            pseudo: dict[str, Any] = {
                 "webhook_url": url,
                 "on": list(_DEFAULT_ROUTE_ACTIONS),
                 "paths": list(_DEFAULT_ROUTE_PATHS),

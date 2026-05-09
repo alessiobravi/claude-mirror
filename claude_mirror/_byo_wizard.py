@@ -275,10 +275,10 @@ class SmokeTestResult:
 
 
 def run_drive_smoke_test(
-    creds,
+    creds: Any,
     folder_id: str,
     *,
-    build_service: Optional[Callable] = None,
+    build_service: Optional[Callable[[Any], Any]] = None,
 ) -> SmokeTestResult:
     """Run a single `drive.files.list(pageSize=1)` call against
     `folder_id`. Return a `SmokeTestResult` with a human-readable reason
@@ -302,7 +302,7 @@ def run_drive_smoke_test(
         # for callers that never run the smoke test (tests, dry-runs).
         from googleapiclient.discovery import build as _build
 
-        def build_service(creds):  # type: ignore[no-redef]
+        def build_service(creds: Any) -> Any:
             return _build("drive", "v3", credentials=creds)
 
     try:

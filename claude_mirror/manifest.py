@@ -7,7 +7,7 @@ import threading
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 
 MANIFEST_FILE = ".claude_mirror_manifest.json"
@@ -170,7 +170,7 @@ class Manifest:
         return True
 
     @staticmethod
-    def _load_entry(v: dict) -> FileState:
+    def _load_entry(v: dict[str, Any]) -> FileState:
         """Parse one manifest entry, accepting v1 / v2 / v3 shapes."""
         synced_hash = v.get("synced_hash", "")
         # v1: drive_file_id; v2/v3: remote_file_id
@@ -219,11 +219,11 @@ class Manifest:
             os.replace(tmp, self._path)
 
     @staticmethod
-    def _dump_entry(s: FileState) -> dict:
+    def _dump_entry(s: FileState) -> dict[str, Any]:
         """Serialise one entry in v3 shape (flat back-compat fields +
         per-backend `remotes` map). Empty `remotes` is omitted to keep
         single-backend manifests visually identical to v2."""
-        out = {
+        out: dict[str, Any] = {
             "synced_hash": s.synced_hash,
             "remote_file_id": s.remote_file_id,
             "synced_at": s.synced_at,

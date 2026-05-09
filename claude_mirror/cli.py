@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, cast
 
 # Suppress gRPC / abseil INFO noise on macOS before gRPC is imported
 os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
@@ -23,7 +23,7 @@ from rich.table import Table
 from rich.text import Text
 
 from . import _byo_wizard
-from .backends import StorageBackend
+from .backends import StorageBackend, redact_error
 from .backends.googledrive import GoogleDriveBackend
 from .config import Config, CONFIG_DIR
 from ._diff import render_diff
@@ -95,7 +95,7 @@ class _JsonMode:
         self._sink: Optional[io.StringIO] = None
         self._saved_stdout: Optional[Any] = None
         self._saved_stderr: Optional[Any] = None
-        self._saved_progress: Optional[tuple] = None
+        self._saved_progress: Optional[tuple[Any, Any, Any]] = None
 
     def __enter__(self) -> "_JsonMode":
         import claude_mirror.cli as _cli_mod
@@ -128,11 +128,11 @@ class _JsonMode:
             getattr(_sync_mod, "make_phase_progress", None),
             getattr(_snap_mod, "make_phase_progress", None),
         )
-        _progress_mod.make_phase_progress = _no_op_progress  # type: ignore[assignment]
+        _progress_mod.make_phase_progress = _no_op_progress  # type: ignore[assignment]  # tests stub the factory; callable signatures intentionally diverge
         if self._saved_progress[1] is not None:
-            _sync_mod.make_phase_progress = _no_op_progress  # type: ignore[assignment]
+            _sync_mod.make_phase_progress = _no_op_progress  # type: ignore[attr-defined,assignment]  # sync.py rebinds the imported factory at module load
         if self._saved_progress[2] is not None:
-            _snap_mod.make_phase_progress = _no_op_progress  # type: ignore[assignment]
+            _snap_mod.make_phase_progress = _no_op_progress  # type: ignore[attr-defined,assignment]  # snapshots.py rebinds the imported factory at module load
         return self
 
     def __exit__(self, *_exc: Any) -> None:
@@ -147,11 +147,11 @@ class _JsonMode:
         if self._saved_sync is not None:
             _sync_mod.console = self._saved_sync
         if self._saved_progress is not None:
-            _progress_mod.make_phase_progress = self._saved_progress[0]  # type: ignore[assignment]
+            _progress_mod.make_phase_progress = self._saved_progress[0]  # restoring the saved factory after the test override
             if self._saved_progress[1] is not None:
-                _sync_mod.make_phase_progress = self._saved_progress[1]  # type: ignore[assignment]
+                _sync_mod.make_phase_progress = self._saved_progress[1]  # type: ignore[attr-defined]  # restore the per-module rebound copy
             if self._saved_progress[2] is not None:
-                _snap_mod.make_phase_progress = self._saved_progress[2]  # type: ignore[assignment]
+                _snap_mod.make_phase_progress = self._saved_progress[2]  # type: ignore[attr-defined]  # restore the per-module rebound copy
         if self._saved_stdout is not None:
             sys.stdout = self._saved_stdout
         if self._saved_stderr is not None:
@@ -1146,8 +1146,8 @@ def _run_wizard(
     backend_default: str = "googledrive",
     *,
     auto_pubsub_setup: bool = False,
-    profile_data: Optional[dict] = None,
-) -> dict:
+    profile_data: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     """Interactive wizard that collects all init parameters. Returns a dict of values.
 
     `backend_default` is the storage backend pre-filled in the first prompt.
@@ -1848,8 +1848,8 @@ def init(
     slack_channel: str,
     slack_flag: bool,
     snapshot_format_opt: str,
-    patterns: tuple,
-    exclude_patterns: tuple,
+    patterns: tuple[str, ...],
+    exclude_patterns: tuple[str, ...],
     credentials_file: str,
     token_file: str,
     config_path: str,
@@ -2086,8 +2086,10 @@ def init(
         if not config_path:
             config_path = _derive_config_path(project_path)
 
-        patterns = list(patterns)
-        exclude_patterns = list(exclude_patterns)
+        # No-op shape coercion — `patterns` arrives as a Click multi-tuple,
+        # but `Config` expects a list. Done outside any branch so the wizard
+        # path (which already provides a list) and the flag path converge.
+        pass
         slack_enabled = slack_flag
         snapshot_format = (snapshot_format_opt or "blobs").lower()
 
@@ -2151,8 +2153,8 @@ def init(
         slack_webhook_url=slack_webhook_url,
         slack_channel=slack_channel,
         snapshot_format=snapshot_format,
-        file_patterns=patterns,
-        exclude_patterns=exclude_patterns,
+        file_patterns=list(patterns),
+        exclude_patterns=list(exclude_patterns),
         credentials_file=credentials_file,
         token_file=token_file,
         backend=backend,
@@ -2402,7 +2404,7 @@ def _auth_check(config: Config) -> None:
     from google.auth.exceptions import RefreshError
 
     try:
-        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)  # type: ignore[no-untyped-call]  # google-auth class methods lack type stubs
     except Exception as e:
         console.print(f"[red]✗ Could not load credentials:[/] {e}")
         return
@@ -2590,8 +2592,8 @@ def _status_watch_sleep(interval: int) -> None:
 def _status_result_dict(
     config_path: str,
     engine: SyncEngine,
-    states: list,
-) -> dict:
+    states: list[Any],
+) -> dict[str, Any]:
     """Build the v1 `status --json` result payload.
 
     Mirrors the Rich table content but in a flat JSON-serialisable form:
@@ -2613,7 +2615,7 @@ def _status_result_dict(
         "new_remote": 0,
         "deleted_local": 0,
     }
-    files: list[dict] = []
+    files: list[dict[str, Any]] = []
     for s in states:
         # Convert Status enum to the schema key. The internal Status enum
         # uses `drive_ahead` / `new_drive` (legacy from the Drive-only
@@ -2679,7 +2681,7 @@ def _build_status_renderable(
         # callbacks fire from inside engine.get_status(). The Progress
         # is transient so the rows clear once the scan completes and the
         # final table can render in their place.
-        from rich.progress import Progress, SpinnerColumn, TextColumn
+        from rich.progress import Progress, SpinnerColumn, TaskID, TextColumn
         from ._progress import _SharedElapsedColumn
 
         with Progress(
@@ -2825,7 +2827,7 @@ def _build_pending_renderable(engine: SyncEngine) -> RenderableType:
     live_files: dict[str, set[str]] = {}
     walk_errors: dict[str, str] = {}
 
-    from rich.progress import Progress, SpinnerColumn, TextColumn
+    from rich.progress import Progress, SpinnerColumn, TaskID, TextColumn
     from ._progress import _SharedElapsedColumn
 
     with Progress(
@@ -2838,14 +2840,14 @@ def _build_pending_renderable(engine: SyncEngine) -> RenderableType:
     ) as progress:
         # Add every mirror's row up-front so the user sees all backends
         # progress simultaneously instead of one-at-a-time.
-        mirror_tasks_p: dict[str, int] = {}
+        mirror_tasks_p: dict[str, "TaskID"] = {}
         for idx, name in enumerate(mirror_names):
             mirror_tasks_p[name] = progress.add_task(
                 name, total=None, detail="queued",
                 show_time=(idx == 0),
             )
 
-        def _walk_mirror_pending(args: tuple) -> None:
+        def _walk_mirror_pending(args: tuple[Any, ...]) -> None:
             backend, name = args
             task = mirror_tasks_p[name]
             progress.update(task, detail="listing")
@@ -3058,7 +3060,7 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
     live_files: dict[str, set[str]] = {}
     walk_errors: dict[str, str] = {}
 
-    from rich.progress import Progress, SpinnerColumn, TextColumn
+    from rich.progress import Progress, SpinnerColumn, TaskID, TextColumn
     from ._progress import _SharedElapsedColumn
 
     with Progress(
@@ -3077,7 +3079,7 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
 
         # Add all mirror task rows up-front so the user sees every
         # backend's progress simultaneously instead of one-at-a-time.
-        mirror_tasks: dict[str, int] = {}
+        mirror_tasks: dict[str, "TaskID"] = {}
         for idx, name in enumerate(mirror_names):
             mirror_tasks[name] = progress.add_task(
                 name, total=None, detail="queued",
@@ -3087,7 +3089,7 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
         # Worker that walks one mirror's tree and stuffs results into
         # `live_files[name]` / `walk_errors[name]` under thread-safe
         # writes (dict assignment is GIL-atomic in CPython).
-        def _walk_mirror(args: tuple) -> None:
+        def _walk_mirror(args: tuple[Any, ...]) -> None:
             mirror, name = args
             task = mirror_tasks[name]
             progress.update(task, detail="listing")
@@ -3130,7 +3132,7 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
         # instead of get_status() + sum(mirror_walks).
         from concurrent.futures import ThreadPoolExecutor as _TPE
 
-        def _run_get_status() -> list:
+        def _run_get_status() -> list[Any]:
             return engine.get_status(
                 on_local=lambda msg: progress.update(local_task, detail=msg),
                 on_remote=lambda msg: progress.update(primary_task, detail=msg),
@@ -3180,7 +3182,7 @@ def _build_status_by_backend_renderable(engine: SyncEngine) -> RenderableType:
     def _bump(name: str, key: str) -> None:
         tallies[name][key] = tallies[name].get(key, 0) + 1
 
-    def _mirror_cell_when_primary_in_sync(name: str, fs, rel_path: str) -> tuple[str, str]:
+    def _mirror_cell_when_primary_in_sync(name: str, fs: Any, rel_path: str) -> tuple[str, str]:
         """Per-mirror cell when the primary says the file is in sync —
         the mirror's outcome depends on its own live presence + manifest
         recorded state."""
@@ -3444,7 +3446,7 @@ def sync(config_path: str, no_prompt: bool, strategy: Optional[str]) -> None:
 @click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
 @click.option("--force-local", is_flag=True, default=False,
               help="Treat local content as authoritative: push all changed files without interactive conflict resolution.")
-def push(files: tuple, config_path: str, force_local: bool) -> None:
+def push(files: tuple[Any, ...], config_path: str, force_local: bool) -> None:
     """Push local changes to Drive. Optionally specify FILES to push."""
     engine, cfg, _ = _load_engine(_resolve_config(config_path))
     engine.push(list(files) if files else None, force_local=force_local)
@@ -3563,7 +3565,7 @@ def diff(path: str, config_path: str, context_lines: int) -> None:
 @click.argument("files", nargs=-1)
 @click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
 @click.option("--output", default="", help="Download files to this directory instead of the project path. Does not update local files or the manifest.")
-def pull(files: tuple, config_path: str, output: str) -> None:
+def pull(files: tuple[Any, ...], config_path: str, output: str) -> None:
     """Pull remote changes from Drive. Optionally specify FILES to pull."""
     engine, _, _ = _load_engine(_resolve_config(config_path), with_pubsub=not output)
     engine.pull(list(files) if files else None, output_dir=output or None)
@@ -3573,7 +3575,7 @@ def pull(files: tuple, config_path: str, output: str) -> None:
 @click.argument("files", nargs=-1, required=True)
 @click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
 @click.option("--local", is_flag=True, default=False, help="Also delete the local file(s).")
-def delete(files: tuple, config_path: str, local: bool) -> None:
+def delete(files: tuple[Any, ...], config_path: str, local: bool) -> None:
     """Delete FILES from remote storage (and optionally local).
 
     Removes the specified files from the configured storage backend and clears
@@ -3709,7 +3711,7 @@ def watch(config_path: str, once: bool, quiet: bool) -> None:
                                                "files": event.files, "project": event.project,
                                                "action": event.action})
 
-    def _handle_signal(sig, frame):
+    def _handle_signal(sig: int, frame: Any) -> None:
         console.print("\n[dim]Stopping watcher...[/]")
         stop_event.set()
 
@@ -3756,7 +3758,7 @@ def watch(config_path: str, once: bool, quiet: bool) -> None:
         console.print("[dim]Watcher stopped.[/]")
 
 
-def _make_watch_callback(cfg: Config, n: Notifier) -> Callable:
+def _make_watch_callback(cfg: Config, n: Notifier) -> Callable[[SyncEvent], None]:
     """Create a per-project callback for Pub/Sub watch events."""
     def on_event(event: SyncEvent) -> None:
         files_str = ", ".join(event.files) if event.files else "files"
@@ -3818,7 +3820,7 @@ def _start_watcher(
 @cli.command("watch-all")
 @click.option("--config", "config_paths", multiple=True,
               help="Config file(s) to watch. Repeatable. Defaults to all configs in ~/.config/claude_mirror/.")
-def watch_all(config_paths: tuple) -> None:
+def watch_all(config_paths: tuple[Any, ...]) -> None:
     """
     Watch all projects simultaneously (one subscription per config).
     Discovers all configs in ~/.config/claude_mirror/ unless --config is given.
@@ -3891,11 +3893,11 @@ def watch_all(config_paths: tuple) -> None:
         console.print("[red]No watchers started.[/]")
         sys.exit(1)
 
-    def _handle_stop(sig, frame):
+    def _handle_stop(sig: int, frame: Any) -> None:
         console.print("\n[dim]Stopping all watchers...[/]")
         stop_event.set()
 
-    def _handle_reload(sig, frame):
+    def _handle_reload(sig: int, frame: Any) -> None:
         """SIGHUP: re-scan configs and start watchers for any new projects."""
         if use_auto_discover:
             new_paths = sorted(str(p) for p in CONFIG_DIR.glob("*.yaml"))
@@ -3927,7 +3929,7 @@ def watch_all(config_paths: tuple) -> None:
     # the first time a new version is observed (cache prevents re-notifying
     # for the same version on subsequent wake-ups). Best-effort; any
     # failure inside the timer thread is silently swallowed.
-    def _periodic_update_check():
+    def _periodic_update_check() -> None:
         import time as _time
         try:
             from ._update_check import check_for_update
@@ -4137,16 +4139,16 @@ def update(do_apply: bool, skip_confirm: bool) -> None:
             sys.exit(1)
         if cmd == "pipx upgrade claude-mirror":
             # Non-editable install path — single command, no cwd needed.
-            result = _sp.run(
+            upgrade_result = _sp.run(
                 ["pipx", "upgrade", "claude-mirror"], check=False,
             )
-            if result.returncode != 0:
+            if upgrade_result.returncode != 0:
                 console.print(
-                    f"\n[red]✗ Update failed (exit code {result.returncode}).[/] "
+                    f"\n[red]✗ Update failed (exit code {upgrade_result.returncode}).[/] "
                     f"See output above for the underlying error (typically "
                     f"a network failure or pipx issue)."
                 )
-                sys.exit(result.returncode)
+                sys.exit(upgrade_result.returncode)
         else:
             # Editable install path — resolve the repo root from the
             # package location and run git+pipx as separate list-form
@@ -4252,7 +4254,7 @@ def snapshots(config_path: str, json_output: bool) -> None:
     snap.show_list()
 
 
-def _snapshot_entry_to_json(entry: dict) -> dict:
+def _snapshot_entry_to_json(entry: dict[str, Any]) -> dict[str, Any]:
     """Project a SnapshotManager.list() dict into the v1 JSON schema.
 
     Schema: {timestamp, format, file_count, size_bytes_or_null, source_backend}
@@ -4296,7 +4298,7 @@ def _snapshot_entry_to_json(entry: dict) -> dict:
                    "disk. Exits 0 after printing the plan. Default: "
                    "--no-dry-run (the actual restore runs as before).")
 @click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
-def restore(timestamp: str, paths: tuple, output: str, backend_name: str,
+def restore(timestamp: str, paths: tuple[Any, ...], output: str, backend_name: str,
             dry_run: bool, config_path: str) -> None:
     """
     Restore a snapshot to a local directory.
@@ -4377,7 +4379,7 @@ def restore(timestamp: str, paths: tuple, output: str, backend_name: str,
     )
 
 
-def _render_restore_plan(plan: dict, paths: Optional[list]) -> None:
+def _render_restore_plan(plan: dict[str, Any], paths: Optional[list[str]]) -> None:
     """Print a Rich table for `claude-mirror restore --dry-run`. Columns:
     Path / Action / Source backend / Size. Ends with a one-line summary."""
     files = plan["files"]
@@ -4774,7 +4776,7 @@ def history(path: str, since: str, until: str, config_path: str, json_output: bo
                 storage = _create_storage(config)
                 snap = SnapshotManager(config, storage)
                 history_data = snap.history(path, since=since_dt, until=until_dt)
-            versions: list[dict] = []
+            versions: list[dict[str, Any]] = []
             for entry in history_data.get("entries", []):
                 versions.append({
                     "timestamp": entry.get("timestamp", ""),
@@ -4935,7 +4937,7 @@ def snapshot_diff(ts1: str, ts2: str, show_all: bool, path_filter: str,
                 "[red]Cannot resolve 'latest': no snapshots found on remote.[/]"
             )
             sys.exit(1)
-        return listing[0]["timestamp"]
+        return cast(str, listing[0]["timestamp"])
 
     try:
         resolved_ts1 = _resolve(ts1)
@@ -4960,7 +4962,7 @@ def snapshot_diff(ts1: str, ts2: str, show_all: bool, path_filter: str,
 
 
 def _classify_files(
-    manifest1: dict, manifest2: dict,
+    manifest1: dict[str, Any], manifest2: dict[str, Any],
 ) -> dict[str, list[str]]:
     """Bucket every path into added/removed/modified/unchanged based on
     the per-format identifier in the two manifest dicts."""
@@ -4987,7 +4989,7 @@ def _classify_files(
 
 def _line_diff_counts(
     snap: SnapshotManager,
-    manifest1: dict, manifest2: dict, path: str,
+    manifest1: dict[str, Any], manifest2: dict[str, Any], path: str,
 ) -> tuple[Optional[int], Optional[int], bool]:
     """For a `modified` file, fetch both blob bodies and return
     `(plus_count, minus_count, is_binary)`. Returns `(None, None, True)`
@@ -5029,7 +5031,7 @@ def _line_diff_counts(
 
 def _render_snapshot_diff(
     snap: SnapshotManager,
-    manifest1: dict, manifest2: dict,
+    manifest1: dict[str, Any], manifest2: dict[str, Any],
     ts1: str, ts2: str,
     show_all: bool,
     path_filter: Optional[str],
@@ -5101,7 +5103,7 @@ def _render_snapshot_diff(
 
 def _emit_unified_diff(
     snap: SnapshotManager,
-    manifest1: dict, manifest2: dict,
+    manifest1: dict[str, Any], manifest2: dict[str, Any],
     path: str,
 ) -> None:
     """Print a standard `diff -u`-format unified diff for ONE file
@@ -5119,7 +5121,7 @@ def _emit_unified_diff(
         )
         sys.exit(1)
 
-    def _fetch(manifest: dict) -> bytes:
+    def _fetch(manifest: dict[str, Any]) -> bytes:
         if path not in manifest["files"]:
             return b""
         return snap.get_blob_content(
@@ -5180,7 +5182,7 @@ def _emit_unified_diff(
 @click.option("--config", "config_path", default="",
               help="Config file path. Auto-detected from cwd if omitted.")
 def forget(
-    timestamps: tuple,
+    timestamps: tuple[Any, ...],
     before: str,
     keep_last: Optional[int],
     keep_days: Optional[int],
@@ -5230,7 +5232,7 @@ def forget(
         )
         sys.exit(1)
 
-    selector_kwargs = dict(
+    selector_kwargs: dict[str, Any] = dict(
         timestamps=list(timestamps) or None,
         before=before or None,
         keep_last=keep_last,
@@ -5960,7 +5962,7 @@ def log(config_path: str, limit: int, json_output: bool) -> None:
                 raw = storage.download_file(log_file_id)
                 sync_log = SyncLog.from_bytes(raw)
             events = sync_log.events[-limit:]
-            payload: list[dict] = []
+            payload: list[dict[str, Any]] = []
             # Newest-first to match the Rich render.
             for event in reversed(events):
                 payload.append({
@@ -6084,7 +6086,7 @@ Register-ArgumentCompleter -Native -CommandName %(prog_name)s -ScriptBlock {
 """
 
 
-def _build_powershell_complete_class():
+def _build_powershell_complete_class() -> Any:
     """Return a `PowerShellComplete` ShellComplete subclass.
 
     Defined as a function so Click's `ShellComplete` import only happens
@@ -6342,7 +6344,7 @@ _PUBSUB_SCOPE = "https://www.googleapis.com/auth/pubsub"
 
 def _googledrive_deep_check_factory(
     config: "Config", token_path: "Path"
-) -> dict:
+) -> dict[str, Any]:
     """Build the OAuth credentials + Pub/Sub admin client used by the deep
     Google Drive doctor checks.
 
@@ -6390,7 +6392,7 @@ def _googledrive_deep_check_factory(
         from google.oauth2.credentials import Credentials  # noqa: PLC0415
         from google.cloud import pubsub_v1  # noqa: PLC0415
 
-        creds = Credentials.from_authorized_user_file(
+        creds = Credentials.from_authorized_user_file(  # type: ignore[no-untyped-call]  # google-auth class methods lack type stubs
             str(token_path),
             [_DRIVE_SCOPE, _PUBSUB_SCOPE],
         )
@@ -6957,7 +6959,7 @@ def _run_dropbox_deep_checks(path: str, config: "Config") -> list[str]:
         # be noise. Bail silently.
         return failures
 
-    token_data: dict = {}
+    token_data: dict[str, Any] = {}
     try:
         raw = token_path.read_text()
         parsed = _json_local.loads(raw)
@@ -7421,7 +7423,7 @@ _AZURE_CLIENT_ID_RE = (
 
 def _onedrive_deep_check_factory(
     config: "Config", token_path: "Path"
-) -> dict:
+) -> dict[str, Any]:
     """Build the MSAL PublicClientApplication + cached account used by
     the deep OneDrive doctor checks.
 
@@ -8318,7 +8320,7 @@ def _run_webdav_deep_checks(path: str, config: "Config") -> list[str]:
 
 def _sftp_deep_check_factory(
     config: "Config",
-) -> dict:
+) -> dict[str, Any]:
     """Build the live SSH key (post-handshake) used by the SFTP deep
     checks, plus the resolved key-file path on disk.
 

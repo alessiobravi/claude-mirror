@@ -333,12 +333,12 @@ class SFTPBackend(StorageBackend):
         folder_id: str,
         prefix: str = "",
         progress_cb: Optional[Callable[[int, int], None]] = None,
-        exclude_folder_names: Optional[set] = None,
-    ) -> list[dict]:
+        exclude_folder_names: Optional[set[str]] = None,
+    ) -> list[dict[str, Any]]:
         """Recursive walk via `listdir_attr`. md5 is None — SFTP has no
         native checksum, so the engine falls back to size+mtime+local-hash."""
         excluded = exclude_folder_names or set()
-        results: list[dict] = []
+        results: list[dict[str, Any]] = []
         folders_done = 0
         files_seen = 0
 
@@ -376,9 +376,9 @@ class SFTPBackend(StorageBackend):
             progress_cb(folders_done, files_seen)
         return results
 
-    def list_folders(self, parent_id: str, name: Optional[str] = None) -> list[dict]:
+    def list_folders(self, parent_id: str, name: Optional[str] = None) -> list[dict[str, Any]]:
         """List subfolders. If `name` given, filter to exact match."""
-        results: list[dict] = []
+        results: list[dict[str, Any]] = []
         try:
             entries = self.sftp.listdir_attr(parent_id)
         except IOError:

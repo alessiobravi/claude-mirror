@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Optional, Union
+from typing import Any, Optional, Union
 from urllib.error import URLError, HTTPError
 from urllib.request import Request, urlopen
 
@@ -145,8 +145,8 @@ def _render_str_template(template: str, event: SyncEvent) -> str:
 
 
 def _render_dict_template(
-    template: dict, event: SyncEvent,
-) -> dict:
+    template: dict[str, Any], event: SyncEvent,
+) -> dict[str, Any]:
     """Render a dict-of-format-strings template (used by Generic webhook).
 
     Each value is run through ``str.format``; non-string values pass
@@ -157,7 +157,7 @@ def _render_dict_template(
     if not template:
         raise KeyError("__empty_template__")
     vars_ = event_template_vars(event)
-    out: dict = {}
+    out: dict[str, Any] = {}
     for key, val in template.items():
         if isinstance(val, str):
             out[key] = val.format(**vars_)
@@ -213,7 +213,7 @@ class WebhookNotifier(ABC):
         webhook_url: str,
         extra_headers: Optional[dict[str, str]] = None,
         *,
-        templates: Optional[dict] = None,
+        templates: Optional[dict[str, Any]] = None,
     ) -> None:
         self.webhook_url = webhook_url
         # Defensive copy so a caller mutating the dict afterward can't
@@ -226,11 +226,11 @@ class WebhookNotifier(ABC):
         # defensively copy so an upstream config object that gets
         # mutated after construction can't change a long-lived
         # notifier's template choice mid-flight.
-        self.templates: Optional[dict] = (
+        self.templates: Optional[dict[str, Any]] = (
             dict(templates) if templates else None
         )
 
-    def _config_template_for(self, action: str) -> Optional[Union[str, dict]]:
+    def _config_template_for(self, action: str) -> Optional[Union[str, dict[str, Any]]]:
         """Return the configured template for ``action``, or ``None``.
 
         Per-action lookup, NOT per-event: the same template applies to
@@ -247,7 +247,7 @@ class WebhookNotifier(ABC):
         """Friendly backend name for log lines."""
         return self.BACKEND_LABEL or type(self).__name__
 
-    def post_json(self, payload: dict, *, timeout_seconds: float = 5.0) -> bool:
+    def post_json(self, payload: dict[str, Any], *, timeout_seconds: float = 5.0) -> bool:
         """POST ``payload`` as JSON to ``self.webhook_url``.
 
         Returns ``True`` on any 2xx HTTP response, ``False`` on network
@@ -297,7 +297,7 @@ class WebhookNotifier(ABC):
             return False
 
     @abstractmethod
-    def _format_event(self, event: SyncEvent) -> dict:
+    def _format_event(self, event: SyncEvent) -> dict[str, Any]:
         """Build the backend-specific JSON payload for ``event``."""
 
     def notify(self, event: SyncEvent) -> None:
@@ -330,7 +330,7 @@ class DiscordWebhookNotifier(WebhookNotifier):
 
     BACKEND_LABEL = "Discord"
 
-    def _format_event(self, event: SyncEvent) -> dict:
+    def _format_event(self, event: SyncEvent) -> dict[str, Any]:
         _hex, decimal_color = _color_for(event.action)
         file_count = len(event.files)
         file_word = "file" if file_count == 1 else "files"
@@ -396,7 +396,7 @@ class TeamsWebhookNotifier(WebhookNotifier):
 
     BACKEND_LABEL = "Teams"
 
-    def _format_event(self, event: SyncEvent) -> dict:
+    def _format_event(self, event: SyncEvent) -> dict[str, Any]:
         hex_color, _decimal = _color_for(event.action)
         # MessageCard themeColor is a hex string without the `#` prefix.
         theme_color = hex_color.lstrip("#")
@@ -462,7 +462,7 @@ class GenericWebhookNotifier(WebhookNotifier):
     SCHEMA_VERSION = 1
     BACKEND_LABEL = "Generic"
 
-    def _format_event(self, event: SyncEvent) -> dict:
+    def _format_event(self, event: SyncEvent) -> dict[str, Any]:
         # Cap files so a 10k-file push doesn't ship a 5 MB envelope to a
         # tiny n8n webhook. We keep ALL files (no truncation marker) up
         # to MAX_FILES_PER_EVENT, since that cap is already enforced at

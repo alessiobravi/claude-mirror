@@ -32,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, List, Optional, cast
 
 from rich.console import Console
 from rich.table import Table
@@ -105,11 +105,12 @@ def _human_size(n: int) -> str:
     expected to check for that before calling."""
     if n < 1024:
         return f"{n} B"
+    size: float = float(n)
     for unit in ("K", "M", "G", "T"):
-        n /= 1024.0
-        if n < 1024 or unit == "T":
-            return f"{n:.1f} {unit}B"
-    return f"{n:.1f} TB"
+        size /= 1024.0
+        if size < 1024 or unit == "T":
+            return f"{size:.1f} {unit}B"
+    return f"{size:.1f} TB"
 
 
 def parse_relative_or_iso_date(value: str, flag_label: str = "date") -> datetime:
@@ -227,7 +228,7 @@ class SnapshotManager:
         rf = getattr(backend, "root_folder", None)
         if callable(rf):
             try:
-                return rf()
+                return cast(str, rf())
             except Exception:
                 pass
         elif isinstance(rf, str) and rf:
@@ -389,7 +390,7 @@ class SnapshotManager:
             and not f["name"].startswith("_claude_mirror_")
         ]
 
-        def _copy_one(file_info: dict) -> None:
+        def _copy_one(file_info: dict[str, Any]) -> None:
             rel_path = file_info["relative_path"]
             parent_id, filename = backend.resolve_path(rel_path, snapshot_folder_id)
             backend.copy_file(
@@ -648,7 +649,7 @@ class SnapshotManager:
     # Listing — both formats combined
     # ------------------------------------------------------------------
 
-    def list(self, _external_progress=None) -> list[dict]:
+    def list(self, _external_progress: Any = None) -> List[dict[str, Any]]:
         """Return snapshots sorted newest-first, mixing both formats.
         Each entry has a `format` field of "full" or "blobs".
 
@@ -657,13 +658,15 @@ class SnapshotManager:
         gc / migrate so the whole command shares one live region).
         """
         snapshots_folder_id = self._get_snapshots_folder()
-        results: list[dict] = []
+        results: list[dict[str, Any]] = []
 
         progress = _external_progress
         own_progress = progress is None
         ctx = make_phase_progress(console) if own_progress else None
         if own_progress:
+            assert ctx is not None
             progress = ctx.__enter__()
+        assert progress is not None
         try:
             scan_task = progress.add_task(
                 "Scanning", total=None,
@@ -710,8 +713,8 @@ class SnapshotManager:
                 show_time=False,
             )
 
-            def _fetch_full_meta(item: dict) -> dict:
-                meta: dict = {}
+            def _fetch_full_meta(item: dict[str, Any]) -> dict[str, Any]:
+                meta: dict[str, Any] = {}
                 try:
                     meta_id = self.storage.get_file_id(SNAPSHOT_META_FILE, item["id"])
                     if meta_id:
@@ -727,8 +730,8 @@ class SnapshotManager:
                     **meta,
                 }
 
-            def _fetch_blob_meta(item: dict) -> dict:
-                meta: dict = {}
+            def _fetch_blob_meta(item: dict[str, Any]) -> dict[str, Any]:
+                meta: dict[str, Any] = {}
                 try:
                     raw = self.storage.download_file(item["id"])
                     meta = json.loads(raw)
@@ -776,6 +779,7 @@ class SnapshotManager:
             progress.update(blobs_task, detail="completed")
         finally:
             if own_progress:
+                assert ctx is not None
                 ctx.__exit__(None, None, None)
 
         # Newest first by timestamp string (ISO-ish, sorts correctly).
@@ -786,7 +790,7 @@ class SnapshotManager:
     # Inspect — view a snapshot's contents (path/hash/size)
     # ------------------------------------------------------------------
 
-    def inspect(self, timestamp: str, backend_name: Optional[str] = None) -> dict:
+    def inspect(self, timestamp: str, backend_name: Optional[str] = None) -> dict[str, Any]:
         """Return a structured view of a snapshot's contents. Auto-detects
         format. Returns a dict with `format`, `timestamp`, `metadata`,
         and `files`. For `blobs`, each file dict has `path` + `hash`.
@@ -852,7 +856,7 @@ class SnapshotManager:
 
     def _try_inspect_on(
         self, backend: StorageBackend, timestamp: str,
-    ) -> Optional[dict]:
+    ) -> Optional[dict[str, Any]]:
         """Probe `backend` for `timestamp`. Returns the inspect dict if
         found, None if not. Re-raises unexpected backend errors so the
         caller can decide whether to fall through to the next mirror."""
@@ -872,12 +876,12 @@ class SnapshotManager:
 
         return None
 
-    def _inspect_blobs(self, timestamp: str, manifest_id: str) -> dict:
+    def _inspect_blobs(self, timestamp: str, manifest_id: str) -> dict[str, Any]:
         return self._inspect_blobs_on(self.storage, timestamp, manifest_id)
 
     def _inspect_blobs_on(
         self, backend: StorageBackend, timestamp: str, manifest_id: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         raw = backend.download_file(manifest_id)
         manifest = json.loads(raw)
         files = sorted(
@@ -899,12 +903,12 @@ class SnapshotManager:
             "files": list(files),
         }
 
-    def _inspect_full(self, timestamp: str, folder_id: str) -> dict:
+    def _inspect_full(self, timestamp: str, folder_id: str) -> dict[str, Any]:
         return self._inspect_full_on(self.storage, timestamp, folder_id)
 
     def _inspect_full_on(
         self, backend: StorageBackend, timestamp: str, folder_id: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         entries = backend.list_files_recursive(folder_id)
         entries = [f for f in entries if f["name"] != SNAPSHOT_META_FILE]
         files = sorted(
@@ -918,7 +922,7 @@ class SnapshotManager:
             ),
             key=lambda x: x["path"],
         )
-        meta: dict = {}
+        meta: dict[str, Any] = {}
         try:
             meta_id = backend.get_file_id(SNAPSHOT_META_FILE, folder_id)
             if meta_id:
@@ -947,7 +951,7 @@ class SnapshotManager:
         path: str,
         since: Optional[datetime] = None,
         until: Optional[datetime] = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Return the path's version timeline across every snapshot on
         remote. For `blobs` snapshots the SHA-256 hash gives true version
         identity (consecutive identical hashes = file unchanged). For
@@ -975,7 +979,7 @@ class SnapshotManager:
         blobs_snaps = [s for s in snapshots if s.get("format") == "blobs"]
         full_snaps = [s for s in snapshots if s.get("format") == "full"]
 
-        def _check_blobs(snap: dict) -> Optional[dict]:
+        def _check_blobs(snap: dict[str, Any]) -> Optional[dict[str, Any]]:
             try:
                 raw = self.storage.download_file(snap["manifest_id"])
                 manifest = json.loads(raw)
@@ -990,7 +994,7 @@ class SnapshotManager:
                 pass
             return None
 
-        def _check_full(snap: dict) -> Optional[dict]:
+        def _check_full(snap: dict[str, Any]) -> Optional[dict[str, Any]]:
             # Walk path components from the snapshot root using cheap
             # per-component lookups (one API call per component) instead
             # of a full recursive BFS over the snapshot folder. For a
@@ -1016,7 +1020,7 @@ class SnapshotManager:
                 pass
             return None
 
-        entries: list[dict] = []
+        entries: list[dict[str, Any]] = []
         if blobs_snaps:
             workers = min(self.config.parallel_workers, len(blobs_snaps))
             with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -1064,7 +1068,7 @@ class SnapshotManager:
         path: str,
         since: Optional[datetime] = None,
         until: Optional[datetime] = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Render the path's version timeline as a table. Returns the
         history() dict so callers can reuse it. `since` / `until` are
         timezone-aware UTC datetimes that, when set, restrict the scan
@@ -1140,7 +1144,7 @@ class SnapshotManager:
         timestamp: str,
         path_filter: Optional[str] = None,
         backend_name: Optional[str] = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Print the snapshot contents as a metadata header + file table.
         path_filter: optional fnmatch glob (e.g. `memory/**`) to filter
         the displayed file list — the underlying manifest is unchanged.
@@ -1208,7 +1212,7 @@ class SnapshotManager:
         console.print(table)
         return result
 
-    def show_list(self) -> list[dict]:
+    def show_list(self) -> List[dict[str, Any]]:
         snapshots = self.list()
         if not snapshots:
             console.print("[dim]No snapshots found.[/]")
@@ -1245,7 +1249,7 @@ class SnapshotManager:
 
     def restore(
         self, timestamp: str, output_path: str,
-        paths: Optional[list[str]] = None,
+        paths: Optional[List[str]] = None,
         backend_name: Optional[str] = None,
     ) -> None:
         """Restore the snapshot at `timestamp` into `output_path`. Auto-detects
@@ -1376,7 +1380,7 @@ class SnapshotManager:
         backend: StorageBackend,
         timestamp: str,
         output_path: str,
-        paths: Optional[list[str]],
+        paths: Optional[List[str]],
     ) -> bool:
         """Attempt to restore `timestamp` from `backend`. Returns True if
         the snapshot was found (and restored), False if it doesn't exist
@@ -1404,7 +1408,7 @@ class SnapshotManager:
 
         return False
 
-    def _matches_paths(self, rel_path: str, paths: list[str]) -> bool:
+    def _matches_paths(self, rel_path: str, paths: List[str]) -> bool:
         """True if rel_path matches any entry in `paths` — either an exact
         match or an fnmatch glob (e.g. `memory/**`, `*.md`)."""
         for p in paths:
@@ -1414,7 +1418,7 @@ class SnapshotManager:
 
     def _restore_full(
         self, backend: StorageBackend, timestamp: str, output_path: str,
-        snapshot_folder_id: str, paths: Optional[list[str]] = None,
+        snapshot_folder_id: str, paths: Optional[List[str]] = None,
     ) -> None:
         """Restore a full-format snapshot from the given `backend`."""
         all_files = backend.list_files_recursive(snapshot_folder_id)
@@ -1445,8 +1449,8 @@ class SnapshotManager:
             f"({scope})"
         )
 
-        def _download_one(file_info: dict) -> str:
-            rel_path = file_info["relative_path"]
+        def _download_one(file_info: dict[str, Any]) -> str:
+            rel_path: str = file_info["relative_path"]
             target = _safe_join(dest, rel_path)
             target.parent.mkdir(parents=True, exist_ok=True)
             content = backend.download_file(file_info["id"])
@@ -1470,7 +1474,7 @@ class SnapshotManager:
 
     def _restore_blobs(
         self, backend: StorageBackend, timestamp: str, output_path: str,
-        manifest_id: str, paths: Optional[list[str]] = None,
+        manifest_id: str, paths: Optional[List[str]] = None,
     ) -> None:
         """Restore a blobs-format snapshot from the given `backend`."""
         manifest_raw = backend.download_file(manifest_id)
@@ -1559,9 +1563,9 @@ class SnapshotManager:
     def plan_restore(
         self,
         timestamp: str,
-        paths: Optional[list[str]] = None,
+        paths: Optional[List[str]] = None,
         backend_name: Optional[str] = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Return what `restore(timestamp, ...)` WOULD do without writing
         anything. Walks the same primary-first/mirror-fallback dispatch as
         `restore`, but stops at the manifest-load step.
@@ -1611,6 +1615,7 @@ class SnapshotManager:
             # display: the real restore will redo the dispatch, and the
             # CLI banner makes clear the plan is a preview only.
             try:
+                assert backend is not None  # checked above (mirror fallback always returns one)
                 blobs_folder_id = self._get_blobs_folder_for(backend)
                 present = {
                     e["name"] for e in backend.list_files_recursive(blobs_folder_id)
@@ -1622,7 +1627,7 @@ class SnapshotManager:
                 if h and h not in present:
                     missing_hashes.add(h)
 
-        plan_files: list[dict] = []
+        plan_files: list[dict[str, Any]] = []
         for f in files:
             h = f.get("hash")
             size = f.get("size")
@@ -1652,7 +1657,7 @@ class SnapshotManager:
 
     def get_snapshot_manifest(
         self, timestamp: str, backend_name: Optional[str] = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Return a normalized view of a snapshot suitable for diffing.
 
         Output dict::
@@ -1766,7 +1771,7 @@ class SnapshotManager:
     # Garbage collection (blobs format only)
     # ------------------------------------------------------------------
 
-    def gc(self, dry_run: bool = False, backend_name: Optional[str] = None) -> dict:
+    def gc(self, dry_run: bool = False, backend_name: Optional[str] = None) -> dict[str, Any]:
         """Delete blobs no longer referenced by any v2 manifest.
 
         backend_name: when None (default), gc operates on the primary
@@ -1796,7 +1801,7 @@ class SnapshotManager:
         Returns: summary dict with counts.
         """
         # Resolve which backend to gc against.
-        target_backend = self.storage  # default: primary
+        target_backend: StorageBackend = self.storage  # default: primary
         if backend_name is not None:
             primary_name = (
                 getattr(self.storage, "backend_name", "") or "primary"
@@ -1804,12 +1809,12 @@ class SnapshotManager:
             if backend_name == primary_name:
                 target_backend = self.storage
             else:
-                target_backend = next(
+                resolved: Optional[StorageBackend] = next(
                     (b for b in self._mirrors
                      if (getattr(b, "backend_name", "") or "") == backend_name),
                     None,
                 )
-                if target_backend is None:
+                if resolved is None:
                     available = [primary_name] + [
                         getattr(b, "backend_name", "?") or "?"
                         for b in self._mirrors
@@ -1818,6 +1823,7 @@ class SnapshotManager:
                         f"No backend named {backend_name!r} configured for "
                         f"this project. Available: {', '.join(available)}"
                     )
+                target_backend = resolved
         snapshots_folder_id = self._get_snapshots_folder_for(target_backend)
         blobs_folder_id = self._get_blobs_folder_for(target_backend)
 
@@ -1830,7 +1836,7 @@ class SnapshotManager:
             blob_folders_seen = 0
             blob_files_seen = 0
 
-            def _blob_cb(folders_done, files_seen):
+            def _blob_cb(folders_done: int, files_seen: int) -> None:
                 nonlocal blob_folders_seen, blob_files_seen
                 blob_folders_seen = folders_done
                 blob_files_seen = files_seen
@@ -1930,7 +1936,7 @@ class SnapshotManager:
             deleted = 0
             done = 0
 
-            def _delete_one(entry: dict) -> bool:
+            def _delete_one(entry: dict[str, Any]) -> bool:
                 try:
                     target_backend.delete_file(entry["id"])
                     return True
@@ -1963,7 +1969,7 @@ class SnapshotManager:
     # Migration: full <-> blobs
     # ------------------------------------------------------------------
 
-    def migrate(self, target: str, dry_run: bool = False, keep_source: bool = False) -> dict:
+    def migrate(self, target: str, dry_run: bool = False, keep_source: bool = False) -> dict[str, Any]:
         """Convert every snapshot on remote to `target` format ("blobs" or
         "full"). Idempotent: re-running skips snapshots already in the
         target format. Atomic per snapshot: the source artifact is only
@@ -2158,12 +2164,12 @@ class SnapshotManager:
 
     def forget(
         self,
-        timestamps: Optional[list[str]] = None,
+        timestamps: Optional[List[str]] = None,
         before: Optional[str] = None,
         keep_last: Optional[int] = None,
         keep_days: Optional[int] = None,
         dry_run: bool = False,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Delete snapshots matching one of the four selectors.
 
         timestamps: explicit list — delete snapshots whose timestamp string
@@ -2268,7 +2274,7 @@ class SnapshotManager:
         keep_monthly: int = 0,
         keep_yearly: int = 0,
         dry_run: bool = True,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Apply a multi-bucket retention policy to the snapshot set.
 
         Each non-zero parameter contributes timestamps to a "keep" set;
@@ -2370,7 +2376,7 @@ class SnapshotManager:
 
     def _compute_retention_keep_set(
         self,
-        snapshots: list[dict],
+        snapshots: List[dict[str, Any]],
         *,
         keep_last: int,
         keep_daily: int,
@@ -2390,8 +2396,8 @@ class SnapshotManager:
             for s in snapshots[:keep_last]:
                 keep.add(s["timestamp"])
 
-        def _bucket_pick(key_fn, n: int) -> None:
-            seen: set = set()
+        def _bucket_pick(key_fn: Callable[[datetime], Any], n: int) -> None:
+            seen: set[Any] = set()
             for s in snapshots:
                 k = key_fn(self._parse_snapshot_ts(s["timestamp"]))
                 if k in seen:
@@ -2412,12 +2418,12 @@ class SnapshotManager:
 
     def _select_to_forget(
         self,
-        snapshots: list[dict],
-        timestamps: Optional[list[str]],
+        snapshots: List[dict[str, Any]],
+        timestamps: Optional[List[str]],
         before: Optional[str],
         keep_last: Optional[int],
         keep_days: Optional[int],
-    ) -> list[dict]:
+    ) -> List[dict[str, Any]]:
         """Compute the list of snapshots to delete from one of four selectors.
         snapshots is already sorted newest-first by `list()`."""
         if timestamps:
@@ -2490,7 +2496,7 @@ class SnapshotManager:
             return False
         return True
 
-    def _forget_one(self, snap: dict) -> None:
+    def _forget_one(self, snap: dict[str, Any]) -> None:
         """Delete a single snapshot's on-remote artifacts. Format-specific:
         full → delete the folder (cascades to all its files). blobs →
         delete only the manifest JSON; blobs are reclaimed later by gc."""
@@ -2513,7 +2519,7 @@ class SnapshotManager:
             return
         raise RuntimeError(f"unknown snapshot format: {fmt!r}")
 
-    def _migrate_full_to_blobs(self, snap: dict, keep_source: bool) -> None:
+    def _migrate_full_to_blobs(self, snap: dict[str, Any], keep_source: bool) -> None:
         """Convert one full-format snapshot folder into a v2 manifest +
         blobs. Files in the snapshot are downloaded once each (we have no
         choice; SHA-256 is not stored remotely), uploaded as blobs if not
@@ -2543,7 +2549,7 @@ class SnapshotManager:
 
         path_to_hash: dict[str, str] = {}
 
-        def _convert_one(file_info: dict) -> tuple[str, str]:
+        def _convert_one(file_info: dict[str, Any]) -> tuple[str, str]:
             rel = file_info["relative_path"]
             content = self.storage.download_file(file_info["id"])
             sha = hashlib.sha256(content).hexdigest()
@@ -2579,7 +2585,7 @@ class SnapshotManager:
                     path_to_hash[rel] = sha
 
         # Read original meta (for triggered_by/action/files_changed).
-        original_meta: dict = {}
+        original_meta: dict[str, Any] = {}
         meta_id: Optional[str] = None
         try:
             meta_id = self.storage.get_file_id(SNAPSHOT_META_FILE, snapshot_folder_id)
@@ -2620,7 +2626,7 @@ class SnapshotManager:
             # will retry these on the next pass.
             self.storage.delete_file(snapshot_folder_id)
 
-    def _migrate_blobs_to_full(self, snap: dict, keep_source: bool) -> None:
+    def _migrate_blobs_to_full(self, snap: dict[str, Any], keep_source: bool) -> None:
         """Convert one v2 manifest into a full-format snapshot folder.
         Each referenced blob is downloaded and uploaded into the new
         folder under its original relative path. The manifest JSON is

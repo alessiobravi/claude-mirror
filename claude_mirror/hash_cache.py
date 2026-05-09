@@ -15,6 +15,13 @@ import json
 import os
 import threading
 from pathlib import Path
+from typing import Any
+
+# Imported under an alias so the parameter annotation `keep: AbstractSet[str]`
+# in HashCache.prune() resolves to the type rather than to the locally defined
+# `HashCache.set` method (mypy resolves names lexically and the method shadows
+# the builtin in that scope under `from __future__ import annotations`).
+from collections.abc import Set as AbstractSet
 
 CACHE_FILE = ".claude_mirror_hash_cache.json"
 
@@ -25,7 +32,7 @@ class HashCache:
         # Entries are stored as one of:
         #   [size, mtime_ns, md5_hex]                   (legacy)
         #   [size, mtime_ns, md5_hex, sha256_hex]       (current)
-        self._data: dict[str, list] = {}
+        self._data: dict[str, list[Any]] = {}
         self._dirty = False
         # `set()` is called concurrently from the hashing thread pool while
         # the main thread iterates and calls `save()` — protect both the
@@ -53,6 +60,7 @@ class HashCache:
             return None
         cached_size, cached_mtime, cached_md5 = entry[0], entry[1], entry[2]
         if cached_size == size and cached_mtime == mtime_ns:
+            assert isinstance(cached_md5, str) or cached_md5 is None
             return cached_md5
         return None
 
@@ -65,6 +73,7 @@ class HashCache:
         cached_size, cached_mtime = entry[0], entry[1]
         cached_sha = entry[3]
         if cached_size == size and cached_mtime == mtime_ns and cached_sha:
+            assert isinstance(cached_sha, str)
             return cached_sha
         return None
 
@@ -104,7 +113,7 @@ class HashCache:
             self._data[rel_path] = [size, mtime_ns, md5, sha256_hex]
             self._dirty = True
 
-    def prune(self, keep: set[str]) -> None:
+    def prune(self, keep: AbstractSet[str]) -> None:
         with self._lock:
             before = len(self._data)
             self._data = {k: v for k, v in self._data.items() if k in keep}

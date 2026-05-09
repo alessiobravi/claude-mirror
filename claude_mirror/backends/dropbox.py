@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional, cast
 
 try:
     import dropbox
@@ -155,7 +155,7 @@ class DropboxBackend(StorageBackend):
         local_path: str,
         rel_path: str,
         root_folder_id: str,
-        file_id=None,
+        file_id: Optional[str] = None,
     ) -> str:
         """Upload with exponential backoff on TRANSIENT/UNKNOWN errors.
 
@@ -293,7 +293,13 @@ class DropboxBackend(StorageBackend):
     # File listing
     # ------------------------------------------------------------------
 
-    def list_files_recursive(self, folder_id: str, prefix: str = "", progress_cb=None, exclude_folder_names=None) -> list[dict]:
+    def list_files_recursive(
+        self,
+        folder_id: str,
+        prefix: str = "",
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+        exclude_folder_names: Optional[set[str]] = None,
+    ) -> list[dict[str, Any]]:
         """List all files recursively. Returns dicts with id, name, md5Checksum, relative_path.
 
         Dropbox's `files/list_folder` returns the full subtree in a single
@@ -302,7 +308,7 @@ class DropboxBackend(StorageBackend):
         folder name (e.g. `_claude_mirror_snapshots/`). This avoids returning
         snapshot copies of the project tree to the caller.
         """
-        results = []
+        results: list[dict[str, Any]] = []
         excluded = exclude_folder_names or set()
         try:
             response = self.dbx.files_list_folder(folder_id, recursive=True)
@@ -320,7 +326,7 @@ class DropboxBackend(StorageBackend):
 
         files_seen = 0
 
-        def _process(entries):
+        def _process(entries: list[Any]) -> None:
             # `files_list_folder(recursive=True)` may return three metadata
             # types: FileMetadata, FolderMetadata, and DeletedMetadata. We
             # only emit live files — folders are implicit in the file paths,
@@ -352,15 +358,15 @@ class DropboxBackend(StorageBackend):
             _process(response.entries)
         return results
 
-    def list_folders(self, parent_id: str, name: Optional[str] = None) -> list[dict]:
+    def list_folders(self, parent_id: str, name: Optional[str] = None) -> list[dict[str, Any]]:
         """List subfolders. Returns dicts with id, name, createdTime."""
-        results = []
+        results: list[dict[str, Any]] = []
         try:
             response = self.dbx.files_list_folder(parent_id)
         except ApiError:
             return results
 
-        def _process(entries):
+        def _process(entries: list[Any]) -> None:
             for entry in entries:
                 if isinstance(entry, FolderMetadata):
                     if name and entry.name != name:
@@ -449,7 +455,7 @@ class DropboxBackend(StorageBackend):
                 f"exceeds MAX_DOWNLOAD_BYTES ({self.MAX_DOWNLOAD_BYTES})."
             )
         if progress_callback is None:
-            content = response.content
+            content: bytes = response.content
             # Belt-and-braces: if metadata lied, abort here.
             if len(content) > self.MAX_DOWNLOAD_BYTES:
                 raise RuntimeError(
@@ -489,7 +495,7 @@ class DropboxBackend(StorageBackend):
         file_path = self._full_path(folder_id, name)
         try:
             meta = self.dbx.files_get_metadata(file_path)
-            return meta.path_display
+            return cast(Optional[str], meta.path_display)
         except ApiError:
             return None
 
@@ -497,14 +503,14 @@ class DropboxBackend(StorageBackend):
         """Server-side copy."""
         dest_path = self._full_path(dest_folder_id, name)
         result = self.dbx.files_copy_v2(source_file_id, dest_path)
-        return result.metadata.path_display
+        return cast(str, result.metadata.path_display)
 
     def get_file_hash(self, file_id: str) -> Optional[str]:
         """Return the Dropbox content hash for a file."""
         try:
             meta = self.dbx.files_get_metadata(file_id)
             if isinstance(meta, FileMetadata):
-                return meta.content_hash
+                return cast(Optional[str], meta.content_hash)
         except ApiError:
             pass
         return None

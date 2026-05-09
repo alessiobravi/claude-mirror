@@ -5,11 +5,12 @@ import platform
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 try:
     import fcntl  # POSIX file locking — used to serialize inbox appends
 except ImportError:  # pragma: no cover — Windows fallback
-    fcntl = None  # type: ignore
+    fcntl = None  # type: ignore[assignment]  # POSIX-only module; None sentinel triggers fallback path
 
 INBOX_FILENAME = ".claude_mirror_inbox.jsonl"
 
@@ -32,7 +33,7 @@ class Notifier:
         self._system = platform.system()
         self._inbox = inbox_path(project_path)
 
-    def notify(self, title: str, message: str, event: dict | None = None) -> None:
+    def notify(self, title: str, message: str, event: dict[str, Any] | None = None) -> None:
         self._write_inbox(title, message, event)
         try:
             if self._system == "Darwin":
@@ -88,7 +89,7 @@ class Notifier:
             # finish regardless of whether the desktop notifier worked.
             pass
 
-    def _write_inbox(self, title: str, message: str, event: dict | None) -> None:
+    def _write_inbox(self, title: str, message: str, event: dict[str, Any] | None) -> None:
         """Append notification to the project-scoped inbox file under an exclusive
         flock so concurrent watcher threads can't interleave their JSON lines."""
         try:
@@ -154,7 +155,7 @@ class Notifier:
             pass
 
 
-def read_and_clear_inbox(project_path: str) -> list[dict]:
+def read_and_clear_inbox(project_path: str) -> list[dict[str, Any]]:
     """Read all pending notifications for a project and clear the inbox.
 
     Atomic against concurrent writers: opens the inbox r+, takes LOCK_EX,

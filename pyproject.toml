@@ -96,6 +96,37 @@ packages = ["claude_mirror"]
 [tool.hatch.build.targets.wheel.force-include]
 "skills/claude-mirror.md" = "claude_mirror/_skill/claude-mirror.md"
 
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+check_untyped_defs = true
+
+# Third-party SDKs without bundled type stubs. Each of these either
+# ships no inline annotations + no py.typed marker, or has stubs that
+# aren't on PyPI under a `types-*` name we want to take a dependency on.
+# `ignore_missing_imports = true` is the supported posture per the mypy
+# docs — we are NOT writing local stubs for these.
+[[tool.mypy.overrides]]
+module = [
+    "paramiko.*",
+    "dropbox.*",
+    "msal.*",
+    "googleapiclient.*",
+    "google.api_core.*",
+    "google.cloud.*",
+    "google.auth.*",
+    "google.oauth2.*",
+    "google_auth_oauthlib.*",
+    "yaml.*",
+    "requests.*",
+    "plyer.*",
+]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]

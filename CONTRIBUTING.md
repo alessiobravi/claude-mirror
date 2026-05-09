@@ -38,6 +38,20 @@ skills/               ← Claude Code skill source (installed via `claude-mirror
 - **Tests should be fast.** The full suite runs in well under a second today; keep that property. If you need a slow test, mark it with `@pytest.mark.slow` so it can be filtered out.
 - **Warnings are errors.** `pyproject.toml` sets `filterwarnings = "error"` — a `DeprecationWarning` from upstream usually means a future-version breakage to flag. If a specific warning is genuinely unactionable, add it to the `pyproject.toml` filter list with a comment explaining why.
 
+## Type checking
+
+Run `mypy --strict claude_mirror/` before submitting a PR. CI runs the same check in a dedicated job alongside `pytest`, so a type-error regression blocks merge.
+
+```bash
+pip install mypy
+mypy --strict claude_mirror/
+# expected: Success: no issues found in 36 source files
+```
+
+New code must keep the strict-mode pass — every function signature must be fully typed (`def fn(arg: str) -> bool:`), every container annotation must carry generic parameters (`dict[str, Any]`, never bare `dict`), and `Optional[X]` must be explicit (no implicit-`None` defaults).
+
+`# type: ignore[error-code]` is reserved for genuine third-party-stub gaps — every directive carries a specific error code (never bare `# type: ignore`) and a one-line comment naming the gap (e.g. `# type: ignore[no-untyped-call]  # google-auth class methods lack type stubs`).
+
 ## Shell tab-completion code
 
 Tab-completion has two surfaces in the codebase, with dedicated test files for each:
@@ -65,9 +79,12 @@ pytest tests/ --collect-only                    # list tests without running
 
 ## CI
 
-Every push and pull request triggers `.github/workflows/test.yml`, which runs the full suite on **Linux and Windows** on Python 3.11, 3.12, 3.13, and 3.14 in parallel — 8 jobs total. A PR must be green on every job before it can merge. `pytest tests/ -v` locally on whichever platform you develop on is the right pre-flight check; CI is the gate that catches platform-specific regressions.
+Every push and pull request triggers `.github/workflows/test.yml`, which runs three distinct top-level jobs in parallel:
 
-A small number of tests are POSIX-only (mainly the `watch-all` SIGHUP hot-reload smoke tests in `test_watcher.py` and the deep-doctor SFTP permission checks in `test_doctor_sftp_deep.py`). They are guarded by `@pytest.mark.skipif(sys.platform == "win32", reason="...")` with explicit reasons so the Windows CI run skips them cleanly rather than failing.
+- **`test` matrix** — full pytest suite on **Linux and Windows** × Python 3.11, 3.12, 3.13, 3.14 — 8 jobs total. A small number of tests are POSIX-only (mainly the `watch-all` SIGHUP hot-reload smoke tests in `test_watcher.py` and the deep-doctor SFTP permission checks in `test_doctor_sftp_deep.py`). They are guarded by `@pytest.mark.skipif(sys.platform == "win32", reason="...")` with explicit reasons so the Windows CI run skips them cleanly rather than failing.
+- **`mypy`** — `mypy --strict claude_mirror/` on Python 3.11 (the lowest supported version, so the static check catches errors that 3.12+ would silently accept).
+
+Every job must be green before a PR can merge. The mypy gate is intentionally a separate job so the GitHub PR check list shows "tests" and "mypy" as clearly distinguishable failure modes. `pytest tests/ -v` locally on whichever platform you develop on is the right pre-flight check; CI is the gate that catches platform-specific and type-checking regressions.
 
 ## Release flow (maintainer)
 

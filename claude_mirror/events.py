@@ -29,8 +29,8 @@ def _truncate_files(files: list[str]) -> list[str]:
 
 
 def _truncate_auto_resolved(
-    entries: Optional[list[dict]],
-) -> list[dict]:
+    entries: Optional[list[dict[str, str]]],
+) -> list[dict[str, str]]:
     """Cap the auto-resolved-conflicts list to MAX_FILES_PER_EVENT, mirroring
     `_truncate_files`. Each entry is a {path, strategy} dict — the audit
     trail for `sync --no-prompt --strategy ...` runs. Idempotent."""
@@ -60,7 +60,7 @@ class SyncEvent:
     # readers can spot which files were auto-overwritten and by which
     # strategy. Each entry is `{"path": str, "strategy": str}`. Older
     # consumers (pre-v0.5.49) ignore unknown fields when deserialising.
-    auto_resolved_files: list[dict] = field(default_factory=list)
+    auto_resolved_files: list[dict[str, str]] = field(default_factory=list)
 
     @classmethod
     def now(
@@ -71,7 +71,7 @@ class SyncEvent:
         action: str,
         project: str,
         *,
-        auto_resolved_files: Optional[list[dict]] = None,
+        auto_resolved_files: Optional[list[dict[str, str]]] = None,
     ) -> SyncEvent:
         return cls(
             machine=machine,

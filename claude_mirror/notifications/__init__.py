@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 from abc import ABC, abstractmethod
-from typing import Callable
+from typing import Any, Callable
 
 from ..events import SyncEvent
 
@@ -22,7 +22,7 @@ class NotificationBackend(ABC):
     def publish_event(self, event: SyncEvent) -> None:
         """Publish a sync event to the notification channel."""
 
-    def publish_event_async(self, event: SyncEvent):
+    def publish_event_async(self, event: SyncEvent) -> Any:
         """Publish without blocking. Default implementation falls back to the
         synchronous publish (returns None). Backends with native async support
         (e.g. Pub/Sub) override this and return a future."""

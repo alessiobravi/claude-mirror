@@ -8,7 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional, cast
 
 from google.auth.exceptions import DefaultCredentialsError, RefreshError, TransportError
 from google.auth.transport.requests import Request
@@ -66,7 +66,7 @@ def _refresh_with_retry(creds: Credentials) -> None:
     last_exc: Optional[Exception] = None
     for attempt in range(_REFRESH_RETRY_ATTEMPTS):
         try:
-            creds.refresh(Request())
+            creds.refresh(Request())  # type: ignore[no-untyped-call]  # google-auth's Credentials.refresh lacks return-type stub
             _verbose(
                 f"refresh ok (attempt {attempt + 1}); "
                 f"new expiry={creds.expiry.isoformat() if creds.expiry else 'unset'}"
@@ -238,7 +238,7 @@ class GoogleDriveBackend(StorageBackend):
         local_path: str,
         rel_path: str,
         root_folder_id: str,
-        file_id=None,
+        file_id: Optional[str] = None,
     ) -> str:
         """Upload with exponential backoff on TRANSIENT/UNKNOWN errors.
 
@@ -291,14 +291,14 @@ class GoogleDriveBackend(StorageBackend):
             return False
         # creds.expiry is a naive UTC datetime per the google-auth library.
         now = datetime.utcnow()
-        return creds.expiry - now < _PROACTIVE_REFRESH_THRESHOLD
+        return bool(creds.expiry - now < _PROACTIVE_REFRESH_THRESHOLD)
 
     def authenticate(self) -> Credentials:
         token_path = Path(self.config.token_file)
         creds: Optional[Credentials] = None
 
         if token_path.exists():
-            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)  # type: ignore[no-untyped-call]  # google-auth class methods lack type stubs
 
         if not creds or not creds.valid:
             if creds and creds.refresh_token and self._needs_refresh(creds):
@@ -338,7 +338,8 @@ class GoogleDriveBackend(StorageBackend):
                     try:
                         _refresh_with_retry(self._creds)
                         _write_token_secure(
-                            Path(self.config.token_file), self._creds.to_json()
+                            Path(self.config.token_file),
+                            self._creds.to_json(),  # type: ignore[no-untyped-call]  # google-auth Credentials.to_json lacks type stubs
                         )
                     except RefreshError as e:
                         if _is_invalid_grant(e):
@@ -362,7 +363,7 @@ class GoogleDriveBackend(StorageBackend):
             token_path = Path(self.config.token_file)
             if not token_path.exists():
                 raise RuntimeError("Not authenticated. Run `claude-mirror auth` first.")
-            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)  # type: ignore[no-untyped-call]  # google-auth class methods lack type stubs
             if not creds.refresh_token:
                 raise RuntimeError(
                     "Token file is missing a refresh_token (this happens when `claude-mirror auth` "
@@ -386,10 +387,10 @@ class GoogleDriveBackend(StorageBackend):
                         "Try again, or run `claude-mirror auth --check` to diagnose."
                     ) from e
             self._creds = creds
-            return creds
+            return cast(Credentials, creds)
 
     @property
-    def service(self):
+    def service(self) -> Any:
         svc = getattr(self._thread_local, "service", None)
         if svc is None:
             creds = self.get_credentials()
@@ -423,7 +424,7 @@ class GoogleDriveBackend(StorageBackend):
 
         with self._folder_cache_lock:
             self._folder_cache[cache_key] = folder_id
-        return folder_id
+        return cast(str, folder_id)
 
     def resolve_path(self, rel_path: str, root_folder_id: str) -> tuple[str, str]:
         """Return (parent_folder_id, filename) for a relative path, creating folders as needed."""
@@ -439,18 +440,18 @@ class GoogleDriveBackend(StorageBackend):
         self,
         folder_id: str,
         prefix: str,
-        exclude_folder_names: Optional[set] = None,
-    ) -> tuple[list[dict], list[tuple[str, str]]]:
+        exclude_folder_names: Optional[set[str]] = None,
+    ) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
         """List a single folder (no recursion). Returns (files, subfolders_to_traverse).
 
         Subfolders whose name is in `exclude_folder_names` are dropped here so
         the BFS never issues an API call for them (e.g. `_claude_mirror_snapshots/`).
         """
-        files: list[dict] = []
+        files: list[dict[str, Any]] = []
         subfolders: list[tuple[str, str]] = []
-        page_token = None
+        page_token: Optional[str] = None
         while True:
-            params = {
+            params: dict[str, Any] = {
                 "q": f"'{_escape_q(folder_id)}' in parents and trashed=false",
                 "fields": "nextPageToken, files(id, name, md5Checksum, mimeType)",
                 "pageSize": 1000,
@@ -475,9 +476,9 @@ class GoogleDriveBackend(StorageBackend):
         self,
         folder_id: str,
         prefix: str = "",
-        progress_cb=None,
-        exclude_folder_names: Optional[set] = None,
-    ) -> list[dict]:
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+        exclude_folder_names: Optional[set[str]] = None,
+    ) -> list[dict[str, Any]]:
         """List all non-folder files recursively. Subfolder fetches run in parallel.
 
         If `progress_cb` is provided, it is called as `(folders_done, files_seen)`
@@ -489,7 +490,7 @@ class GoogleDriveBackend(StorageBackend):
         per snapshot) and `_claude_mirror_logs/` — without pruning, status
         explodes from N files to N × (snapshot_count + 1).
         """
-        results: list[dict] = []
+        results: list[dict[str, Any]] = []
         pending: list[tuple[str, str]] = [(folder_id, prefix)]
         folders_done = 0
         if progress_cb:
@@ -512,7 +513,7 @@ class GoogleDriveBackend(StorageBackend):
             pending = next_pending
         return results
 
-    def list_folders(self, parent_id: str, name: Optional[str] = None) -> list[dict]:
+    def list_folders(self, parent_id: str, name: Optional[str] = None) -> list[dict[str, Any]]:
         """List subfolders of parent. If name given, filter by exact name."""
         query = (
             f"'{_escape_q(parent_id)}' in parents "
@@ -526,7 +527,7 @@ class GoogleDriveBackend(StorageBackend):
             fields="files(id, name, createdTime)",
             orderBy="createdTime desc",
         ).execute()
-        return result.get("files", [])
+        return cast(list[dict[str, Any]], result.get("files", []))
 
     def upload_file(
         self,
@@ -582,7 +583,7 @@ class GoogleDriveBackend(StorageBackend):
             # Legacy fast path — Drive's SDK runs the resumable loop
             # internally with no per-chunk hook.
             file = request.execute()
-            return file["id"]
+            return cast(str, file["id"])
 
         # Manual chunk loop — used when either bandwidth-cap is on or
         # the caller wants per-chunk progress callbacks.
@@ -619,7 +620,7 @@ class GoogleDriveBackend(StorageBackend):
                 if delta:
                     progress_callback(delta)
             last_progress = new_progress
-        return response["id"]
+        return cast(str, response["id"])
 
     # Hard cap on remote-file size we will load into memory. claude-mirror is
     # designed for small text/markdown files; nothing legitimate should ever
@@ -687,7 +688,7 @@ class GoogleDriveBackend(StorageBackend):
             file = self.service.files().create(
                 body=meta, media_body=media, fields="id"
             ).execute()
-        return file["id"]
+        return cast(str, file["id"])
 
     def get_file_id(self, name: str, folder_id: str) -> Optional[str]:
         query = (
@@ -696,7 +697,7 @@ class GoogleDriveBackend(StorageBackend):
         )
         result = self.service.files().list(q=query, fields="files(id)").execute()
         files = result.get("files", [])
-        return files[0]["id"] if files else None
+        return cast(Optional[str], files[0]["id"]) if files else None
 
     def copy_file(self, source_file_id: str, dest_folder_id: str, name: str) -> str:
         """Server-side copy — no data transfer through the client."""
@@ -705,12 +706,12 @@ class GoogleDriveBackend(StorageBackend):
             body={"name": name, "parents": [dest_folder_id]},
             fields="id",
         ).execute()
-        return result["id"]
+        return cast(str, result["id"])
 
     def get_file_hash(self, file_id: str) -> Optional[str]:
         """Fetch only the md5Checksum of a Drive file (no download)."""
         result = self.service.files().get(fileId=file_id, fields="md5Checksum").execute()
-        return result.get("md5Checksum")
+        return cast(Optional[str], result.get("md5Checksum"))
 
     def delete_file(self, file_id: str) -> None:
         self.service.files().delete(fileId=file_id).execute()

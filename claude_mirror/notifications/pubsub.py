@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from typing import Callable
+from typing import Any, Callable
 
 from google.api_core.exceptions import AlreadyExists, NotFound
 from google.cloud.pubsub_v1 import PublisherClient, SubscriberClient
@@ -24,7 +24,7 @@ class PubSubNotifier(NotificationBackend):
         self._subscription_path = self._subscriber.subscription_path(
             config.gcp_project_id, config.subscription_id
         )
-        self._streaming_pull_future = None
+        self._streaming_pull_future: Any = None
 
     def ensure_topic(self) -> None:
         try:
@@ -49,7 +49,7 @@ class PubSubNotifier(NotificationBackend):
         future = self.publish_event_async(event)
         future.result()
 
-    def publish_event_async(self, event: SyncEvent):
+    def publish_event_async(self, event: SyncEvent) -> Any:
         """Non-blocking publish. Returns a future the caller can `result()`
         later to confirm delivery. Used by SyncEngine to flush all publishes
         for a command in a single batch at the end of the operation."""
@@ -67,7 +67,7 @@ class PubSubNotifier(NotificationBackend):
         Start streaming subscription. Calls callback for each message
         not originating from this machine. Blocks until stop_event is set.
         """
-        def _on_message(message):
+        def _on_message(message: Any) -> None:
             try:
                 event = SyncEvent.from_json(message.data.decode("utf-8"))
                 message.ack()

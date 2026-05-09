@@ -386,13 +386,19 @@ class OneDriveBackend(StorageBackend):
     # File listing
     # ------------------------------------------------------------------
 
-    def list_files_recursive(self, folder_id: str, prefix: str = "", progress_cb=None, exclude_folder_names=None) -> list[dict]:
+    def list_files_recursive(
+        self,
+        folder_id: str,
+        prefix: str = "",
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+        exclude_folder_names: Optional[set[str]] = None,
+    ) -> list[dict[str, Any]]:
         """List all files recursively under the OneDrive folder.
 
         `exclude_folder_names` prunes named subfolders at recursion time so
         we never issue Graph API calls for `_claude_mirror_snapshots/` etc.
         """
-        results = []
+        results: list[dict[str, Any]] = []
         # Counters for progress_cb — folders explored, files seen so far.
         counters = [0, 0]
         self._list_recursive(
@@ -406,10 +412,10 @@ class OneDriveBackend(StorageBackend):
     def _list_recursive(
         self,
         rel_folder: str,
-        results: list[dict],
-        exclude_folder_names: Optional[set] = None,
-        progress_cb=None,
-        counters: Optional[list] = None,
+        results: list[dict[str, Any]],
+        exclude_folder_names: Optional[set[str]] = None,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+        counters: Optional[list[int]] = None,
     ) -> None:
         """Recursively list children of a folder."""
         if rel_folder:
@@ -466,7 +472,7 @@ class OneDriveBackend(StorageBackend):
 
             url = data.get("@odata.nextLink")
 
-    def list_folders(self, parent_id: str, name: Optional[str] = None) -> list[dict]:
+    def list_folders(self, parent_id: str, name: Optional[str] = None) -> list[dict[str, Any]]:
         """List subfolders. Returns dicts with id, name, createdTime."""
         if parent_id:
             url = f"{self._item_url(parent_id)}:/children"
@@ -474,7 +480,7 @@ class OneDriveBackend(StorageBackend):
             folder = self.config.onedrive_folder.strip("/")
             url = f"{GRAPH_BASE}/me/drive/root:/{folder}:/children"
 
-        results = []
+        results: list[dict[str, Any]] = []
         while url:
             resp = self.session.get(url, params={"$top": "200"})
             if resp.status_code == 404:
@@ -563,7 +569,7 @@ class OneDriveBackend(StorageBackend):
         self,
         dest_rel: str,
         content: bytes,
-        bucket=None,
+        bucket: Any = None,
         progress_callback: Optional[Callable[[int], None]] = None,
     ) -> None:
         """Upload a large file (>4MB) using a Microsoft Graph upload session.

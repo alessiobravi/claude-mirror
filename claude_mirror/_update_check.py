@@ -31,7 +31,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, cast
 
 # Where the cache lives. ~/.config/claude_mirror/.update_check.json
 _CACHE_FILE = Path.home() / ".config" / "claude_mirror" / ".update_check.json"
@@ -163,11 +163,11 @@ def _get_current_version() -> str:
         return "0.0.0"
 
 
-def _load_cache() -> dict:
+def _load_cache() -> dict[str, Any]:
     """Read the cache file. Returns {} on any failure (missing file,
     corrupted JSON, permission error, etc.)."""
     try:
-        return json.loads(_CACHE_FILE.read_text())
+        return cast(dict[str, Any], json.loads(_CACHE_FILE.read_text()))
     except (json.JSONDecodeError, OSError, ValueError):
         # JSONDecodeError: malformed cache; OSError: missing/unreadable
         # (FileNotFoundError, PermissionError); ValueError: defensive
@@ -175,7 +175,7 @@ def _load_cache() -> dict:
         return {}
 
 
-def _save_cache(data: dict) -> None:
+def _save_cache(data: dict[str, Any]) -> None:
     """Atomic write via tmp + os.replace so a crash mid-write can't
     corrupt the cache. Best-effort: any failure is swallowed."""
     try:

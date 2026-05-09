@@ -26,6 +26,7 @@ from rich.progress import (
     DownloadColumn,
     Progress,
     SpinnerColumn,
+    Task,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
@@ -43,7 +44,7 @@ class _SharedElapsedColumn(TimeElapsedColumn):
     identical.
     """
 
-    def render(self, task):
+    def render(self, task: "Task") -> Text:
         if not task.fields.get("show_time"):
             return Text("")
         return super().render(task)

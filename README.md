@@ -151,9 +151,10 @@ The trimmed README covers install, your first project, daily-usage cheatsheet, n
 
 **Operations & admin**:
 - [docs/admin.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md) — snapshots, retention, `gc` / `prune` / `forget`, doctor, watcher service, multi-backend Tier 2 setup, auto-start
-- [docs/profiles.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/profiles.md) — credentials profiles: factor `credentials_file` / `token_file` / app keys out of every project YAML
-- [docs/conflict-resolution.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/conflict-resolution.md) — interactive conflict prompts, `$EDITOR` merge, three-way diff
 - [docs/cli-reference.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/cli-reference.md) — every command, every flag
+- [docs/conflict-resolution.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/conflict-resolution.md) — interactive conflict prompts, `$EDITOR` merge, three-way diff
+- [docs/faq.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/faq.md) — frequently asked questions across auth, sync, snapshots, notifications, performance, and migration; 30-second answers with links into the depth-docs
+- [docs/profiles.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/profiles.md) — credentials profiles: factor `credentials_file` / `token_file` / app keys out of every project YAML
 
 **Topology guides** (pick the one that matches your situation):
 - [docs/scenarios.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/scenarios.md) — seven deployment topologies, end to end:

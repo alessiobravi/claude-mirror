@@ -54,6 +54,7 @@ Output is one yellow line per auto-resolved file plus a trailing one-line `Summa
 
 ## See also
 
+- [faq.md](faq.md) — 30-second answers to common questions, including conflict-resolution recipes for cron / unattended use.
 - [admin.md](admin.md) — restoring an older version from a snapshot if you resolved a conflict the wrong way.
 - [admin.md — Unattended sync via cron](admin.md#unattended-sync-via-cron) — sample crontab entries for `--no-prompt --strategy`.
 - [cli-reference.md](cli-reference.md#sync) — the `sync` command that triggers conflict resolution, including the `--no-prompt --strategy` flag table.

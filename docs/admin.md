@@ -1315,6 +1315,7 @@ The `--backend` filter is case-insensitive and accepts `googledrive`, `dropbox`,
 
 ## See also
 
+- [faq.md](faq.md) — 30-second answers to common questions about auth, sync, snapshots, notifications, performance, and migration.
 - [conflict-resolution.md](conflict-resolution.md) for resolving `sync` conflicts.
 - [cli-reference.md](cli-reference.md) for the full command list (snapshot, retention, watcher commands grouped under "Snapshots" and "Maintenance").
 - [scenarios.md](scenarios.md) for end-to-end deployment topology guides (standalone, multi-machine, multi-user, multi-backend).

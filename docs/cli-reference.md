@@ -610,6 +610,7 @@ Slack-specific fields (`slack_enabled`, `slack_webhook_url`, `slack_channel`) ar
 
 ## See also
 
+- [faq.md](faq.md) — 30-second answers to the most common questions across auth, sync, snapshots, notifications, performance, and migration.
 - [admin.md](admin.md) — snapshots, retention, watcher daemon, notifications, credentials profiles.
 - [profiles.md](profiles.md) — credentials profiles in depth: sample profile YAMLs per backend, precedence rule, common multi-project workflows.
 - [conflict-resolution.md](conflict-resolution.md) — what `sync` does when both sides changed.

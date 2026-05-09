@@ -984,4 +984,14 @@ Or via `claude-mirror-install` for an auto-starting service.
 
 ---
 
+## See also
+
+- [faq.md](faq.md) — 30-second answers across auth, sync, snapshots, notifications, performance, and migration.
+- [admin.md](admin.md) — snapshots, retention, watcher service, multi-backend Tier 2 reference.
+- [cli-reference.md](cli-reference.md) — every command, every flag.
+- [conflict-resolution.md](conflict-resolution.md) — interactive prompt + `--no-prompt --strategy` for unattended runs.
+- [profiles.md](profiles.md) — credentials profiles for multi-project / multi-account setups.
+
+---
+
 ← Back to [README index](../README.md)

@@ -436,7 +436,7 @@ claude-mirror init \
   --exclude 'secrets.md'
 ```
 
-Or at any time later by editing the YAML directly. Changes take effect on the next command — no restart of the watcher needed (it picks up YAML changes via `SIGHUP` reload).
+Or at any time later by editing the YAML directly. Changes take effect on the next command — no restart of the watcher needed (it picks up YAML changes via the sentinel-file reload, polled every 2 s).
 
 ### Daily ops behaviour
 
@@ -967,7 +967,7 @@ Or via `claude-mirror-install` for an auto-starting service.
 | You run `claude-mirror push` from `~/work/design-doc` | Pushes only that project. Touches the work Drive, work token, work GCP project. Side hustle and research wiki are untouched. |
 | You `cd ~/personal/sidehustle` and `push` | Same command, different project, different backend (Dropbox), different token. Transparent. |
 | `watch-all` sees a Drive notification for the work project | Routes the event to the right project's inbox file (`/Users/alice/work/design-doc/.claude_mirror_inbox.jsonl`). The desktop notification names the project. |
-| You add a new project (`init` from a new directory) | The running `watch-all` daemon receives a `SIGHUP` and picks up the new config without restart. (Or run `claude-mirror reload` to force the rescan.) |
+| You add a new project (`init` from a new directory) | `init` writes the reload sentinel file; the running `watch-all` daemon polls it every 2 s and picks up the new config without restart. (Or run `claude-mirror reload` to force the rescan.) |
 | You retire a project | Delete its YAML and token files. The next `watch-all` reload drops the corresponding watcher thread. The remote folder is untouched (delete it manually if you want). |
 | Dropbox token expires for the side hustle | Only the side-hustle project surfaces an `auth` warning. Work, research, and homelab projects continue working fine. |
 | You upgrade claude-mirror | One install, all projects benefit. The watcher must be restarted to pick up the new code (the auto-start service script will do this on the next login or you can `kill` it and let the supervisor restart it). |

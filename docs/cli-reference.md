@@ -512,7 +512,7 @@ Watch every project in a single process — auto-discovers all configs in `~/.co
 
 ### `reload`
 
-Send `SIGHUP` to the running `watch-all` process so it re-scans `~/.config/claude_mirror/` and starts watcher threads for any new configs without restarting.
+Tell the running `watch-all` daemon to re-scan `~/.config/claude_mirror/` and start watcher threads for any new configs without restarting. Cross-platform: writes a sentinel file (`~/.config/claude_mirror/.reload_signal`) the daemon polls every 2 seconds. Exits non-zero with a friendly notice if no `watch-all` daemon can be detected on this host (best-effort: `pgrep` on POSIX, `tasklist` on Windows). Falls back to "couldn't verify" + exit 0 if neither detection tool is available — the sentinel write itself is the contract.
 
 ### `inbox`
 

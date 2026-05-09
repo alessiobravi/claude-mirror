@@ -8,6 +8,7 @@ import signal
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional, cast
 
@@ -250,27 +251,94 @@ def _resolve_config(config_path: str) -> str:
     return DEFAULT_CONFIG
 
 
-def _try_reload_watcher() -> None:
-    """Send SIGHUP to any running watch-all process so it picks up new configs."""
-    # `watch-all` is POSIX-only (SIGHUP-driven hot-reload). On Windows
-    # `pgrep` doesn't exist and `signal.SIGHUP` is undefined, so any
-    # attempt here would raise FileNotFoundError / AttributeError after
-    # init has otherwise succeeded. Bail early.
-    if not hasattr(signal, "SIGHUP"):
-        return
-    import subprocess as _sp
+# Sentinel file used by `claude-mirror reload` and `_try_reload_watcher`
+# to signal a running `watch-all` daemon that it should re-scan
+# `~/.config/claude_mirror/` for new project configs. Cross-platform —
+# replaces the POSIX-only SIGHUP mechanism that used to drive hot-reload.
+# See `_should_reload` / `_rescan_configs` and `watch_all` for the
+# polling-loop side of the contract.
+RELOAD_SIGNAL_FILE = CONFIG_DIR / ".reload_signal"
+
+# Poll cadence (seconds) for the watch-all daemon's reload-sentinel
+# check. 2s is fast enough that an `init`-triggered reload feels instant
+# but slow enough that the idle-CPU cost of the daemon stays negligible.
+# Tests override this (e.g. `monkeypatch.setattr(cli_mod,
+# "_RELOAD_POLL_SECONDS", 0.05)`) to drive the loop deterministically
+# without real waits.
+_RELOAD_POLL_SECONDS: float = 2.0
+
+
+def _write_reload_signal(path: Optional[Path] = None) -> None:
+    """Atomically (re)write the sentinel file used to wake the daemon.
+
+    Writes the current epoch as content via tempfile + os.replace so a
+    daemon polling the file's mtime never observes a half-written state
+    even under aggressive concurrent reloads from multiple `init` runs.
+
+    `path=None` means "use the module-level RELOAD_SIGNAL_FILE at call
+    time" so test monkeypatches of the module attribute take effect
+    even when callers omit the argument.
+    """
+    import tempfile
+    target = path if path is not None else RELOAD_SIGNAL_FILE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = f"{time.time()}\n".encode("utf-8")
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".reload_signal.", dir=str(target.parent)
+    )
     try:
-        result = _sp.run(["pgrep", "-f", "claude-mirror watch-all"], capture_output=True, text=True)
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+        os.replace(tmp_name, target)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _read_reload_mtime(path: Optional[Path] = None) -> Optional[float]:
+    """Return the sentinel file's mtime, or None if it doesn't exist.
+
+    `path=None` means "use the module-level RELOAD_SIGNAL_FILE at call
+    time" — same rebind-friendly default as `_write_reload_signal`.
+    """
+    target = path if path is not None else RELOAD_SIGNAL_FILE
+    try:
+        return target.stat().st_mtime
     except (FileNotFoundError, OSError):
+        return None
+
+
+def _should_reload(path: Path, last_seen_mtime: Optional[float]) -> bool:
+    """True iff the sentinel file's mtime has advanced past last_seen_mtime.
+
+    Pure helper so the watch-all polling loop can be exercised
+    deterministically from tests without involving real timing.
+    """
+    current = _read_reload_mtime(path)
+    if current is None:
+        return False
+    if last_seen_mtime is None:
+        return True
+    return current > last_seen_mtime
+
+
+def _try_reload_watcher() -> None:
+    """Tell any running `watch-all` daemon to re-scan configs.
+
+    Cross-platform: writes the reload-signal sentinel file. The daemon's
+    polling loop picks it up within `_RELOAD_POLL_SECONDS` seconds. If
+    no daemon is running the file just sits there harmlessly until one
+    starts (it'll establish a fresh mtime baseline and ignore the stale
+    mark).
+    """
+    try:
+        _write_reload_signal()
+    except OSError:
         return
-    pids = [p.strip() for p in result.stdout.strip().splitlines() if p.strip() and p.strip() != str(os.getpid())]
-    if pids:
-        for pid in pids:
-            try:
-                os.kill(int(pid), signal.SIGHUP)
-            except (ProcessLookupError, PermissionError):
-                pass
-        console.print("[dim]Watcher reloaded to pick up the new config.[/]")
+    console.print("[dim]Watcher reloaded to pick up the new config.[/]")
 
 
 # Commands that should NOT print the "watcher is not running" warning:
@@ -4548,6 +4616,107 @@ def _start_watcher(
     return t
 
 
+def _collect_mirror_paths(candidate_paths: list[str]) -> set[str]:
+    """Return paths referenced by any candidate's `mirror_config_paths`.
+
+    Mirror configs must be skipped during watch-all so multi-backend
+    projects don't end up with duplicate notification streams (one per
+    backend); the primary's watcher is the single source of truth and
+    the mirror entries fan out from there.
+    """
+    mirror_paths: set[str] = set()
+    for cp in candidate_paths:
+        try:
+            cfg = Config.load(cp)
+        except Exception:
+            continue
+        for mp in (cfg.mirror_config_paths or []):
+            try:
+                if Path(mp).is_absolute():
+                    resolved_mp = Path(mp).resolve()
+                else:
+                    resolved_mp = Path(_resolve_config(mp)).resolve()
+            except Exception:
+                try:
+                    resolved_mp = Path(mp).resolve()
+                except Exception:
+                    continue
+            mirror_paths.add(str(resolved_mp))
+    return mirror_paths
+
+
+@dataclass
+class _RescanState:
+    """All state the watch-all polling loop needs to perform a re-scan
+    of `~/.config/claude_mirror/` and spawn watchers for new projects.
+
+    Pulled out of `watch_all`'s local scope so the rescan logic is a
+    plain top-level function — easier to test (the test suite drives
+    `_rescan_configs` directly with a synthetic state) and lets the
+    same code path serve both the cross-platform sentinel-file polling
+    branch AND the POSIX-only SIGHUP back-compat handler.
+    """
+    config_paths: tuple[str, ...]
+    use_auto_discover: bool
+    stop_event: threading.Event
+    watched: set[str]
+    clients: list[NotificationBackend]
+    threads: list[threading.Thread]
+
+
+def _start_with_mirror_skip(
+    p: str,
+    mirror_paths: set[str],
+    state: _RescanState,
+) -> Optional[threading.Thread]:
+    """Wrapper around `_start_watcher` that skips configs which are
+    declared as mirrors by some primary config in the same scan set."""
+    resolved = str(Path(p).resolve())
+    if resolved in mirror_paths:
+        try:
+            cfg = Config.load(p)
+            project_label = cfg.project_path
+        except Exception:
+            project_label = "<unknown>"
+        console.print(
+            f"[dim]skipping mirror config {Path(p).name} for project "
+            f"{project_label} — primary already watching[/]"
+        )
+        return None
+    return _start_watcher(p, state.stop_event, state.watched, state.clients)
+
+
+def _rescan_configs(state: _RescanState) -> int:
+    """Re-scan configs and start watcher threads for any new projects.
+
+    Returns the number of new threads spawned (0 if every config was
+    already being watched). Driven by both the SIGHUP handler (POSIX
+    back-compat) and the cross-platform sentinel-file polling branch.
+    """
+    if state.use_auto_discover:
+        new_paths = sorted(str(p) for p in CONFIG_DIR.glob("*.yaml"))
+    else:
+        new_paths = list(state.config_paths)
+    new_mirror_paths = _collect_mirror_paths(new_paths)
+    added = 0
+    for p in new_paths:
+        t = _start_with_mirror_skip(p, new_mirror_paths, state)
+        if t is not None:
+            state.threads.append(t)
+            added += 1
+    if added:
+        console.print(
+            f"[dim]Reload: added {added} new project(s), now watching "
+            f"{len(state.watched)} total.[/]"
+        )
+    else:
+        console.print(
+            f"[dim]Reload: no new configs found "
+            f"({len(state.watched)} project(s) unchanged).[/]"
+        )
+    return added
+
+
 @cli.command("watch-all")
 @click.option("--config", "config_paths", multiple=True,
               help="Config file(s) to watch. Repeatable. Defaults to all configs in ~/.config/claude_mirror/.")
@@ -4555,7 +4724,7 @@ def watch_all(config_paths: tuple[Any, ...]) -> None:
     """
     Watch all projects simultaneously (one subscription per config).
     Discovers all configs in ~/.config/claude_mirror/ unless --config is given.
-    Send SIGHUP to reload configs and pick up new projects without restarting.
+    Run `claude-mirror reload` to pick up new projects without restarting.
     Press Ctrl+C to stop all watchers.
     """
     use_auto_discover = not config_paths
@@ -4570,53 +4739,21 @@ def watch_all(config_paths: tuple[Any, ...]) -> None:
 
     stop_event = threading.Event()
     clients: list[NotificationBackend] = []
-    watched: set[str] = set()            # resolved paths of configs already watched
+    watched: set[str] = set()
     threads: list[threading.Thread] = []
 
-    def _collect_mirror_paths(candidate_paths: list[str]) -> set[str]:
-        """First pass: load each candidate config and gather every path
-        referenced by some other config's `mirror_config_paths`. Those
-        configs are mirrors of an already-watched primary, so they must
-        be skipped — otherwise multi-backend projects get duplicate
-        notification streams (one per backend)."""
-        mirror_paths: set[str] = set()
-        for cp in candidate_paths:
-            try:
-                cfg = Config.load(cp)
-            except Exception:
-                continue
-            for mp in (cfg.mirror_config_paths or []):
-                try:
-                    if Path(mp).is_absolute():
-                        resolved_mp = Path(mp).resolve()
-                    else:
-                        resolved_mp = Path(_resolve_config(mp)).resolve()
-                except Exception:
-                    try:
-                        resolved_mp = Path(mp).resolve()
-                    except Exception:
-                        continue
-                mirror_paths.add(str(resolved_mp))
-        return mirror_paths
-
-    def _start_with_mirror_skip(p: str, mirror_paths: set[str]) -> threading.Thread | None:
-        resolved = str(Path(p).resolve())
-        if resolved in mirror_paths:
-            try:
-                cfg = Config.load(p)
-                project_label = cfg.project_path
-            except Exception:
-                project_label = "<unknown>"
-            console.print(
-                f"[dim]skipping mirror config {Path(p).name} for project "
-                f"{project_label} — primary already watching[/]"
-            )
-            return None
-        return _start_watcher(p, stop_event, watched, clients)
+    state = _RescanState(
+        config_paths=tuple(str(p) for p in config_paths),
+        use_auto_discover=use_auto_discover,
+        stop_event=stop_event,
+        watched=watched,
+        clients=clients,
+        threads=threads,
+    )
 
     mirror_paths = _collect_mirror_paths(paths)
     for p in paths:
-        t = _start_with_mirror_skip(p, mirror_paths)
+        t = _start_with_mirror_skip(p, mirror_paths, state)
         if t:
             threads.append(t)
 
@@ -4629,31 +4766,24 @@ def watch_all(config_paths: tuple[Any, ...]) -> None:
         stop_event.set()
 
     def _handle_reload(sig: int, frame: Any) -> None:
-        """SIGHUP: re-scan configs and start watchers for any new projects."""
-        if use_auto_discover:
-            new_paths = sorted(str(p) for p in CONFIG_DIR.glob("*.yaml"))
-        else:
-            new_paths = list(config_paths)
-        # Re-scan mirror paths in case primaries gained / lost mirrors
-        # since startup. Mirror configs are skipped on reload too.
-        new_mirror_paths = _collect_mirror_paths(new_paths)
-        added = 0
-        for p in new_paths:
-            t = _start_with_mirror_skip(p, new_mirror_paths)
-            if t:
-                threads.append(t)
-                added += 1
-        if added:
-            console.print(f"[dim]Reload: added {added} new project(s), now watching {len(watched)} total.[/]")
-        else:
-            console.print(f"[dim]Reload: no new configs found ({len(watched)} project(s) unchanged).[/]")
+        """SIGHUP: drives the same `_rescan_configs` path the sentinel
+        file would. Kept on POSIX for back-compat with older
+        `claude-mirror reload` clients that still send SIGHUP."""
+        _rescan_configs(state)
 
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGTERM, _handle_stop)
-    signal.signal(signal.SIGHUP, _handle_reload)
+    # SIGHUP only exists on POSIX. The sentinel-file polling branch
+    # below carries hot-reload on Windows; the SIGHUP registration is
+    # belt-and-braces for clients still sending the legacy signal.
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _handle_reload)
 
     console.print(f"\n[bold]claude-mirror v{_get_version()}[/]")
-    console.print(f"[dim]Watching {len(threads)} project(s). Send SIGHUP to reload, Ctrl+C to stop.[/]")
+    console.print(
+        f"[dim]Watching {len(threads)} project(s). "
+        f"Run `claude-mirror reload` to pick up new configs, Ctrl+C to stop.[/]"
+    )
 
     # Update-check daemon thread — once at startup, then every 24h while
     # watch-all is running. Fires a non-disruptive desktop notification
@@ -4664,16 +4794,13 @@ def watch_all(config_paths: tuple[Any, ...]) -> None:
         import time as _time
         try:
             from ._update_check import check_for_update
-            # Initial check shortly after startup so the user gets a
-            # notice on launch when an update is already pending.
             _time.sleep(30)
             while not stop_event.is_set():
                 try:
                     check_for_update(notify_desktop=True)
                 except Exception:
                     pass
-                # Sleep in 60s slices so stop_event is honoured promptly.
-                for _ in range(24 * 60):  # 24 hours
+                for _ in range(24 * 60):
                     if stop_event.is_set():
                         return
                     _time.sleep(60)
@@ -4683,7 +4810,16 @@ def watch_all(config_paths: tuple[Any, ...]) -> None:
     _update_thread = threading.Thread(target=_periodic_update_check, daemon=True)
     _update_thread.start()
 
-    stop_event.wait()
+    # Anchor on the sentinel's CURRENT mtime (or None if absent) so a
+    # stale signal from an earlier `reload` invocation doesn't trigger
+    # a phantom rescan on this fresh launch.
+    last_seen_mtime = _read_reload_mtime()
+    while not stop_event.is_set():
+        if _should_reload(RELOAD_SIGNAL_FILE, last_seen_mtime):
+            last_seen_mtime = _read_reload_mtime()
+            _rescan_configs(state)
+        if stop_event.wait(timeout=_RELOAD_POLL_SECONDS):
+            break
 
     for c in clients:
         c.close()
@@ -4929,31 +5065,88 @@ def update(do_apply: bool, skip_confirm: bool) -> None:
         sys.exit(1)
 
 
+def _detect_watcher_pids() -> tuple[Optional[list[str]], Optional[str]]:
+    """Best-effort: list PIDs of running `claude-mirror watch-all` processes.
+
+    Returns (pids, error_message). On POSIX we shell out to `pgrep`; on
+    Windows we fall back to `tasklist /V` and grep for the command line.
+    If neither approach succeeds (missing tool, permission denied, exotic
+    OS), returns (None, reason) so the caller can surface an
+    informational note without failing.
+    """
+    own_pid = str(os.getpid())
+    import subprocess as _sp
+    if sys.platform != "win32":
+        try:
+            result = _sp.run(
+                ["pgrep", "-f", "claude-mirror watch-all"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            return None, f"pgrep unavailable ({exc})"
+        pids = [
+            p.strip() for p in result.stdout.strip().splitlines()
+            if p.strip() and p.strip() != own_pid
+        ]
+        return pids, None
+    try:
+        # `tasklist /V /FO CSV` includes the window title but NOT the
+        # full command line. We grep the verbose output for the PID +
+        # image-name combination as a best-effort heuristic; some
+        # locked-down Windows environments restrict tasklist altogether,
+        # in which case we surface "couldn't verify".
+        result = _sp.run(
+            ["tasklist", "/V", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        return None, f"tasklist unavailable ({exc})"
+    pids = []
+    for line in result.stdout.splitlines():
+        if "claude-mirror" not in line.lower() or "watch-all" not in line.lower():
+            continue
+        parts = [p.strip().strip('"') for p in line.split(",")]
+        if len(parts) >= 2 and parts[1].isdigit() and parts[1] != own_pid:
+            pids.append(parts[1])
+    return pids, None
+
+
 @cli.command()
 def reload() -> None:
-    """Send SIGHUP to the running watch-all process to pick up new configs."""
-    import subprocess
-    result = subprocess.run(
-        ["pgrep", "-f", "claude-mirror watch-all"],
-        capture_output=True, text=True,
-    )
-    pids = result.stdout.strip().splitlines()
-    # Filter out our own process
-    own_pid = str(os.getpid())
-    pids = [p.strip() for p in pids if p.strip() and p.strip() != own_pid]
+    """Tell the running `watch-all` daemon to re-scan configs.
 
-    if not pids:
-        console.print("[yellow]No running watch-all process found.[/]")
+    Cross-platform: writes a sentinel file (`~/.config/claude_mirror/.reload_signal`)
+    that the daemon's polling loop reacts to within a few seconds. No
+    signals, no subprocess required for the actual reload — only for
+    the informational running-process check.
+    """
+    try:
+        _write_reload_signal()
+    except OSError as exc:
+        console.print(f"[red]Could not write reload signal:[/] {exc}")
+        sys.exit(1)
+
+    pids, detect_err = _detect_watcher_pids()
+    if pids is None:
+        console.print(
+            "[yellow]Couldn't verify whether a watcher is running on this "
+            "platform; reload signal written anyway.[/]"
+        )
+        if detect_err:
+            console.print(f"[dim]({detect_err})[/]")
         return
+    if not pids:
+        console.print(
+            "[yellow]No running `claude-mirror watch-all` process found.[/] "
+            "Start one with [bold]claude-mirror watch-all[/] (or run "
+            "[bold]claude-mirror-install[/] for auto-start at login)."
+        )
+        sys.exit(1)
 
-    for pid in pids:
-        try:
-            os.kill(int(pid), signal.SIGHUP)
-            console.print(f"[green]Sent SIGHUP to watch-all process (PID {pid}).[/]")
-        except ProcessLookupError:
-            console.print(f"[yellow]Process {pid} no longer exists.[/]")
-        except PermissionError:
-            console.print(f"[red]Permission denied sending signal to PID {pid}.[/]")
+    console.print(
+        f"[green]Reload signal written;[/] watcher (PID "
+        f"{', '.join(pids)}) will pick it up within ~{int(_RELOAD_POLL_SECONDS)}s."
+    )
 
 
 @cli.command()

@@ -524,9 +524,15 @@ pgrep -f "claude-mirror watch-all"      # PID(s) if running, exit 1 if not
 claude-mirror watch-all                 # foreground run; Ctrl+C to stop
 ```
 
-**Windows:** `watch-all` is POSIX-only today (it uses `SIGHUP` for hot-reload). Use the cron-style polling form instead — `claude-mirror watch --once --quiet` from Task Scheduler at the cadence you want. The inbox file lock that serializes concurrent watcher threads is now cross-platform (`msvcrt.locking` on Windows, `fcntl.flock` on POSIX), so the previous v0.5.54 caveat about Windows watchers losing lines under concurrent drains no longer applies — the strict TOCTOU regression test now runs on every platform.
+**Windows:** `watch-all` is fully supported on Windows since v0.5.59 — same one-process-per-config model as POSIX. Hot-reload uses a sentinel file (`%USERPROFILE%\.config\claude_mirror\.reload_signal`) the daemon polls every 2 seconds, so `claude-mirror reload` works the same way it does on macOS / Linux. The inbox file lock that serializes concurrent watcher threads is also cross-platform now (`msvcrt.locking` on Windows, `fcntl.flock` on POSIX), so the previous v0.5.54 caveat about Windows watchers losing lines under concurrent drains is closed — the strict TOCTOU regression test runs on every platform. To start it on login, use Task Scheduler:
 
-If the process is alive but a specific project still isn't getting events, run `claude-mirror reload` to send the running watcher a `SIGHUP` (re-scans `~/.config/claude_mirror/` for new configs). If that doesn't help, [`claude-mirror doctor`](#doctor) will tell you whether the project's backend itself is reachable and whether the notification channel (Drive Pub/Sub, Dropbox cursor, OneDrive/WebDAV/SFTP poll loop) is configured correctly.
+```powershell
+schtasks /Create /SC ONLOGON /TN "claude-mirror watch-all" /TR "claude-mirror watch-all" /RL HIGHEST /F
+schtasks /Run /TN "claude-mirror watch-all"          # start it now
+tasklist /V /FO CSV /NH | findstr "claude-mirror"   # verify it's running
+```
+
+If the process is alive but a specific project still isn't getting events, run `claude-mirror reload` to ask the running watcher to re-scan `~/.config/claude_mirror/` for new configs (the request lands within ~2 seconds via the sentinel-file poll). If that doesn't help, [`claude-mirror doctor`](#doctor) will tell you whether the project's backend itself is reachable and whether the notification channel (Drive Pub/Sub, Dropbox cursor, OneDrive/WebDAV/SFTP poll loop) is configured correctly.
 
 ### Unattended sync via cron
 
@@ -565,13 +571,13 @@ claude-mirror watch-all --config ~/.config/claude_mirror/work-a.yaml \
 
 ### Adding a new project to a running watcher
 
-When you create a new project with `claude-mirror init`, the running watcher is notified automatically via `SIGHUP` and picks up the new config without restarting. You can also trigger a reload manually:
+When you create a new project with `claude-mirror init`, the running watcher is notified automatically and picks up the new config without restarting. You can also trigger a reload manually:
 
 ```bash
 claude-mirror reload
 ```
 
-This sends `SIGHUP` to the running `watch-all` process, which re-scans `~/.config/claude_mirror/` for new config files and starts watcher threads for any it doesn't already have. Existing watchers are not interrupted.
+This writes a sentinel file (`~/.config/claude_mirror/.reload_signal`) that the running `watch-all` daemon polls every 2 seconds. On the next tick the daemon re-scans `~/.config/claude_mirror/` for new config files and starts watcher threads for any it doesn't already have. Existing watchers are not interrupted, and worst-case reload latency is the poll cadence (2 s). The mechanism is cross-platform — same behaviour on macOS, Linux, and Windows; no signals or `pgrep` involved.
 
 ### Recommended: `claude-mirror-install`
 
@@ -771,7 +777,7 @@ Syntax summary:
 
 Precedence: rules from `.claude_mirror_ignore` apply IN ADDITION to YAML `exclude_patterns` — both layers must vote "keep" for a file to be eligible. A path excluded by either system is filtered out before hashing or upload.
 
-Reload: the file is parsed once per command invocation. Edit it, run any subsequent `claude-mirror status` / `push` / `sync` and the new rules apply. The background watcher re-reads it on its existing config-reload cadence (`SIGHUP`), so you do not need to restart `watch-all`.
+Reload: the file is parsed once per command invocation. Edit it, run any subsequent `claude-mirror status` / `push` / `sync` and the new rules apply. The background watcher re-reads it on its existing config-reload cadence (the sentinel-file polling check, default 2 s), so you do not need to restart `watch-all`.
 
 The `.claude_mirror_ignore` file itself is auto-excluded from sync — the rules do not propagate to other machines unless you explicitly add the file to `file_patterns` (which you almost certainly should not). This mirrors the gitignore convention.
 

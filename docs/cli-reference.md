@@ -328,6 +328,8 @@ See [admin.md — Auto-start the watcher](admin.md#auto-start-the-watcher) for t
 
 Emit shell tab-completion source for the named shell. `eval "$(claude-mirror completion zsh)"` (or `bash` / `fish`) in your shell rc enables tab-completion for all subcommands and their flags.
 
+Since v0.5.50: `--backend` value list is enumerated dynamically at completion time via the hidden `_list-backends` command, so future backend additions automatically appear without re-sourcing the completion.
+
 ---
 
 ## Daily

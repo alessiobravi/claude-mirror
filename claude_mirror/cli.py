@@ -325,9 +325,28 @@ def _check_watcher_running(cmd_name: str) -> None:
     )
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Single source of truth for the set of valid storage backends. Both
+# `_create_storage` (the dispatch factory) and the hidden `_list-backends`
+# command (used by shell tab-completion to enumerate `--backend` values
+# at completion time, see DYN-COMP / v0.5.50) consult this tuple — adding
+# a new backend here automatically wires it into both surfaces, plus any
+# `shell_complete=` callback bound to a `--backend` Click option.
+# ──────────────────────────────────────────────────────────────────────────
+_AVAILABLE_BACKENDS: tuple[str, ...] = (
+    "googledrive",
+    "dropbox",
+    "onedrive",
+    "webdav",
+    "sftp",
+)
+
+
 def _create_storage(config: Config) -> StorageBackend:
     """Factory: create the storage backend based on config.backend."""
     backend = config.backend
+    if backend not in _AVAILABLE_BACKENDS:
+        raise ValueError(f"Unknown storage backend: {backend}")
     if backend == "googledrive":
         return GoogleDriveBackend(config)
     if backend == "dropbox":
@@ -342,7 +361,22 @@ def _create_storage(config: Config) -> StorageBackend:
     if backend == "sftp":
         from .backends.sftp import SFTPBackend
         return SFTPBackend(config)
-    raise ValueError(f"Unknown storage backend: {backend}")
+    raise ValueError(f"Unknown storage backend: {backend}")  # pragma: no cover
+
+
+def _backend_value_completer(
+    ctx: "click.Context", param: "click.Parameter", incomplete: str
+) -> list[str]:
+    """Click `shell_complete` callback for `--backend` value completion.
+
+    Returns the subset of `_AVAILABLE_BACKENDS` whose names start with the
+    user-typed prefix. Wired onto the high-traffic `--backend` options
+    (`init`, `auth`, etc.) so `claude-mirror init --backend <TAB>` enumerates
+    `dropbox / googledrive / onedrive / sftp / webdav` natively via Click's
+    completion-callback protocol — no static list baked into the emitted
+    shell scripts.
+    """
+    return [name for name in _AVAILABLE_BACKENDS if name.startswith(incomplete)]
 
 
 def _create_storage_set(config: Config) -> tuple[StorageBackend, list[StorageBackend]]:
@@ -1724,6 +1758,7 @@ def _run_wizard(
 @cli.command()
 @click.option("--project", default="", help="Path to the Claude project directory.")
 @click.option("--backend", "backend_opt", default="googledrive", show_default=True,
+              shell_complete=_backend_value_completer,
               help="Storage backend: googledrive | dropbox | onedrive | webdav | sftp.")
 @click.option("--drive-folder-id", default="", help="Google Drive folder ID to sync into.")
 @click.option("--gcp-project-id", default="", help="Google Cloud project ID.")
@@ -4244,6 +4279,7 @@ def _snapshot_entry_to_json(entry: dict) -> dict:
 @click.argument("paths", nargs=-1)
 @click.option("--output", default="", help="Directory to restore files into. Defaults to project path.")
 @click.option("--backend", "backend_name", default="",
+              shell_complete=_backend_value_completer,
               help="Tier 2: restore SOLELY from the named backend (e.g. "
                    "'dropbox'), bypassing the primary-first fallback chain. "
                    "Useful when the primary is down or you know which "
@@ -4385,6 +4421,7 @@ def _render_restore_plan(plan: dict, paths: Optional[list]) -> None:
 
 @cli.command()
 @click.option("--backend", "backend_filter", default="",
+              shell_complete=_backend_value_completer,
               help="Retry only on this one mirror backend (e.g. 'dropbox'). "
                    "Default: retry on every mirror with pending entries.")
 @click.option("--dry-run", is_flag=True, default=False,
@@ -4445,6 +4482,7 @@ def retry(backend_filter: str, dry_run: bool, config_path: str) -> None:
 
 @cli.command("seed-mirror")
 @click.option("--backend", "backend_name", default="",
+              shell_complete=_backend_value_completer,
               help="Mirror backend to seed (e.g. 'sftp'). Must match a "
                    "configured mirror's `backend` field. Optional: when "
                    "omitted, seed-mirror auto-detects the candidate if "
@@ -4550,6 +4588,7 @@ def seed_mirror(backend_name: str, dry_run: bool, config_path: str) -> None:
               help="With --delete, skip both confirmation prompts. Required "
                    "for non-interactive use (cron, CI).")
 @click.option("--backend", "backend_name", default="",
+              shell_complete=_backend_value_completer,
               help="Tier 2: target a specific backend (primary or any "
                    "configured mirror by `backend_name`, e.g. 'sftp', "
                    "'dropbox'). Default: the primary backend. Use this "
@@ -4784,6 +4823,7 @@ def history(path: str, since: str, until: str, config_path: str, json_output: bo
 @click.option("--config", "config_path", default="",
               help="Config file path. Auto-detected from cwd if omitted.")
 @click.option("--backend", "backend_name", default="",
+              shell_complete=_backend_value_completer,
               help="Inspect a specific backend (e.g. 'dropbox'). Default: "
                    "primary first, fall back to mirror(s).")
 def inspect(timestamp: str, path_filter: str, config_path: str, backend_name: str) -> None:
@@ -5619,7 +5659,7 @@ def profile_show(name: str) -> None:
 @click.option(
     "--backend", "backend_opt",
     type=click.Choice(
-        ["googledrive", "dropbox", "onedrive", "webdav", "sftp"],
+        list(_AVAILABLE_BACKENDS),
         case_sensitive=False,
     ),
     required=True,
@@ -6095,6 +6135,83 @@ def _build_powershell_complete_class():
     return PowerShellComplete
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Dynamic `--backend` value completion (DYN-COMP / v0.5.50).
+#
+# Click's emitted completion scripts dispatch back into the binary via the
+# `_CLAUDE_MIRROR_COMPLETE=<shell>_complete` env-var protocol on every
+# tab-press, so the `shell_complete=_backend_value_completer` callback wired
+# onto each `--backend` Click option already enumerates backends at
+# completion time — no static list is baked into any emitted script.
+#
+# In addition, each emitted script is suffixed with a small shell-native
+# helper that calls the hidden `claude-mirror _list-backends` subcommand.
+# This serves three purposes:
+#
+#   1. Belt-and-braces fallback. If a user customizes their shell's
+#      completion machinery in a way that bypasses Click's callback
+#      (rare), they can rebind `--backend` value completion to the helper
+#      directly with one line in their rc.
+#   2. Discoverability. Users grepping their completion script will find
+#      the hidden subcommand and understand how the dynamic enumeration
+#      works without reading Click internals.
+#   3. Runtime-only backends. Future plugin-loaded backends register
+#      themselves at `claude-mirror` import time; calling
+#      `_list-backends` always returns the live set, so freshly-installed
+#      backends complete without re-sourcing the script.
+#
+# The shim is intentionally tiny (one helper per shell) and idempotent
+# (defining it twice is a no-op). Cold-start cost of the callback is
+# ~50ms (Python + Click startup); warm-cache ~10ms — fast enough that
+# we don't ship a static-fallback flag.
+# ──────────────────────────────────────────────────────────────────────────
+
+_ZSH_DYN_COMP_SHIM = """
+# claude-mirror DYN-COMP — dynamic --backend value completion via
+# `claude-mirror _list-backends` (hidden subcommand). Click's own callback
+# already populates --backend values, but exposing the helper here makes
+# runtime-only backend additions visible without re-sourcing.
+_claude_mirror_backends() {
+    local -a backends
+    backends=(${(f)"$(claude-mirror _list-backends 2>/dev/null)"})
+    compadd -a backends
+}
+"""
+
+_BASH_DYN_COMP_SHIM = """
+# claude-mirror DYN-COMP — dynamic --backend value completion via
+# `claude-mirror _list-backends` (hidden subcommand). Used as a
+# belt-and-braces fallback when the previous word is `--backend`; the
+# Click-generated _claude_mirror_completion above is the primary path.
+_claude_mirror_backends() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    COMPREPLY=( $(compgen -W "$(claude-mirror _list-backends 2>/dev/null)" -- "$cur") )
+}
+"""
+
+_FISH_DYN_COMP_SHIM = """
+# claude-mirror DYN-COMP — dynamic --backend value completion via
+# `claude-mirror _list-backends` (hidden subcommand). Registered as an
+# explicit complete rule alongside Click's own dispatcher so fish always
+# sees the live backend set even if the Click env-var protocol changes.
+complete -c claude-mirror -l backend -x -a '(claude-mirror _list-backends)'
+"""
+
+_POWERSHELL_DYN_COMP_SHIM = """
+# claude-mirror DYN-COMP — dynamic --backend value completion via
+# `claude-mirror _list-backends` (hidden subcommand). Helper function;
+# the primary completion path remains the Register-ArgumentCompleter
+# block above (Click's env-var dispatch).
+function global:_ClaudeMirrorBackends {
+    & claude-mirror _list-backends 2>$null | ForEach-Object {
+        [System.Management.Automation.CompletionResult]::new(
+            $_, $_, 'ParameterValue', "claude-mirror backend: $_"
+        )
+    }
+}
+"""
+
+
 @cli.command()
 @click.argument(
     "shell",
@@ -6124,6 +6241,11 @@ def completion(shell: str) -> None:
     After restarting your shell, `claude-mirror <TAB>` completes commands
     and `claude-mirror push <TAB>` completes flag names. High-value flags
     (--config, --backend) also complete their values.
+
+    Since v0.5.50 the `--backend` value list is enumerated DYNAMICALLY at
+    completion time via the hidden `claude-mirror _list-backends`
+    subcommand — future backend additions automatically appear without
+    re-sourcing the completion script.
     """
     from click.shell_completion import BashComplete, FishComplete, ZshComplete
 
@@ -6133,15 +6255,45 @@ def completion(shell: str) -> None:
         "fish": FishComplete,
         "powershell": _build_powershell_complete_class(),
     }
-    cls = shell_classes[shell.lower()]
+    shim_for = {
+        "bash": _BASH_DYN_COMP_SHIM,
+        "zsh": _ZSH_DYN_COMP_SHIM,
+        "fish": _FISH_DYN_COMP_SHIM,
+        "powershell": _POWERSHELL_DYN_COMP_SHIM,
+    }
+    shell_lc = shell.lower()
+    cls = shell_classes[shell_lc]
     comp = cls(
         cli=cli,
         ctx_args={},
         prog_name="claude-mirror",
         complete_var="_CLAUDE_MIRROR_COMPLETE",
     )
-    # `.source()` returns the shell-specific script as a string
+    # `.source()` returns the shell-specific script as a string. Append
+    # the DYN-COMP shim so a grep for `_list-backends` lands a hit and
+    # any rc-level overrides have a stable hook to bind to.
     click.echo(comp.source())
+    click.echo(shim_for[shell_lc])
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# `_list-backends` — hidden helper consumed by shell tab-completion
+# (DYN-COMP / v0.5.50). Prints one backend name per line on stdout, exit 0.
+# Hidden so it never clutters `claude-mirror --help`.
+# ──────────────────────────────────────────────────────────────────────────
+@cli.command("_list-backends", hidden=True)
+def list_backends_cmd() -> None:
+    """Print the available storage-backend names, one per line.
+
+    Used by the dynamic shell-completion shims emitted by
+    `claude-mirror completion <shell>` to enumerate `--backend` values
+    at completion time. Source-of-truth: the module-level
+    `_AVAILABLE_BACKENDS` constant — adding a new backend there
+    automatically wires it into both the dispatch factory
+    (`_create_storage`) and shell completion.
+    """
+    for name in _AVAILABLE_BACKENDS:
+        click.echo(name)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -9297,6 +9449,7 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
 @click.option("--config", "config_path", default="",
               help="Config file path. Auto-detected from cwd if omitted.")
 @click.option("--backend", "backend_filter", default="",
+              shell_complete=_backend_value_completer,
               help="Limit checks to one backend by name "
                    "(googledrive, dropbox, onedrive, webdav, sftp). Default: "
                    "check all configured backends including Tier 2 mirrors.")

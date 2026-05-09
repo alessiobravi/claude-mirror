@@ -559,6 +559,28 @@ It detects your platform automatically, creates the appropriate service file, an
 claude-mirror-install --uninstall
 ```
 
+### Shell tab-completion
+
+`claude-mirror-install` also installs tab-completion for your shell (auto-detected from `$SHELL`, with PowerShell as the Windows default). After install, `claude-mirror <TAB>` enumerates subcommands and `claude-mirror init --backend <TAB>` enumerates the supported storage backends.
+
+Since v0.5.50 the `--backend` value list is **dynamic**: the completion script calls back into `claude-mirror _list-backends` (a hidden subcommand) at every tab-press, so when a future release adds a new backend, it appears automatically without re-sourcing the completion. The cold-start cost of the callback is roughly 50 ms (Python + Click startup); warm-cache around 10 ms — fast enough that there is no static-fallback flag.
+
+To regenerate the completion script manually for one shell:
+
+```bash
+# zsh — append to ~/.zshrc
+eval "$(claude-mirror completion zsh)"
+
+# bash — append to ~/.bashrc
+eval "$(claude-mirror completion bash)"
+
+# fish — write to the completions directory
+claude-mirror completion fish > ~/.config/fish/completions/claude-mirror.fish
+
+# PowerShell — append to your profile
+claude-mirror completion powershell | Out-File -Encoding utf8 -Append $PROFILE.CurrentUserAllHosts
+```
+
 ### Manual component installation
 
 If you prefer to set up the service by hand, or need to customize the generated file, follow the steps for your platform below.

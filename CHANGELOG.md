@@ -110,6 +110,28 @@ Plain FTP (legacy shared-hosting market: cPanel / DirectAdmin / old WordPress ho
 - `docs/cli-reference.md` — `--backend` choice list extended to include `ftp` everywhere it appears. New `--ftp-*` flag block on `init` and `clone`. Backend pages list extended.
 - `README.md` — new FTP / FTPS row in the backends table; new row in the prerequisites table.
 
+## [Unreleased]
+
+### Added — S3-compatible storage backend (BACKEND-S3)
+
+One implementation transparently supports AWS S3, Cloudflare R2, Backblaze B2 (S3 API), Wasabi, MinIO, Tigris, IDrive E2, Linode Object Storage, DigitalOcean Spaces, Storj, Hetzner Storage Box, and every other S3-compatible service via configurable `s3_endpoint_url`. Adds `boto3>=1.34` to base install (lazy-imported, zero startup cost for users who don't use S3).
+
+- New module `claude_mirror/backends/s3.py` (~470 lines) — full `StorageBackend` implementation: `authenticate` via `head_bucket`, single-PUT or multipart `upload_file` (5 MiB threshold matching S3's smallest legal multipart-part size), `get_object` streaming download with the project-wide `MAX_DOWNLOAD_BYTES` cap, paginated `list_objects_v2` recursive listing with client-side `exclude_folder_names` filtering, server-side `copy_object`, ETag-based `get_file_hash` (with the documented multipart `-N` suffix caveat), `classify_error` mapping for `NoCredentialsError` / `InvalidAccessKeyId` / `SignatureDoesNotMatch` / `AccessDenied` / `NoSuchBucket` / `NoSuchKey` / `SlowDown` / 429 / 5xx / 413 / `EndpointConnectionError`. Boto3 lazy-imported function-locally per the v0.5.61 fusepy precedent.
+- `claude_mirror/cli.py::_AVAILABLE_BACKENDS` — append `"s3"` (last entry, append-only). New `_create_storage` dispatch case. New `_run_s3_deep_checks` doctor function (six checks: credentials shape, endpoint URL well-formedness, bucket reachable via `head_bucket`, list permissions via `list_objects_v2 MaxKeys=1`, write permissions via `put_object` + `delete_object` of a 1-byte sentinel, region consistency between `s3_region` and the bucket's actual region) wired into `_run_doctor_checks`. Init wizard + flag-mode validation extended with the s3 branch; `init` and `clone` Click commands gain the seven new `--s3-*` flags. Wizard summary block + token-file derivation cover s3.
+- `claude_mirror/config.py::Config` — new fields `s3_endpoint_url`, `s3_bucket`, `s3_region`, `s3_access_key_id`, `s3_secret_access_key`, `s3_prefix`, `s3_use_path_style`. `root_folder` property returns the resolved prefix for s3.
+- `pyproject.toml` — `boto3>=1.34` added to base `[project] dependencies` (matches the v0.5.10 every-backend-in-base policy). `boto3.*` + `botocore.*` added to the `[[tool.mypy.overrides]] ignore_missing_imports` list. Empty `[project.optional-dependencies] s3 = []` for back-compat aliases.
+- `tests/test_s3_backend.py` — **38 tests** using a hand-written `FakeS3` mock (no `moto`, no network): authenticate happy/sad paths, all upload/download/list/copy/delete/get_hash methods, classify_error mapping for every ErrorClass entry, path-style vs virtual-hosted-style URL construction, multipart threshold passes through `TransferConfig`, multi-page pagination, empty bucket, sentinel write+delete. Multipart code path exercised at `_MULTIPART_THRESHOLD + 1024` bytes.
+- `tests/test_doctor_s3_deep.py` — **11 tests** covering each of the six deep checks (happy path + failure variants), plus auth-bucket short-circuit assertion (one auth failure, remaining checks skipped). All boto3 calls mocked at the `S3Backend._get_client` seam.
+- `tests/test_init_wizard.py` — extended with `test_run_wizard_s3_walks_through_prompts`.
+- `tests/test_dyn_comp.py` — updated `test_list_backends_prints_five_expected_names_one_per_line` to include `"s3"` (the test is renamed semantically but the contract remains: every entry of `_AVAILABLE_BACKENDS` is emitted, in declaration order, one per line).
+- `docs/backends/s3.md` — new (~250 lines): per-provider quick-starts (AWS / Cloudflare R2 / Backblaze B2 / MinIO), full config field reference, minimum IAM policy with `s3:ListBucket` + `s3:GetObject` / `s3:PutObject` / `s3:DeleteObject` / `s3:CopyObject` examples, doctor deep-check walkthrough, troubleshooting (auth errors, bucket-not-found, region mismatches, MinIO TLS, path-style vs virtual-hosted, multipart ETag caveat).
+- `README.md` — backends table extended with the S3 row; `**Supported backends**` summary line, `## How it works` polling latency line, `### Prerequisites` table, install description, and the documentation index all updated.
+
+### Tests
+
+- `pytest tests/` — **1151 passed, 3 skipped** locally on macOS (was 1101 + 50 new S3 tests + 1 init-wizard regression update).
+- `mypy --strict claude_mirror/` — clean across 42 source files.
+
 ---
 
 ## [0.5.62] — 2026-05-09

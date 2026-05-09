@@ -13,6 +13,7 @@ claude-mirror [--profile NAME] <subcommand> ...   # global flag (since v0.5.49)
 
 claude-mirror init        [--wizard]
                         [--backend googledrive|dropbox|onedrive|webdav|sftp|ftp]
+                        [--backend googledrive|dropbox|onedrive|webdav|sftp|s3]
                         [--project PATH]
                         [--drive-folder-id ID] [--gcp-project-id ID] [--pubsub-topic-id ID]
                         [--credentials-file PATH]
@@ -27,12 +28,15 @@ claude-mirror init        [--wizard]
                         [--ftp-host HOST] [--ftp-port PORT] [--ftp-username USER] [--ftp-password PASS]
                         [--ftp-folder PATH] [--ftp-tls off|explicit|implicit]
                         [--ftp-passive/--no-ftp-passive]
+                        [--s3-endpoint-url URL] [--s3-bucket NAME] [--s3-region REGION]
+                        [--s3-access-key-id ID] [--s3-secret-access-key KEY]
+                        [--s3-prefix PATH] [--s3-use-path-style/--no-s3-use-path-style]
                         [--poll-interval SECS]
                         [--slack/--no-slack] [--slack-webhook-url URL] [--slack-channel CHAN]
                         [--token-file PATH] [--patterns GLOB ...] [--exclude GLOB ...] [--config PATH]
                         [--auto-pubsub-setup]      # googledrive only: auto-create Pub/Sub topic + per-machine subscription + IAM grant after auth
 claude-mirror auth        [--check] [--config PATH]
-claude-mirror clone       --backend googledrive|dropbox|onedrive|webdav|sftp
+claude-mirror clone       --backend googledrive|dropbox|onedrive|webdav|sftp|s3
                         --project PATH
                         [--drive-folder-id ID] [--gcp-project-id ID] [--pubsub-topic-id ID]
                         [--credentials-file PATH]
@@ -47,6 +51,9 @@ claude-mirror clone       --backend googledrive|dropbox|onedrive|webdav|sftp
                         [--ftp-host HOST] [--ftp-port PORT] [--ftp-username USER] [--ftp-password PASS]
                         [--ftp-folder PATH] [--ftp-tls off|explicit|implicit]
                         [--ftp-passive/--no-ftp-passive]
+                        [--s3-endpoint-url URL] [--s3-bucket NAME] [--s3-region REGION]
+                        [--s3-access-key-id ID] [--s3-secret-access-key KEY]
+                        [--s3-prefix PATH] [--s3-use-path-style/--no-s3-use-path-style]
                         [--poll-interval SECS]
                         [--token-file PATH] [--patterns GLOB ...] [--exclude GLOB ...] [--config PATH]
                         [--no-pull] [--wizard]
@@ -76,7 +83,7 @@ claude-mirror forget            TIMESTAMP... | --before DATE/DURATION | --keep-l
 claude-mirror prune             [--keep-last N] [--keep-daily N] [--keep-monthly N] [--keep-yearly N]
                               [--delete] [--yes] [--include-tagged] [--config PATH]   # dry-run by default; reads keep_* from config; tagged snapshots shielded unless --include-tagged
 claude-mirror gc                [--backend NAME] [--delete] [--yes] [--config PATH]   # dry-run by default; --delete to actually delete; --backend targets a specific mirror (Tier 2)
-claude-mirror doctor            [--backend NAME] [--config PATH]   # end-to-end self-test: config + credentials + connectivity + project + manifest (+ deep checks under --backend googledrive or --backend dropbox)
+claude-mirror doctor            [--backend NAME] [--config PATH]   # end-to-end self-test: config + credentials + connectivity + project + manifest (+ deep checks under --backend googledrive | dropbox | onedrive | webdav | sftp | s3)
 claude-mirror health            [--no-backends] [--timeout N] [--json] [--config PATH]   # machine-readable monitoring probe; exit 0 ok / 1 warn / 2 fail
 claude-mirror verify            [--backend NAME] [--snapshots/--no-snapshots] [--files/--no-files] [--mount-cache/--no-mount-cache] [--strict] [--json] [--config PATH]   # end-to-end integrity audit: manifest-vs-remote + snapshot blobs + mount cache
 claude-mirror migrate-snapshots --to {blobs|full} [--dry-run] [--keep-source] [--no-update-config] [--config PATH]
@@ -419,6 +426,7 @@ See [README — Your first project](../README.md#your-first-project) for the wiz
 - [backends/webdav.md](backends/webdav.md)
 - [backends/sftp.md](backends/sftp.md)
 - [backends/ftp.md](backends/ftp.md)
+- [backends/s3.md](backends/s3.md)
 
 ### `clone`
 
@@ -431,6 +439,7 @@ One-shot bootstrap from an existing remote project — combines `init` + `auth` 
 - OneDrive — `--onedrive-client-id <CLIENT_ID> --onedrive-folder <PATH>`
 - WebDAV — `--webdav-url <URL> --webdav-username <USER> --webdav-password <PW>` (add `--webdav-insecure-http` only on closed-LAN test setups)
 - SFTP — `--sftp-host <HOST> --sftp-port <PORT> --sftp-username <USER> --sftp-key-file <KEY> --sftp-known-hosts-file <PATH> --sftp-folder <ABS_PATH>` (or `--sftp-password <PW>` instead of a key)
+- S3-compatible — `--s3-bucket <NAME> --s3-region <REGION> --s3-access-key-id <ID> --s3-secret-access-key <KEY> --s3-prefix <PATH>` (add `--s3-endpoint-url <URL>` for non-AWS providers; add `--s3-use-path-style` for MinIO)
 
 Common flags:
 
@@ -450,7 +459,7 @@ Common flags:
 
 ### `auth`
 
-Authenticate the configured backend. Google Drive opens a browser; Dropbox prints an authorization URL and reads the code from stdin; OneDrive prints a device code; WebDAV validates the URL/username/password in-process; SFTP validates the SSH key/password against the server. Tokens are written to the project's `token_file` with `chmod 0600`. `--check` only verifies the existing token (does not start a fresh login).
+Authenticate the configured backend. Google Drive opens a browser; Dropbox prints an authorization URL and reads the code from stdin; OneDrive prints a device code; WebDAV validates the URL/username/password in-process; SFTP validates the SSH key/password against the server; S3 verifies the access key + secret against the bucket via `head_bucket`. Tokens are written to the project's `token_file` with `chmod 0600`. `--check` only verifies the existing token (does not start a fresh login).
 
 Combines with the global `--profile NAME` flag — `claude-mirror --profile work auth` writes the OAuth token to the path declared on the profile rather than the project YAML, which is exactly what you want when several projects share the same profile (one OAuth flow → one token reused everywhere).
 

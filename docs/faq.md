@@ -455,7 +455,7 @@ Three layers to check, top-down:
 
 1. **Is the watcher running?** `pgrep -fl claude-mirror` should list at least one watch process. If not, `claude-mirror watch-all` (or restart the launchd / systemd service via `claude-mirror-install`).
 
-2. **Is the per-backend channel healthy?** `claude-mirror doctor --backend NAME` runs deep, backend-specific checks for all five backends — Drive (Pub/Sub topic + subscription + IAM grant), Dropbox (token shape + scopes + folder access), OneDrive (token cache + Azure GUID + scopes), WebDAV (PROPFIND + DAV class), SFTP (host fingerprint + key perms + auth).
+2. **Is the per-backend channel healthy?** `claude-mirror doctor --backend NAME` runs deep, backend-specific checks for every backend — Drive (Pub/Sub topic + subscription + IAM grant), Dropbox (token shape + scopes + folder access), OneDrive (token cache + Azure GUID + scopes), WebDAV (PROPFIND + DAV class), SFTP (host fingerprint + key perms + auth), S3 (bucket reachable + list + write permissions + region consistency).
 
 3. **(Drive) Is the IAM grant present?** This is the single most common silent failure — about 70% of self-serve Drive setups miss it. The deep `doctor` check reports it explicitly; `claude-mirror init --auto-pubsub-setup --config <path>` adds it idempotently.
 

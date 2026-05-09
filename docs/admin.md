@@ -1460,7 +1460,7 @@ The implementation runs the following checks in order. Every per-backend check r
 | Check | Backends | Failure looks like |
 |---|---|---|
 | OAuth credentials file referenced by `credentials_file` exists on disk | googledrive, dropbox, onedrive | `credentials file missing: PATH` — fix is to re-download `credentials.json` from the provider's developer console |
-| Credentials check skipped (inline in YAML) | webdav, sftp | info-only line, never a failure |
+| Credentials check skipped (inline in YAML or default chain) | webdav, sftp, s3 | info-only line, never a failure |
 
 #### Tokens / inline auth material
 
@@ -1469,6 +1469,7 @@ The implementation runs the following checks in order. Every per-backend check r
 | Token file exists, parses as JSON, and contains a `refresh_token` | googledrive, dropbox, onedrive | `token file missing` / `token file corrupt` / `token has no refresh_token` — fix is `claude-mirror auth --config PATH` (consent screen must be shown to issue a new refresh token) |
 | `webdav_username` and `webdav_password` are non-empty in the YAML | webdav | `WebDAV credentials missing in config: PATH` |
 | `sftp_host`, `sftp_username`, `sftp_folder`, plus at least one of `sftp_key_file` or `sftp_password` are set | sftp | `SFTP config incomplete (missing FIELDS): PATH` |
+| `s3_bucket` is non-empty in the YAML; access key + secret are optional (boto3's default credential chain handles env vars / `~/.aws/credentials` / IAM role when blank) | s3 | `S3 config incomplete (s3_bucket): PATH` |
 
 #### Connectivity
 
@@ -1745,6 +1746,31 @@ The FTP backend uses Python's stdlib `ftplib` — no third-party dependency. The
 
 - Backend is not `ftp` — the deep section is gated on `backend_name == "ftp"` and silently skipped for everything else.
 - Generic Check 3 (FTP credentials present in YAML) failed — the deep section still runs, but most checks degrade to "missing credentials" failures pointing back at the YAML.
+### S3 deep checks
+
+When `--backend s3` is in effect (explicitly via the flag, or because the primary / a Tier 2 mirror is `s3`), the doctor runs an additional six checks targeting failure modes that show up on S3-compatible storage. These complement the generic credentials/connectivity loop above; they don't replace it. Skipped silently for every other backend.
+
+| Check | Failure looks like |
+|---|---|
+| Credentials shape | `s3_access_key_id set but s3_secret_access_key empty` (or vice versa) — fix is to add the missing field, OR blank both to fall back to boto3's default credential chain (env vars / `~/.aws/credentials` / IAM role) |
+| Endpoint URL well-formed (when set) | `s3_endpoint_url is malformed` — fix is to use the form `https://<host>` (e.g. `https://s3.eu-central-003.backblazeb2.com` for Backblaze B2; `https://<account>.r2.cloudflarestorage.com` for Cloudflare R2) |
+| Bucket reachable (`head_bucket`) | `Bucket NAME does not exist` (404 — fix is `aws s3 mb s3://NAME` or create the bucket in the provider's web UI), `S3 auth failed` (auth-bucketed; fix is to verify keys + re-run `claude-mirror auth`), `Could not reach S3 endpoint` (DNS / firewall — fix is to verify reachability), or `transient server error` (5xx — retry in a moment) |
+| List permissions (`list_objects_v2 MaxKeys=1`) | `S3 list permissions denied (AccessDenied)` plus the IAM hint `grant the IAM principal s3:ListBucket on arn:aws:s3:::BUCKET` |
+| Write permissions (`put_object` + `delete_object` of a 1-byte sentinel `__claude_mirror_doctor_test`) | `S3 write permissions denied (AccessDenied)` plus the IAM hint `grant s3:PutObject + s3:DeleteObject on arn:aws:s3:::BUCKET/PREFIX/*`. The sentinel is cleaned up immediately on success |
+| Region consistency (when `s3_region` is set) | yellow `⚠ Region mismatch: configured X but bucket is in Y` — non-fatal warning. AWS may redirect or reject some operations on a mismatch; many S3-compat services tolerate it |
+
+#### Auth-failure bucketing
+
+Auth-class failures (`InvalidAccessKeyId`, `SignatureDoesNotMatch`, `AccessDenied`, `NoCredentialsError`, HTTP 401) all funnel through ONE auth-bucket — at most one of these fires per run, and the remaining checks (4-6) are short-circuited so the user doesn't see five copies of "your credentials are broken" rooted in the same problem. The bucket fix-hint points at the YAML's `s3_access_key_id` + `s3_secret_access_key` fields and at re-running `claude-mirror auth --config PATH`.
+
+#### Lazy import
+
+`boto3` and `botocore.exceptions` are lazy-imported inside the deep-check function (and inside `S3Backend` itself, function-locally) so the multi-tens-of-millisecond import cost is only paid when `--backend s3` is actually exercising these checks. Generic `claude-mirror doctor` invocations on other backends remain fast — the same v0.5.61 fusepy precedent.
+
+#### When the deep section is skipped
+
+- Backend is not `s3` — the deep section is gated on `backend_name == "s3"` and silently skipped for everything else.
+- Generic Check 3 (`s3_bucket` present in YAML) failed — the deep section still runs, but most checks degrade to "missing bucket" failures pointing back at the YAML.
 
 ### Sample Dropbox deep-check successful output
 

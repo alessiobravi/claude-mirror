@@ -447,6 +447,7 @@ _AVAILABLE_BACKENDS: tuple[str, ...] = (
     "webdav",
     "sftp",
     "ftp",
+    "s3",
 )
 
 
@@ -472,6 +473,9 @@ def _create_storage(config: Config) -> StorageBackend:
     if backend == "ftp":
         from .backends.ftp import FtpBackend
         return FtpBackend(config)
+    if backend == "s3":
+        from .backends.s3 import S3Backend
+        return S3Backend(config)
     raise ValueError(f"Unknown storage backend: {backend}")  # pragma: no cover
 
 
@@ -1281,7 +1285,7 @@ def _run_wizard(
     console.print("\n[bold cyan]claude-mirror setup wizard[/]\n")
     console.print("Press Enter to accept the [dim]default[/] shown in brackets.\n")
 
-    _SUPPORTED_BACKENDS = ("googledrive", "dropbox", "onedrive", "webdav", "sftp", "ftp")
+    _SUPPORTED_BACKENDS = ("googledrive", "dropbox", "onedrive", "webdav", "sftp", "ftp", "s3")
 
     # Backend
     console.print(
@@ -1332,6 +1336,14 @@ def _run_wizard(
     ftp_tls = "explicit"
     ftp_passive = True
     poll_interval = 30  # default; only meaningful for onedrive/webdav/sftp/ftp
+    s3_endpoint_url = ""
+    s3_bucket = ""
+    s3_region = ""
+    s3_access_key_id = ""
+    s3_secret_access_key = ""
+    s3_prefix = ""
+    s3_use_path_style = False
+    poll_interval = 30  # default; only meaningful for onedrive/webdav/sftp/s3
 
     # ── Profile pre-fill banner ───────────────────────────────────────
     # When the wizard runs under `--profile NAME`, announce which fields
@@ -1784,8 +1796,104 @@ def _run_wizard(
             default=True,
         )
 
+    elif backend == "s3":
+        # Endpoint URL — empty for AWS, otherwise the provider's S3 host.
+        if profile_data.get("s3_endpoint_url"):
+            s3_endpoint_url = profile_data["s3_endpoint_url"]
+            console.print(
+                f"[dim]S3 endpoint URL supplied by profile:[/] "
+                f"{s3_endpoint_url}\n"
+            )
+        else:
+            console.print(
+                "\n[dim]S3 endpoint URL: leave blank for AWS S3 proper, "
+                "otherwise the provider's S3 host.[/]"
+                "\n[dim]  Cloudflare R2: https://<account>.r2.cloudflarestorage.com[/]"
+                "\n[dim]  Backblaze B2:  https://s3.<region>.backblazeb2.com[/]"
+                "\n[dim]  Wasabi:        https://s3.<region>.wasabisys.com[/]"
+                "\n[dim]  MinIO:         http://localhost:9000[/]"
+                "\n[dim]  DO Spaces:     https://<region>.digitaloceanspaces.com[/]\n"
+            )
+            s3_endpoint_url = click.prompt(
+                "S3 endpoint URL (blank for AWS)", default="",
+            ).strip()
+
+        # Bucket
+        if profile_data.get("s3_bucket"):
+            s3_bucket = profile_data["s3_bucket"]
+            console.print(
+                f"[dim]S3 bucket supplied by profile:[/] {s3_bucket}\n"
+            )
+        else:
+            console.print(
+                "\n[dim]S3 bucket: the bucket name (must already exist).[/]\n"
+            )
+            while True:
+                s3_bucket = click.prompt("S3 bucket").strip()
+                if s3_bucket:
+                    break
+                console.print("[red]Bucket name cannot be empty.[/]")
+
+        # Region — required for AWS, optional for many S3-compat services.
+        if profile_data.get("s3_region"):
+            s3_region = profile_data["s3_region"]
+            console.print(
+                f"[dim]S3 region supplied by profile:[/] {s3_region}\n"
+            )
+        else:
+            console.print(
+                "\n[dim]S3 region (e.g. us-east-1, eu-central-1, "
+                "eu-central-003 for B2). Required for AWS proper; "
+                "many S3-compat services accept any value.[/]\n"
+            )
+            s3_region = click.prompt(
+                "S3 region",
+                default="us-east-1" if not s3_endpoint_url else "auto",
+            ).strip()
+
+        # Access key + secret
+        if (
+            profile_data.get("s3_access_key_id")
+            and profile_data.get("s3_secret_access_key")
+        ):
+            s3_access_key_id = profile_data["s3_access_key_id"]
+            s3_secret_access_key = profile_data["s3_secret_access_key"]
+            console.print(
+                "[dim]S3 access key + secret supplied by profile.[/]\n"
+            )
+        else:
+            console.print(
+                "\n[dim]Access key ID + secret access key. Leave both "
+                "blank to use boto3's default credential chain "
+                "(env vars / ~/.aws/credentials / IAM role).[/]\n"
+            )
+            s3_access_key_id = click.prompt(
+                "S3 access key ID", default="",
+            ).strip()
+            if s3_access_key_id:
+                s3_secret_access_key = click.prompt(
+                    "S3 secret access key", default="",
+                    hide_input=True, show_default=False,
+                ).strip()
+
+        # Prefix — defaults to project name.
+        console.print(
+            "\n[dim]S3 prefix: path inside the bucket where this "
+            "project's files live. Default: project name.[/]\n"
+        )
+        s3_prefix = click.prompt(
+            "S3 prefix", default=project_name,
+        ).strip().strip("/")
+
+        # Path-style addressing (MinIO + some S3-compat hosts require it).
+        s3_use_path_style = click.confirm(
+            "Use path-style addressing? "
+            "(required for MinIO; AWS works with either)",
+            default=False,
+        )
+
     # Polling interval for backends without push notifications.
-    if backend in ("onedrive", "webdav", "sftp", "ftp"):
+    if backend in ("onedrive", "webdav", "sftp", "ftp", "s3"):
         console.print(
             "\n[dim]Poll interval (seconds): how often the watcher checks for "
             "remote changes. Lower = more responsive, higher = less network use.[/]\n"
@@ -1813,6 +1921,8 @@ def _run_wizard(
             derived_token = str(CONFIG_DIR / f"sftp-{project_name}-token.json")
         elif backend == "ftp":
             derived_token = str(CONFIG_DIR / f"ftp-{project_name}-token.json")
+        elif backend == "s3":
+            derived_token = str(CONFIG_DIR / f"s3-{project_name}-token.json")
         else:
             derived_token = str(CONFIG_DIR / f"{backend}-{project_name}-token.json")
         raw_token = click.prompt("Token file", default=derived_token)
@@ -1887,7 +1997,19 @@ def _run_wizard(
             console.print(f"  Password:      {'*' * len(ftp_password)}")
         console.print(f"  FTP folder:    {ftp_folder}")
         console.print(f"  Passive mode:  {ftp_passive}")
-    if backend in ("onedrive", "webdav", "sftp", "ftp"):
+    elif backend == "s3":
+        console.print(f"  Endpoint URL:  {s3_endpoint_url or '(AWS default)'}")
+        console.print(f"  Bucket:        {s3_bucket}")
+        console.print(f"  Region:        {s3_region}")
+        console.print(
+            f"  Access key:    "
+            f"{s3_access_key_id or '(from boto3 default chain)'}"
+        )
+        if s3_secret_access_key:
+            console.print(f"  Secret key:    {'*' * 8}")
+        console.print(f"  Prefix:        {s3_prefix}")
+        console.print(f"  Path style:    {s3_use_path_style}")
+    if backend in ("onedrive", "webdav", "sftp", "ftp", "s3"):
         console.print(f"  Poll interval: {poll_interval}s")
     console.print(f"  Patterns:      {', '.join(patterns)}")
 
@@ -1995,6 +2117,13 @@ def _run_wizard(
         ftp_folder=ftp_folder,
         ftp_tls=ftp_tls,
         ftp_passive=ftp_passive,
+        s3_endpoint_url=s3_endpoint_url,
+        s3_bucket=s3_bucket,
+        s3_region=s3_region,
+        s3_access_key_id=s3_access_key_id,
+        s3_secret_access_key=s3_secret_access_key,
+        s3_prefix=s3_prefix,
+        s3_use_path_style=s3_use_path_style,
         poll_interval=poll_interval,
         slack_enabled=slack_enabled,
         slack_webhook_url=slack_webhook_url,
@@ -2012,7 +2141,7 @@ def _run_wizard(
 @click.option("--project", default="", help="Path to the Claude project directory.")
 @click.option("--backend", "backend_opt", default="googledrive", show_default=True,
               shell_complete=_backend_value_completer,
-              help="Storage backend: googledrive | dropbox | onedrive | webdav | sftp.")
+              help="Storage backend: googledrive | dropbox | onedrive | webdav | sftp | ftp | s3.")
 @click.option("--drive-folder-id", default="", help="Google Drive folder ID to sync into.")
 @click.option("--gcp-project-id", default="", help="Google Cloud project ID.")
 @click.option("--pubsub-topic-id", default="", help="Pub/Sub topic ID.")
@@ -2053,8 +2182,23 @@ def _run_wizard(
               help="TLS mode: explicit=AUTH TLS on port 21; implicit=legacy FTPS on port 990; off=cleartext (LAN-only).")
 @click.option("--ftp-passive/--no-ftp-passive", "ftp_passive", default=True, show_default=True,
               help="Use passive mode for FTP data transfers (recommended; works through more firewalls).")
+@click.option("--s3-endpoint-url", default="",
+              help="S3 endpoint URL. Empty for AWS S3; set to provider URL for R2 / B2 / Wasabi / MinIO / Tigris / Spaces / etc.")
+@click.option("--s3-bucket", default="",
+              help="S3 bucket name (must already exist).")
+@click.option("--s3-region", default="",
+              help="S3 region (e.g. us-east-1, eu-central-1, eu-central-003 for Backblaze B2).")
+@click.option("--s3-access-key-id", default="",
+              help="S3 access key ID. Leave blank to use boto3's default credential chain.")
+@click.option("--s3-secret-access-key", default="",
+              help="S3 secret access key. Leave blank to use boto3's default credential chain.")
+@click.option("--s3-prefix", default="",
+              help="Path prefix inside the bucket. Defaults to the project name.")
+@click.option("--s3-use-path-style/--no-s3-use-path-style",
+              "s3_use_path_style", default=False, show_default=True,
+              help="Use path-style addressing (https://endpoint/bucket/key). Required for MinIO and a few S3-compat services.")
 @click.option("--poll-interval", "poll_interval", default=30, show_default=True, type=int,
-              help="Polling interval in seconds for backends without push notifications (OneDrive, WebDAV, SFTP, FTP).")
+              help="Polling interval in seconds for backends without push notifications (OneDrive, WebDAV, SFTP, FTP, S3).")
 @click.option("--slack-webhook-url", default="", help="Slack incoming webhook URL for sync notifications.")
 @click.option("--slack-channel", default="", help="Slack channel override (default: webhook's channel).")
 @click.option("--slack/--no-slack", "slack_flag", default=False, help="Enable/disable Slack notifications.")
@@ -2110,6 +2254,13 @@ def init(
     ftp_folder: str,
     ftp_tls: str,
     ftp_passive: bool,
+    s3_endpoint_url: str,
+    s3_bucket: str,
+    s3_region: str,
+    s3_access_key_id: str,
+    s3_secret_access_key: str,
+    s3_prefix: str,
+    s3_use_path_style: bool,
     poll_interval: int,
     slack_webhook_url: str,
     slack_channel: str,
@@ -2163,6 +2314,13 @@ def init(
         ftp_folder=ftp_folder,
         ftp_tls=ftp_tls,
         ftp_passive=ftp_passive,
+        s3_endpoint_url=s3_endpoint_url,
+        s3_bucket=s3_bucket,
+        s3_region=s3_region,
+        s3_access_key_id=s3_access_key_id,
+        s3_secret_access_key=s3_secret_access_key,
+        s3_prefix=s3_prefix,
+        s3_use_path_style=s3_use_path_style,
         poll_interval=poll_interval,
         slack_webhook_url=slack_webhook_url,
         slack_channel=slack_channel,
@@ -2208,6 +2366,13 @@ def _run_init(
     ftp_folder: str,
     ftp_tls: str,
     ftp_passive: bool,
+    s3_endpoint_url: str,
+    s3_bucket: str,
+    s3_region: str,
+    s3_access_key_id: str,
+    s3_secret_access_key: str,
+    s3_prefix: str,
+    s3_use_path_style: bool,
     poll_interval: int,
     slack_webhook_url: str,
     slack_channel: str,
@@ -2288,6 +2453,13 @@ def _run_init(
         ftp_folder       = values["ftp_folder"]
         ftp_tls          = values["ftp_tls"]
         ftp_passive      = values["ftp_passive"]
+        s3_endpoint_url  = values["s3_endpoint_url"]
+        s3_bucket        = values["s3_bucket"]
+        s3_region        = values["s3_region"]
+        s3_access_key_id = values["s3_access_key_id"]
+        s3_secret_access_key = values["s3_secret_access_key"]
+        s3_prefix        = values["s3_prefix"]
+        s3_use_path_style = values["s3_use_path_style"]
         poll_interval    = values["poll_interval"]
         slack_enabled    = values["slack_enabled"]
         slack_webhook_url = values["slack_webhook_url"]
@@ -2377,6 +2549,17 @@ def _run_init(
                     ("--ftp-password",
                      ftp_password or profile_data.get("ftp_password", "")),
                     ("--ftp-folder", ftp_folder),
+                ] if not val
+            ]
+        elif backend == "s3":
+            # Bucket is required; access key + secret are optional (boto3
+            # falls back to env vars / ~/.aws/credentials / IAM role when
+            # both are blank).
+            missing = [
+                name for name, val in [
+                    ("--project", project),
+                    ("--s3-bucket",
+                     s3_bucket or profile_data.get("s3_bucket", "")),
                 ] if not val
             ]
         else:
@@ -2492,6 +2675,9 @@ def _run_init(
             elif backend == "ftp":
                 project_name = Path(project_path).name
                 token_file = str(CONFIG_DIR / f"ftp-{project_name}-token.json")
+            elif backend == "s3":
+                project_name = Path(project_path).name
+                token_file = str(CONFIG_DIR / f"s3-{project_name}-token.json")
             else:
                 project_name = Path(project_path).name
                 token_file = str(CONFIG_DIR / f"{backend}-{project_name}-token.json")
@@ -2547,6 +2733,16 @@ def _run_init(
             ftp_username = ""
         if profile_data.get("ftp_password"):
             ftp_password = ""
+        if profile_data.get("s3_endpoint_url"):
+            s3_endpoint_url = ""
+        if profile_data.get("s3_bucket"):
+            s3_bucket = ""
+        if profile_data.get("s3_region"):
+            s3_region = ""
+        if profile_data.get("s3_access_key_id"):
+            s3_access_key_id = ""
+        if profile_data.get("s3_secret_access_key"):
+            s3_secret_access_key = ""
 
     config = Config(
         project_path=project_path,
@@ -2576,6 +2772,13 @@ def _run_init(
         ftp_folder=ftp_folder,
         ftp_tls=ftp_tls,
         ftp_passive=ftp_passive,
+        s3_endpoint_url=s3_endpoint_url,
+        s3_bucket=s3_bucket,
+        s3_region=s3_region,
+        s3_access_key_id=s3_access_key_id,
+        s3_secret_access_key=s3_secret_access_key,
+        s3_prefix=s3_prefix,
+        s3_use_path_style=s3_use_path_style,
         poll_interval=poll_interval,
         slack_enabled=slack_enabled,
         slack_webhook_url=slack_webhook_url,
@@ -2618,6 +2821,8 @@ def _run_init(
                 "sftp_known_hosts_file", "sftp_strict_host_check",
                 "ftp_host", "ftp_port", "ftp_username",
                 "ftp_password", "ftp_tls", "ftp_passive",
+                "s3_endpoint_url", "s3_bucket", "s3_region",
+                "s3_access_key_id", "s3_secret_access_key",
             ) if profile_data.get(k) not in (None, "")
         )
         config.save(config_path, profile=profile_name, strip_fields=strip)
@@ -2646,6 +2851,13 @@ def _run_init(
         console.print(f"[green]FTP TLS mode:[/]        {ftp_tls}")
         console.print(f"[green]FTP folder:[/]          {ftp_folder}")
         console.print("\nRun [bold]claude-mirror auth[/] to verify the FTP connection.")
+    elif backend == "s3":
+        console.print(
+            f"[green]S3 bucket:[/]           "
+            f"{s3_bucket}{(' @ ' + s3_endpoint_url) if s3_endpoint_url else ' (AWS)'}"
+        )
+        console.print(f"[green]S3 prefix:[/]           {s3_prefix or Path(project_path).name}")
+        console.print("\nRun [bold]claude-mirror auth[/] to verify S3 credentials.")
 
     # ── Flag-driven (non-wizard) auto-pubsub-setup path (v0.5.47) ──
     # The wizard branch already ran the smoke test + auto-setup above
@@ -2919,7 +3131,7 @@ def _auth_check(config: Config) -> None:
 @click.option("--backend", "backend_opt", required=True,
               type=click.Choice(_AVAILABLE_BACKENDS, case_sensitive=False),
               shell_complete=_backend_value_completer,
-              help="Storage backend to clone from: googledrive | dropbox | onedrive | webdav | sftp.")
+              help="Storage backend to clone from: googledrive | dropbox | onedrive | webdav | sftp | ftp | s3.")
 @click.option("--project", "project", required=True, type=str,
               help="Path to the local destination project directory. Created if missing.")
 @click.option("--drive-folder-id", default="", help="Google Drive folder ID to clone from.")
@@ -2961,6 +3173,21 @@ def _auth_check(config: Config) -> None:
               help="TLS mode: explicit (default), implicit (FTPS-on-990), or off (cleartext, LAN-only).")
 @click.option("--ftp-passive/--no-ftp-passive", "ftp_passive", default=True, show_default=True,
               help="Use passive mode for FTP data transfers.")
+@click.option("--s3-endpoint-url", default="",
+              help="S3 endpoint URL. Empty for AWS; provider URL for R2 / B2 / Wasabi / MinIO / Tigris / Spaces / etc.")
+@click.option("--s3-bucket", default="",
+              help="S3 bucket name.")
+@click.option("--s3-region", default="",
+              help="S3 region.")
+@click.option("--s3-access-key-id", default="",
+              help="S3 access key ID. Leave blank to use boto3's default credential chain.")
+@click.option("--s3-secret-access-key", default="",
+              help="S3 secret access key.")
+@click.option("--s3-prefix", default="",
+              help="S3 prefix inside the bucket. Defaults to project name.")
+@click.option("--s3-use-path-style/--no-s3-use-path-style",
+              "s3_use_path_style", default=False, show_default=True,
+              help="Use path-style S3 addressing (required for MinIO).")
 @click.option("--credentials-file", "credentials_file", default=_DEFAULT_CREDENTIALS, show_default=True,
               help="Path to Google OAuth2 credentials JSON for this project (Drive only).")
 @click.option("--token-file", "token_file", default="",
@@ -3006,6 +3233,13 @@ def clone(
     ftp_folder: str,
     ftp_tls: str,
     ftp_passive: bool,
+    s3_endpoint_url: str,
+    s3_bucket: str,
+    s3_region: str,
+    s3_access_key_id: str,
+    s3_secret_access_key: str,
+    s3_prefix: str,
+    s3_use_path_style: bool,
     credentials_file: str,
     token_file: str,
     config_path: str,
@@ -3094,6 +3328,13 @@ def clone(
                 ftp_folder=ftp_folder,
                 ftp_tls=ftp_tls,
                 ftp_passive=ftp_passive,
+                s3_endpoint_url=s3_endpoint_url,
+                s3_bucket=s3_bucket,
+                s3_region=s3_region,
+                s3_access_key_id=s3_access_key_id,
+                s3_secret_access_key=s3_secret_access_key,
+                s3_prefix=s3_prefix,
+                s3_use_path_style=s3_use_path_style,
                 poll_interval=poll_interval,
                 slack_webhook_url="",
                 slack_channel="",
@@ -11309,13 +11550,341 @@ def _run_ftp_deep_checks(path: str, config: "Config") -> list[str]:
     return failures
 
 
+
+
+def _run_s3_deep_checks(path: str, config: "Config") -> list[str]:
+    """S3-specific deep diagnostic checks.
+
+    Six checks layered on top of the generic credentials/connectivity
+    pass:
+
+      1. Credentials shape — non-empty access key + secret (when set).
+      2. Endpoint URL well-formed (when set).
+      3. Bucket reachable — head_bucket. AUTH bucketed; 404 → NOT_FOUND;
+         5xx → TRANSIENT.
+      4. List permissions — list_objects_v2 with MaxKeys=1.
+      5. Write permissions — put_object of a 1-byte sentinel + cleanup.
+      6. Region consistency — when s3_region is set, verify the bucket's
+         actual region matches (warning, non-fatal).
+
+    Auth-class failures (InvalidAccessKeyId / SignatureDoesNotMatch /
+    AccessDenied / 401) bucket: ONE auth line is emitted and remaining
+    checks short-circuit so the user sees one root cause, not five.
+    """
+    from urllib.parse import urlparse as _urlparse
+
+    failures: list[str] = []
+    auth_bucket_reported = False
+
+    def _emit_auth_bucket(headline: str, fix_hint: str, summary: str) -> None:
+        nonlocal auth_bucket_reported
+        if auth_bucket_reported:
+            return
+        auth_bucket_reported = True
+        console.print(
+            f"  [red]✗[/] {headline}\n"
+            f"      [yellow]Fix:[/] {fix_hint}"
+        )
+        failures.append(summary)
+
+    bucket = (getattr(config, "s3_bucket", "") or "").strip()
+    endpoint = (getattr(config, "s3_endpoint_url", "") or "").strip()
+    region = (getattr(config, "s3_region", "") or "").strip()
+    access_key = (getattr(config, "s3_access_key_id", "") or "").strip()
+    secret_key = (getattr(config, "s3_secret_access_key", "") or "").strip()
+
+    # ───── Check 1: credential shape ─────
+    if access_key and not secret_key:
+        console.print(
+            f"  [red]✗[/] [bold]s3_access_key_id[/] set but "
+            f"[bold]s3_secret_access_key[/] empty in [bold]{path}[/]\n"
+            f"      [yellow]Fix:[/] add the secret key to the YAML "
+            f"or blank both fields to fall back to boto3's default "
+            f"credential chain (env vars / ~/.aws/credentials)."
+        )
+        failures.append("S3 access_key set without secret_access_key")
+        return failures
+    if not access_key and secret_key:
+        console.print(
+            f"  [red]✗[/] [bold]s3_secret_access_key[/] set but "
+            f"[bold]s3_access_key_id[/] empty in [bold]{path}[/]\n"
+            f"      [yellow]Fix:[/] add the access key ID to the YAML."
+        )
+        failures.append("S3 secret_access_key set without access_key")
+        return failures
+    if access_key and secret_key:
+        console.print(
+            f"  [green]✓[/] S3 credentials present "
+            f"([dim]access key + secret[/])"
+        )
+    else:
+        console.print(
+            "  [dim]·[/] S3 credentials: using boto3's default "
+            "credential chain (env vars / ~/.aws/credentials / IAM role)"
+        )
+
+    # ───── Check 2: endpoint URL well-formed (when set) ─────
+    if endpoint:
+        parsed = _urlparse(endpoint)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            console.print(
+                f"  [red]✗[/] [bold]s3_endpoint_url[/] is malformed: "
+                f"[dim]{endpoint!r}[/]\n"
+                f"      [yellow]Fix:[/] use the form "
+                f"[bold]https://<host>[/] (e.g. "
+                f"[bold]https://s3.eu-central-003.backblazeb2.com[/])."
+            )
+            failures.append(f"S3 endpoint URL malformed: {endpoint}")
+            return failures
+        console.print(
+            f"  [green]✓[/] Endpoint URL well-formed: [dim]{endpoint}[/]"
+        )
+    else:
+        console.print(
+            "  [dim]·[/] Endpoint URL: empty (using AWS S3 default)"
+        )
+
+    # ───── Lazy-import boto3 + botocore ─────
+    try:
+        import boto3 as _boto3  # noqa: PLC0415
+        from botocore.exceptions import (  # noqa: PLC0415
+            ClientError as _ClientError,
+            EndpointConnectionError as _EndpointConnectionError,
+            NoCredentialsError as _NoCredentialsError,
+        )
+    except ImportError as exc:
+        console.print(
+            f"  [red]✗[/] boto3 not importable: [dim]{exc}[/]\n"
+            f"      [yellow]Fix:[/] reinstall claude-mirror — "
+            f"[bold]pipx install --force claude-mirror[/]."
+        )
+        failures.append("boto3 not importable")
+        return failures
+
+    # Build a client. Re-use S3Backend's helper so the deep check exercises
+    # the same construction path the runtime uses (signature version,
+    # path-style, retries config, etc.).
+    from .backends.s3 import S3Backend as _S3Backend  # noqa: PLC0415
+    backend_inst = _S3Backend(config)
+    try:
+        client = backend_inst._get_client()
+    except BaseException as exc:  # noqa: BLE001
+        console.print(
+            f"  [red]✗[/] Could not construct boto3 S3 client: "
+            f"[dim]{type(exc).__name__}: {str(exc)[:160]}[/]"
+        )
+        failures.append(f"S3 client construction failed: {type(exc).__name__}")
+        return failures
+
+    # ───── Check 3: bucket reachable (head_bucket) ─────
+    bucket_region: Optional[str] = None
+    head_resp: dict[str, Any] = {}
+    if not bucket:
+        console.print(
+            f"  [red]✗[/] [bold]s3_bucket[/] is empty in [bold]{path}[/]\n"
+            f"      [yellow]Fix:[/] set the bucket name in the YAML."
+        )
+        failures.append("S3 bucket name missing")
+        return failures
+    try:
+        head_resp = client.head_bucket(Bucket=bucket)
+        # The bucket region is in the BucketRegion or in the response
+        # headers; head_bucket on AWS includes it via x-amz-bucket-region.
+        meta = head_resp.get("ResponseMetadata", {}) or {}
+        headers = meta.get("HTTPHeaders", {}) or {}
+        bucket_region = (
+            headers.get("x-amz-bucket-region")
+            or head_resp.get("BucketRegion")
+            or None
+        )
+        console.print(
+            f"  [green]✓[/] Bucket reachable: [bold]{bucket}[/]"
+        )
+    except _NoCredentialsError as exc:
+        _emit_auth_bucket(
+            f"S3 credentials not found ({type(exc).__name__})",
+            f"set [bold]s3_access_key_id[/] + "
+            f"[bold]s3_secret_access_key[/] in [bold]{path}[/], or "
+            f"populate ~/.aws/credentials.",
+            "S3 credentials not found",
+        )
+        return failures
+    except _EndpointConnectionError as exc:
+        console.print(
+            f"  [red]✗[/] Could not reach S3 endpoint: "
+            f"[dim]{str(exc)[:160]}[/]\n"
+            f"      [yellow]Fix:[/] verify [bold]s3_endpoint_url[/] is "
+            f"reachable and that DNS / firewall allow connections from "
+            f"this machine."
+        )
+        failures.append(f"S3 endpoint unreachable: {bucket}")
+        return failures
+    except _ClientError as exc:
+        err = exc.response.get("Error", {}) if hasattr(exc, "response") else {}
+        code = str(err.get("Code", "") or "")
+        status = 0
+        try:
+            status = int(
+                exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0)
+            )
+        except (TypeError, ValueError, AttributeError):
+            status = 0
+        if code in (
+            "InvalidAccessKeyId",
+            "SignatureDoesNotMatch",
+            "AccessDenied",
+        ) or status == 401:
+            _emit_auth_bucket(
+                f"S3 auth failed on head_bucket ({code or status})",
+                f"verify [bold]s3_access_key_id[/] + "
+                f"[bold]s3_secret_access_key[/] in [bold]{path}[/]; "
+                f"re-run [bold]claude-mirror auth --config {path}[/].",
+                f"S3 auth failed: {code or status}",
+            )
+            return failures
+        if code == "NoSuchBucket" or status == 404:
+            console.print(
+                f"  [red]✗[/] Bucket [bold]{bucket}[/] does not exist\n"
+                f"      [yellow]Fix:[/] create the bucket in the "
+                f"provider's web UI or via "
+                f"[bold]aws s3 mb s3://{bucket}[/], then re-run "
+                f"[bold]claude-mirror doctor --config {path}[/]."
+            )
+            failures.append(f"S3 bucket not found: {bucket}")
+            return failures
+        if status >= 500:
+            console.print(
+                f"  [yellow]⚠[/] Bucket head_bucket returned HTTP "
+                f"{status}: [dim]{code}[/] — transient server error, "
+                f"retry in a moment."
+            )
+            failures.append(f"S3 head_bucket transient: {status}")
+            return failures
+        console.print(
+            f"  [red]✗[/] head_bucket failed: [dim]{type(exc).__name__}: "
+            f"{code or str(exc)[:160]}[/]"
+        )
+        failures.append(f"S3 head_bucket failed: {code}")
+        return failures
+    except BaseException as exc:  # noqa: BLE001
+        console.print(
+            f"  [red]✗[/] head_bucket raised unexpected: "
+            f"[dim]{type(exc).__name__}: {str(exc)[:160]}[/]"
+        )
+        failures.append(f"S3 head_bucket exception: {type(exc).__name__}")
+        return failures
+
+    # ───── Check 4: list permissions (list_objects_v2 MaxKeys=1) ─────
+    try:
+        client.list_objects_v2(Bucket=bucket, MaxKeys=1)
+        console.print(
+            f"  [green]✓[/] List permissions ok "
+            f"([dim]list_objects_v2 MaxKeys=1[/])"
+        )
+    except _ClientError as exc:
+        err = exc.response.get("Error", {}) if hasattr(exc, "response") else {}
+        code = str(err.get("Code", "") or "")
+        if code in ("AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch"):
+            _emit_auth_bucket(
+                f"S3 list permissions denied ({code})",
+                f"grant the IAM principal [bold]s3:ListBucket[/] on "
+                f"[bold]arn:aws:s3:::{bucket}[/] (or the equivalent "
+                f"policy on your S3-compat provider).",
+                f"S3 list permission denied: {code}",
+            )
+        else:
+            console.print(
+                f"  [red]✗[/] list_objects_v2 failed: "
+                f"[dim]{type(exc).__name__}: {code or str(exc)[:160]}[/]"
+            )
+            failures.append(f"S3 list_objects_v2 failed: {code}")
+    except BaseException as exc:  # noqa: BLE001
+        console.print(
+            f"  [red]✗[/] list_objects_v2 raised: "
+            f"[dim]{type(exc).__name__}: {str(exc)[:160]}[/]"
+        )
+        failures.append(f"S3 list_objects_v2 exception: {type(exc).__name__}")
+
+    # Stop if auth already bucketed.
+    if auth_bucket_reported:
+        return failures
+
+    # ───── Check 5: write permissions (put + delete sentinel) ─────
+    raw_prefix = (getattr(config, "s3_prefix", "") or "").strip().strip("/")
+    if not raw_prefix:
+        raw_prefix = Path(config.project_path).name or "claude-mirror"
+    sentinel_key = f"{raw_prefix}/__claude_mirror_doctor_test"
+    try:
+        client.put_object(Bucket=bucket, Key=sentinel_key, Body=b"x")
+        try:
+            client.delete_object(Bucket=bucket, Key=sentinel_key)
+        except BaseException:  # noqa: BLE001
+            # Best-effort cleanup; surface failure but don't fail the
+            # check — the put already proved write works.
+            console.print(
+                f"  [yellow]⚠[/] Sentinel write succeeded but cleanup "
+                f"delete failed; orphan key: [dim]{sentinel_key}[/]"
+            )
+        console.print(
+            f"  [green]✓[/] Write permissions ok "
+            f"([dim]put + delete sentinel[/])"
+        )
+    except _ClientError as exc:
+        err = exc.response.get("Error", {}) if hasattr(exc, "response") else {}
+        code = str(err.get("Code", "") or "")
+        if code in ("AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch"):
+            _emit_auth_bucket(
+                f"S3 write permissions denied ({code})",
+                f"grant the IAM principal [bold]s3:PutObject[/] + "
+                f"[bold]s3:DeleteObject[/] on "
+                f"[bold]arn:aws:s3:::{bucket}/{raw_prefix}/*[/] "
+                f"(or the equivalent on your provider).",
+                f"S3 write permission denied: {code}",
+            )
+        else:
+            console.print(
+                f"  [red]✗[/] put_object failed: "
+                f"[dim]{type(exc).__name__}: {code or str(exc)[:160]}[/]"
+            )
+            failures.append(f"S3 put_object failed: {code}")
+    except BaseException as exc:  # noqa: BLE001
+        console.print(
+            f"  [red]✗[/] put_object raised: "
+            f"[dim]{type(exc).__name__}: {str(exc)[:160]}[/]"
+        )
+        failures.append(f"S3 put_object exception: {type(exc).__name__}")
+
+    # ───── Check 6: region consistency (warning, not failure) ─────
+    if region and bucket_region and region != bucket_region:
+        console.print(
+            f"  [yellow]⚠[/] Region mismatch: configured "
+            f"[bold]{region}[/] but bucket is in [bold]{bucket_region}[/]\n"
+            f"      [dim]Many S3-compat services tolerate this; AWS "
+            f"may redirect or reject some operations. Update "
+            f"[bold]s3_region[/] in {path} to match.[/]"
+        )
+    elif region and bucket_region:
+        console.print(
+            f"  [green]✓[/] Region consistency ok "
+            f"([dim]{region}[/])"
+        )
+    elif region:
+        console.print(
+            f"  [dim]·[/] Region [bold]{region}[/] configured "
+            f"(server did not advertise bucket region)"
+        )
+
+    return failures
+
+
+
+
 def _is_loopback_or_rfc1918_for_doctor(host: str) -> bool:
     """Doctor-side wrapper around the backend's host-classification
     helper. Kept as a thin alias so tests can monkeypatch the doctor's
     decision independently of the backend's runtime behaviour."""
     from .backends.ftp import _is_loopback_or_rfc1918
     return _is_loopback_or_rfc1918(host)
-
 
 def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
     """Run the doctor check sequence for one config + its mirrors.
@@ -11418,6 +11987,12 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
                 "  [dim]·[/] credentials file: skipped (FTP uses inline "
                 "host/user/password in YAML)"
             )
+        elif backend_name == "s3":
+            console.print(
+                "  [dim]·[/] credentials file: skipped (S3 uses inline "
+                "access key + secret in YAML, or boto3's default "
+                "credential chain)"
+            )
         else:
             creds_path = Path(config.credentials_file)
             if not creds_path.exists():
@@ -11519,6 +12094,25 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
                 console.print(
                     "  [green]✓[/] FTP credentials present in config "
                     "(host + username + password + folder)"
+                )
+        elif backend_name == "s3":
+            # S3 requires a bucket; access key + secret are optional
+            # (boto3's default credential chain handles env vars /
+            # ~/.aws/credentials / IAM role when both are blank).
+            s3_bucket_v = getattr(config, "s3_bucket", "") or ""
+            if not s3_bucket_v:
+                console.print(
+                    f"  [red]✗[/] S3 config incomplete: missing "
+                    f"[bold]s3_bucket[/] in [bold]{path}[/]\n"
+                    f"      [yellow]Fix:[/] run "
+                    f"[bold]claude-mirror init --wizard --config {path}[/] "
+                    f"or edit the YAML to add the bucket name."
+                )
+                failures.append(f"S3 config incomplete (s3_bucket): {path}")
+            else:
+                console.print(
+                    "  [green]✓[/] S3 config present "
+                    "(bucket configured)"
                 )
         else:
             token_path = Path(config.token_file)
@@ -11853,6 +12447,10 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
         if backend_name == "ftp":
             console.print("\n[bold]FTP deep checks[/]")
             failures.extend(_run_ftp_deep_checks(path, config))
+        # ───── S3 deep checks (BACKEND-S3) ─────
+        if backend_name == "s3":
+            console.print("\n[bold]S3 deep checks[/]")
+            failures.extend(_run_s3_deep_checks(path, config))
 
         # ───── Check 5: project_path exists locally ─────
         # Only check on the primary — every mirror config validated by

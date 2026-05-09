@@ -17,7 +17,7 @@ Built originally for Claude Code projects (where most context lives in markdown)
 - **Near-real-time collaboration.** Pub/Sub (Drive), long-poll (Dropbox), or polling (OneDrive / WebDAV / SFTP) push remote changes to other machines within seconds. Optional per-project Slack webhooks pipe events to a team channel.
 - **No-loss conflict resolution.** When both sides change a file, interactive choice: keep local, keep remote, open `$EDITOR` for manual merge, or skip. No silent overwrites.
 
-**Supported backends:** Google Drive, Dropbox, Microsoft OneDrive, any WebDAV server (Nextcloud, OwnCloud, Apache mod_dav, Synology/QNAP NAS, Box.com, etc.), any SFTP/SSH-accessible server (VPS, NAS, shared hosting, self-hosted Linux), and FTP / FTPS (legacy shared-hosting providers — cPanel, DirectAdmin, NAS — via Python's stdlib, no new dependency; use FTPS or the SFTP backend wherever possible because plain FTP transmits credentials in cleartext). Each project picks its own primary backend independently — different projects on the same machine can use different backends.
+**Supported backends:** Google Drive, Dropbox, Microsoft OneDrive, any WebDAV server (Nextcloud, OwnCloud, Apache mod_dav, Synology/QNAP NAS, Box.com, etc.), any SFTP/SSH-accessible server (VPS, NAS, shared hosting, self-hosted Linux), any S3-compatible object store (AWS S3, Cloudflare R2, Backblaze B2, Wasabi, MinIO, Tigris, IDrive E2, Linode Object Storage, DigitalOcean Spaces, Storj, Hetzner Storage Box, …), and FTP / FTPS (legacy shared-hosting providers — cPanel, DirectAdmin, NAS — via Python's stdlib, no new dependency; use FTPS or the SFTP backend wherever possible because plain FTP transmits credentials in cleartext). Each project picks its own primary backend independently — different projects on the same machine can use different backends.
 
 **Quality gates:** Every commit and pull request runs **1251 automated tests** on Linux and Windows on Python 3.11, 3.12, 3.13, and 3.14 in parallel via GitHub Actions, plus a separate `mypy --strict` static-type-checking job on every commit and PR. Coverage spans the 3-way diff sync core, both snapshot formats (with named tags + messages + tag-protected pruning), path-traversal safety, conflict resolution, auth flows, **six backends** with HTTP-level / SSH-level mocking (Google Drive, Dropbox, OneDrive, WebDAV, SFTP, and FTP/FTPS — new in v0.5.63), the read-only FUSE mount engine and its 5 variants (snapshot / live / per-mirror / all-snapshots-stacked / time-travel), the four shipping CLI introspection surfaces (`tree` / `ncdu` / `stats` / `verify`), the notifier inbox under concurrent writers (cross-platform locking via `fcntl.flock` on POSIX + `msvcrt.locking` on Windows), the Discord / Teams / Generic webhook notifiers, the watcher daemon's cross-platform sentinel-file hot-reload, the `--json` output mode for `status / history / inbox / log / snapshots / health / stats / verify`, the `.claude_mirror_ignore` parser, the bandwidth-throttle token-bucket integration across every backend, the credentials-profile resolution + merge-precedence rule (project YAML wins over profile defaults), the transfer-progress callback wiring, the global rate-limit `BackoffCoordinator`, the non-interactive `sync --no-prompt --strategy` flow for cron / unattended use, dynamic `--backend` shell completion (zsh / bash / fish / powershell), multi-channel notification routing per project, per-event webhook templating, the Drive BYO wizard, the Drive Pub/Sub auto-setup logic, and the deep `doctor --backend` checks for **all six backends**. CI must be green before any PR can merge. See [`CONTRIBUTING.md`](https://github.com/alessiobravi/claude-mirror/blob/main/CONTRIBUTING.md) for the test conventions and how to run them locally.
 
@@ -30,7 +30,7 @@ Built originally for Claude Code projects (where most context lives in markdown)
 - When you push, collaborators are notified in near-real-time:
   - **Google Drive** — Cloud Pub/Sub streaming (sub-second latency)
   - **Dropbox** — `files/list_folder/longpoll` (seconds latency)
-  - **OneDrive / WebDAV / SFTP** — periodic polling (default 30s, configurable)
+  - **OneDrive / WebDAV / SFTP / S3** — periodic polling (default 30s, configurable)
 - Conflicts (both sides changed) are resolved interactively: keep local, keep remote, or open in `$EDITOR` — see [docs/conflict-resolution.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/conflict-resolution.md)
 - A snapshot is saved after every push or sync, enabling point-in-time recovery — see [docs/admin.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md#snapshots-and-disaster-recovery)
 - **Multi-backend mirroring (Tier 2)** — push to multiple backends simultaneously (e.g. Drive + SFTP), with per-backend retry, classified error handling, and snapshot mirroring — see [docs/admin.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md#multi-backend-mirroring-tier-2) and [docs/scenarios.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/scenarios.md#d-multi-backend-redundancy-tier-2)
@@ -40,7 +40,7 @@ Built originally for Claude Code projects (where most context lives in markdown)
 
 ## Supported storage backends
 
-Each backend ships in the base install — `pipx install claude-mirror` enables all six. Per-backend setup walkthroughs live under [docs/backends/](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/):
+Each backend ships in the base install — `pipx install claude-mirror` enables every backend (now seven, with S3 + FTP added in v0.5.65). Per-backend setup walkthroughs live under [docs/backends/](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/):
 
 | Backend | Latency | Setup | Reference |
 |---|---|---|---|
@@ -49,6 +49,7 @@ Each backend ships in the base install — `pipx install claude-mirror` enables 
 | **OneDrive** | up to `poll_interval` (default 30s) | Device-code OAuth2 + Azure AD app | [docs/backends/onedrive.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/onedrive.md) |
 | **WebDAV** | up to `poll_interval` (default 30s) | URL + username + app password (Nextcloud, OwnCloud, NAS, Apache mod_dav, Box, Synology, QNAP, ...) | [docs/backends/webdav.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/webdav.md) |
 | **SFTP** | up to `poll_interval` (default 30s) | SSH key (preferred) or password — any OpenSSH-accessible server | [docs/backends/sftp.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/sftp.md) |
+| **S3-compatible** | up to `poll_interval` (default 30s) | Access key ID + secret access key + bucket; endpoint URL for non-AWS services (R2, B2, MinIO, Wasabi, Spaces, Storj, Tigris, IDrive E2, Linode, Hetzner, …) | [docs/backends/s3.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/s3.md) |
 | **FTP / FTPS** | up to `poll_interval` (default 30s) | Host + username + password — cPanel / DirectAdmin / shared hosting / NAS. Plain FTP supported but use FTPS or the SFTP backend wherever possible | [docs/backends/ftp.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/ftp.md) |
 
 ---
@@ -66,6 +67,7 @@ Plus, depending on the backend you choose:
 | OneDrive | A Microsoft account and an Azure AD app registration (free, created at [portal.azure.com](https://portal.azure.com)) |
 | WebDAV | A WebDAV server URL + username + app password (e.g. Nextcloud / OwnCloud / NAS / Apache mod_dav) |
 | SFTP | An SSH-accessible server (VPS / NAS / shared hosting / self-hosted Linux) — SSH key recommended, password fallback OK on LAN |
+| S3-compatible | An S3-compatible bucket (AWS / R2 / B2 / Wasabi / MinIO / Spaces / Storj / Tigris / IDrive E2 / Linode / Hetzner …) — access key ID + secret access key + bucket name |
 | FTP / FTPS | An FTP-accessible server (cPanel / DirectAdmin / legacy shared hosting / NAS). FTPS strongly recommended; plain FTP works but transmits credentials in cleartext — LAN-only |
 
 ---
@@ -83,7 +85,7 @@ pipx ensurepath     # adds ~/.local/bin to PATH if not already there
 pipx install claude-mirror
 ```
 
-All six backends ship in this single install — no per-backend extras needed.
+Every backend ships in this single install — no per-backend extras needed.
 
 Verify:
 
@@ -164,6 +166,7 @@ The trimmed README covers install, your first project, daily-usage cheatsheet, n
 - [docs/backends/onedrive.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/onedrive.md) — Azure AD app, device-code login
 - [docs/backends/webdav.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/webdav.md) — Nextcloud / OwnCloud / NAS / Apache mod_dav
 - [docs/backends/sftp.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/sftp.md) — SSH keys, host fingerprints, OpenSSH
+- [docs/backends/s3.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/s3.md) — AWS S3, Cloudflare R2, Backblaze B2, Wasabi, MinIO, Spaces, Storj, Tigris, IDrive E2, Linode, Hetzner
 
 **Operations & admin**:
 - [docs/admin.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md) — snapshots, retention, `gc` / `prune` / `forget`, doctor, watcher service, multi-backend Tier 2 setup, auto-start

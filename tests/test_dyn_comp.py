@@ -38,13 +38,18 @@ pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
 # ── _list-backends output ────────────────────────────────────────────────────
 
-def test_list_backends_prints_five_expected_names_one_per_line():
+def test_list_backends_prints_expected_names_one_per_line():
     """The hidden command emits exactly the supported backends, each on
-    its own line, exit 0 — the contract every shell shim depends on."""
+    its own line, exit 0 — the contract every shell shim depends on.
+    Order matches the `_AVAILABLE_BACKENDS` tuple (append-only, so older
+    shells that hard-coded a length keep working until they choose to
+    update)."""
     result = CliRunner().invoke(cli, ["_list-backends"])
     assert result.exit_code == 0, result.output
     lines = [line for line in result.output.splitlines() if line.strip()]
-    assert lines == ["googledrive", "dropbox", "onedrive", "webdav", "sftp", "ftp"]
+    assert lines == [
+        "googledrive", "dropbox", "onedrive", "webdav", "sftp", "ftp", "s3",
+    ]
 
 
 def test_list_backends_output_matches_available_backends_constant():

@@ -120,3 +120,47 @@ def test_run_wizard_ftp_walks_through_prompts(monkeypatch, tmp_path):
     assert "FTP port" in joined
     assert "FTP username" in joined
     assert "FTP password" in joined
+
+
+class _ReachedSummary(Exception):
+    """Sentinel — raised once the wizard has consumed all the s3-specific
+    answers and would otherwise prompt for token-file / config-file /
+    patterns / the final save-config confirmation."""
+    pass
+
+
+def test_run_wizard_s3_walks_through_prompts(monkeypatch):
+    """Regression: the s3 branch of `_run_wizard` must reach the auth /
+    confirmation step when fed bucket + region + access key + secret +
+    prefix + path-style answers."""
+    from pathlib import Path as _Path
+
+    answers: list[object] = [
+        "s3",                                  # Storage backend
+        str(_Path.cwd()),                      # Project directory
+        "",                                    # S3 endpoint URL (AWS default)
+        "mybucket",                            # S3 bucket
+        "us-east-1",                           # S3 region
+        "AKIA-FAKE",                           # Access key ID
+        "secret-fake",                         # Secret access key
+        "myproject",                           # Prefix
+        "30",                                  # Poll interval
+    ]
+
+    def fake_prompt(label, default=None, **kwargs):
+        if not answers:
+            raise _ReachedSummary()
+        return answers.pop(0)
+
+    def fake_confirm(label, default=False):
+        if "path-style" in str(label).lower():
+            return False
+        if "save this configuration" in str(label).lower():
+            raise _ReachedSummary()
+        return default
+
+    monkeypatch.setattr(cli_module.click, "prompt", fake_prompt)
+    monkeypatch.setattr(cli_module.click, "confirm", fake_confirm)
+
+    with pytest.raises(_ReachedSummary):
+        cli_module._run_wizard(backend_default="s3")

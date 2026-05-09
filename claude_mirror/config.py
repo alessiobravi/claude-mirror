@@ -241,6 +241,22 @@ class Config:
     # first byte). `off` = cleartext FTP (LAN/test only — see warning above).
     ftp_tls: str = "explicit"
     ftp_passive: bool = True
+    # S3-compatible (BACKEND-S3): one shape works for AWS S3, Cloudflare
+    # R2, Backblaze B2 (S3 API), Wasabi, MinIO, Tigris, IDrive E2, Linode
+    # Object Storage, DigitalOcean Spaces, Storj, Hetzner Storage Box, and
+    # any other S3-compatible service. ``s3_endpoint_url`` selects the
+    # provider; leave empty for AWS proper.
+    s3_endpoint_url: str = ""
+    s3_bucket: str = ""
+    s3_region: str = ""
+    s3_access_key_id: str = ""
+    s3_secret_access_key: str = ""
+    s3_prefix: str = ""        # within-bucket path prefix; empty = use project name
+    # Path-style addressing (https://endpoint/bucket/key) is required by
+    # MinIO and a few S3-compat services that don't terminate TLS for
+    # virtual-hosted-style URLs. AWS proper accepts both; default to
+    # virtual-hosted-style.
+    s3_use_path_style: bool = False
     poll_interval: int = 30    # seconds between polling checks (WebDAV, OneDrive)
     # Slack notifications (optional, per-project)
     slack_enabled: bool = False
@@ -644,6 +660,16 @@ class Config:
             return self.sftp_folder
         if self.backend == "ftp":
             return self.ftp_folder
+        if self.backend == "s3":
+            # S3 has no real folders; the project root is the configured
+            # prefix (or the project name when the prefix is left blank).
+            # Always returned with a trailing slash so prefix arithmetic
+            # stays consistent.
+            raw = (self.s3_prefix or "").strip().strip("/")
+            if not raw:
+                from pathlib import Path as _Path
+                raw = _Path(self.project_path).name or "claude-mirror"
+            return raw + "/"
         return self.drive_folder_id
 
     @property

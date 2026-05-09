@@ -72,7 +72,10 @@ Issues        = "https://github.com/alessiobravi/claude-mirror/issues"
 [project.optional-dependencies]
 dropbox = []
 onedrive = []
-all = []
+# Read-only FUSE mount engine — opt-in, since fusepy needs a working
+# FUSE / OSXFUSE / WinFsp install and most users will never mount.
+mount = ["fusepy>=3.0"]
+all = ["fusepy>=3.0"]
 # Development extras — pytest + helpers for the test suite.
 # Install with: pipx install -e '.[dev]'  or  pip install -e '.[dev]'
 dev = [
@@ -124,6 +127,7 @@ module = [
     "yaml.*",
     "requests.*",
     "plyer.*",
+    "fuse.*",
 ]
 ignore_missing_imports = true
 

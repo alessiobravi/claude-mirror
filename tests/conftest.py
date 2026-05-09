@@ -100,7 +100,11 @@ def write_files(project_dir: Path):
         for rel, content in files.items():
             full = project_dir / rel
             full.parent.mkdir(parents=True, exist_ok=True)
-            full.write_text(content)
+            # `newline=""` prevents Python's text-mode `\n` → `\r\n`
+            # translation on Windows. The diff/sync engines compare files
+            # at the byte level, so a fixture writing `"hello\n"` must end
+            # up with `b"hello\n"` on disk on every platform.
+            full.write_text(content, newline="")
         return project_dir
     return _write
 

@@ -251,8 +251,17 @@ def _resolve_config(config_path: str) -> str:
 
 def _try_reload_watcher() -> None:
     """Send SIGHUP to any running watch-all process so it picks up new configs."""
+    # `watch-all` is POSIX-only (SIGHUP-driven hot-reload). On Windows
+    # `pgrep` doesn't exist and `signal.SIGHUP` is undefined, so any
+    # attempt here would raise FileNotFoundError / AttributeError after
+    # init has otherwise succeeded. Bail early.
+    if not hasattr(signal, "SIGHUP"):
+        return
     import subprocess as _sp
-    result = _sp.run(["pgrep", "-f", "claude-mirror watch-all"], capture_output=True, text=True)
+    try:
+        result = _sp.run(["pgrep", "-f", "claude-mirror watch-all"], capture_output=True, text=True)
+    except (FileNotFoundError, OSError):
+        return
     pids = [p.strip() for p in result.stdout.strip().splitlines() if p.strip() and p.strip() != str(os.getpid())]
     if pids:
         for pid in pids:

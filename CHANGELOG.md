@@ -4,6 +4,36 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.54] — 2026-05-09
+
+Hotfix #2 for v0.5.52. v0.5.53 fixed the manifest/glob path-separator class of bug; CI on the new Windows runners now flagged 5 more Windows-only failures clustering into 3 distinct root causes.
+
+### Fixed — Test fixture wrote `\r\n` on Windows, breaking 3 diff tests
+- `tests/conftest.py::write_files` used `Path.write_text(content)`. On Windows, Python's text mode translates `\n` → `\r\n` by default, so a fixture writing `"hello\n"` produced `b"hello\r\n"` on disk. The diff engine compares files at the byte level, so the local copy (`b"hello\r\n"`) and the remote copy (`b"hello\n"`) differed even though the visible content was identical.
+- Symptom: `test_diff_in_sync_prints_identical_message` and `test_diff_absolute_path_inside_project_resolved_to_relative` saw "both sides differ" when they expected "in sync"; `test_diff_context_flag_respected_at_cli` saw `len(out_ctx5) == len(out_ctx0)` because every line was already classified as a diff line, so adding context lines had nothing to add.
+- Fix: `Path.write_text(content, newline="")` suppresses the translation. The fixture now produces byte-exact content on every platform.
+
+### Fixed — `init` raised `FileNotFoundError` on Windows after success
+- `_try_reload_watcher()` ran `subprocess.run(["pgrep", ...])` and then `os.kill(pid, signal.SIGHUP)` unconditionally. `pgrep` doesn't exist on Windows; `signal.SIGHUP` is POSIX-only. `init` would print its "Config saved … run claude-mirror auth" success block and then crash with `FileNotFoundError(2, 'The system cannot find the file specified')`.
+- Symptom: `test_init_writes_retention_defaults_into_new_yaml` succeeded internally (the YAML was written correctly) but the CLI exited with `1`.
+- Fix: early-return when `signal.SIGHUP` doesn't exist on the platform; wrap the `subprocess.run` in `try/except (FileNotFoundError, OSError)` as a defence-in-depth. `_check_watcher_running` already had this defensive shape; `_try_reload_watcher` was missing it.
+
+### Fixed — Inbox concurrency test skipped on Windows (POSIX `fcntl` gap)
+- `claude_mirror/notifier.py` imports `fcntl` conditionally and falls back to a no-op when not available. The strict TOCTOU guarantee asserted by `test_inbox_read_clears_atomically_against_concurrent_writer` therefore cannot hold on Windows today — the test counted 673 entries from 678 writes, exactly the kind of lost-mid-clear failure the locking is supposed to prevent.
+- Fix: `@pytest.mark.skipif(sys.platform == "win32")` on that single test, with a reason string pointing at the underlying gap (`msvcrt.locking` / `portalocker` are the candidate replacements). Notifier behaviour on Windows is unchanged from v0.5.53; only the strict regression assertion is gated.
+
+### Updated docs/files
+- `tests/conftest.py` — `write_files` fixture passes `newline=""` to suppress CRLF translation.
+- `claude_mirror/cli.py` — `_try_reload_watcher` guards on `hasattr(signal, "SIGHUP")` and wraps the `pgrep` call.
+- `tests/test_notifier_inbox.py` — skip-marker on the strict concurrency test, with a reason linking the Windows-locking gap.
+- `pyproject.toml` (version 0.5.53 → 0.5.54).
+
+### Tests
+- `pytest tests/` — **834 passed locally** on macOS (no behavioural changes on POSIX).
+- The 5 Windows-only failures from the v0.5.53 CI run are addressed; one is now a documented `skip` with an actionable reason rather than a fail.
+
+---
+
 ## [0.5.53] — 2026-05-09
 
 Hotfix for v0.5.52. The Windows-runner CI matrix added in WIN-CI surfaced a real cross-platform source bug that the WIN-CI agent missed because it ran tests only on macOS (which uses forward slashes natively): manifest keys + glob comparisons were using OS-native path separators on Windows.

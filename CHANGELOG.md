@@ -4,7 +4,9 @@ All notable changes to claude-mirror.
 
 ---
 
-## [Unreleased]
+## [0.5.59] — 2026-05-09
+
+Windows credibility release: closes 7 of the 22 Windows test skips by making the inbox file lock and the `watch-all` hot-reload mechanism cross-platform. `watch-all` is now fully supported on Windows (was POSIX-only since the project's first release).
 
 ### Added — cross-platform inbox file locking (WIN-LOCK)
 

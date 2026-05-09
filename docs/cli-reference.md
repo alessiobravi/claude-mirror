@@ -86,6 +86,7 @@ claude-mirror mount       MOUNTPOINT
                           [--foreground/--background]       # default --foreground
                           [--config PATH]
 claude-mirror umount      MOUNTPOINT [--config PATH]   # macOS: umount; Linux: fusermount -u; Windows: prints Ctrl+C hint
+claude-mirror ncdu        [--remote BACKEND] [--non-interactive] [--top N] [--config PATH]   # POSIX-only interactive disk-usage TUI (curses); --non-interactive prints top-N largest paths to stdout
 claude-mirror profile list
 claude-mirror profile show       NAME
 claude-mirror profile create     NAME --backend BACKEND [--description TEXT] [--force]
@@ -672,6 +673,61 @@ Non-zero return from the underlying tool surfaces its stderr and exits 1. The `-
 claude-mirror umount /tmp/snap
 claude-mirror umount /tmp/drive-now
 ```
+
+### `ncdu`
+
+Interactive disk-usage TUI over a configured remote, modeled on [`ncdu`](https://dev.yorhel.nl/ncdu) and `rclone ncdu`. Two modes: an interactive curses navigator, and a `--non-interactive` plain-text top-N report for cron / CI / scripts.
+
+```bash
+claude-mirror ncdu                                  # interactive curses TUI on the primary backend
+claude-mirror ncdu --remote sftp                    # navigate one specific Tier 2 mirror's remote
+claude-mirror ncdu --non-interactive                # print top-20 largest paths and exit
+claude-mirror ncdu --non-interactive --top 50       # print top-50
+claude-mirror ncdu --non-interactive --remote sftp  # cron-friendly per-mirror report
+```
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--remote BACKEND` | primary | Tier 2: walk one specific mirror by `backend_name` (e.g. `sftp`, `dropbox`). Unknown name → clean error listing the configured backends. |
+| `--non-interactive` | off | Skip the curses TUI; print the top-N largest paths to stdout in plain text. |
+| `--top N` | 20 | With `--non-interactive`, how many largest paths to list. Ignored in interactive mode. |
+| `--config PATH` | auto-detected | Project config to operate on. |
+
+Interactive keybindings:
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` | move cursor |
+| `Enter` / `→` | descend into the selected directory |
+| `←` / `Backspace` / `h` | ascend to the parent |
+| `q` | quit |
+
+Layout (interactive mode): the top status line shows `--- claude-mirror: PROJECT (BACKEND) ---`; the body lists children of the current node sorted by size-desc, formatted as `<size>  <bar-of-asterisks>  <name>` with the cursor row reverse-highlighted; the bottom status line shows the aggregate size + child count + current path. The bar-of-asterisks scales relative to the largest child of the current node, so the relative-size cue stays meaningful at any depth. Terminal resize is handled cleanly (`KEY_RESIZE`).
+
+Sample non-interactive output:
+
+```
+$ claude-mirror ncdu --non-interactive --top 10
+
+Top 10 largest paths in primary backend:
+
+  size      count   path
+   45.2 MB    127   docs/
+   12.3 MB     42   memory/
+    8.1 MB     15   .archive/
+    5.0 MB      1   docs/big-pdf.pdf
+    3.2 MB     12   docs/admin/
+    2.8 MB     38   memory/sessions/
+    1.5 MB      9   profiles/
+    980 KB      3   README.md
+    640 KB      2   CHANGELOG.md
+    456 KB      3   drafts/
+  total: 67.4 MB across 245 files
+```
+
+A directory path is suffixed with `/`; a file path has no suffix. The `count` column is `1` for files and the descendant file-count for directories. The `total:` line aggregates the WHOLE tree (not just the displayed top-N), so a small project's total matches `du -sh` on the local copy.
+
+POSIX-only: `curses` is not in the CPython stdlib on Windows. On Windows, `claude-mirror ncdu` exits with a friendly hint pointing at `claude-mirror tree --depth N` (the read-only tree view) as the closest cross-platform alternative.
 
 ---
 

@@ -16,6 +16,32 @@ A new top-level `claude-mirror tree [PATH]` subcommand prints a `tree(1)`-style 
 - `README.md` — Daily usage cheatsheet: new `claude-mirror tree` line.
 - `docs/cli-reference.md` — top-level command list block extended with the full `tree` invocation; new `### tree` subsection with the flag table and a sample rendering.
 
+### Added — claude-mirror ncdu interactive disk-usage TUI (NCDU)
+
+New `claude-mirror ncdu` subcommand modeled on `ncdu` / `rclone ncdu`: an interactive curses TUI showing per-directory size aggregates of the configured remote, with arrow-key navigation and a `--non-interactive` flag for cron / CI / scripts that just want the top-N largest paths in plain text.
+
+- New module `claude_mirror/_ncdu.py` (~200 lines, ~330 with docstrings) split into a pure-data layer and a thin curses wrapper. The data layer (`SizeNode`, `build_size_tree`, `top_n_paths`, `format_non_interactive`, `entries_from_backend_listing`) has no curses, no rendering, no I/O — it turns a flat backend listing into a directory-aggregate tree and answers "what's the biggest thing in here?" questions; it is the unit-tested surface. `run_curses_ui(root)` is the thin wrapper that takes a built tree and runs the interactive event loop; validation path is manual smoke-test in a real terminal.
+- Tier 2: `--remote NAME` walks a specific Tier 2 mirror by `backend_name` (default: the primary backend). Unknown name → clean error listing the configured backends.
+- `--non-interactive` mode prints a fixed-shape report (`Top N largest paths in BACKEND backend:` header, size + count + path columns, total line) so cron jobs can string-grep on it. `--top N` defaults to 20.
+- Interactive keybindings: `↑` / `↓` move cursor, `Enter` / `→` descend into a directory, `←` / `Backspace` / `h` ascend, `q` quits. The body bar-of-asterisks scales relative to the largest child of the current node. Handles `KEY_RESIZE` gracefully.
+- POSIX-only: `curses` is not in the CPython stdlib on Windows. On Windows, `claude-mirror ncdu` exits with a friendly hint pointing at `claude-mirror tree --depth N` (the read-only tree view) as the closest cross-platform alternative. No new third-party dependencies.
+- `claude_mirror/cli.py` — new `ncdu` Click subcommand, ~120 lines. Calls `_load_engine`, resolves the target backend by name, fetches the listing via `list_files_recursive(folder_id, exclude_folder_names={SNAPSHOTS_FOLDER, BLOBS_FOLDER, LOGS_FOLDER})`, builds the tree, and dispatches into `format_non_interactive` or `run_curses_ui` based on the `--non-interactive` flag. Live progress on the listing phase ("Fetching remote listing..." → "Fetched N file(s). Building size tree...").
+- `tests/test_ncdu.py` — **32 tests** for the pure-data layer + CLI dispatch (offline, <100ms each). Coverage: empty / single-file / nested-paths / siblings / duplicate-rel-path / NUL-byte rejection / max-listing-entries guard tree-build cases; `SizeNode.sorted_children` ordering; `top_n_paths` desc order, n bounds, ties; `format_non_interactive` shape + empty-remote case; `entries_from_backend_listing` adapter happy + defensive paths; CLI `--non-interactive --top N`, default `--top 20`, `--remote NAME` dispatch to mirror, unknown-backend error, `--top 0` rejection, Windows-platform gating with the friendly message.
+- `README.md` — Daily usage cheatsheet entry: `claude-mirror ncdu` (interactive TUI) and `claude-mirror ncdu --non-interactive --top 10`.
+- `docs/cli-reference.md` — top-level command list grows the `claude-mirror ncdu …` line. New `### ncdu` subsection with the keybindings table and a sample non-interactive output block.
+
+Pure-data API exposed by `claude_mirror/_ncdu.py`:
+- `SizeNode(name, path, is_file, size, file_count, children)` — `size` and `file_count` are aggregates (sum of every descendant file for directory nodes); `children` is keyed by name; `path` is rel-from-root with `/` separators.
+- `build_size_tree(entries: Iterable[tuple[str, int]], *, root_name: str = "") -> SizeNode` — accepts `(rel_path, size)` tuples.
+- `top_n_paths(root: SizeNode, n: int) -> list[SizeNode]` — n largest aggregates in size-desc order.
+- `format_non_interactive(root: SizeNode, n: int, *, backend_label: str = "primary") -> str` — fixed-shape plain-text report.
+- `entries_from_backend_listing(listing: Iterable[dict[str, Any]]) -> Iterable[tuple[str, int]]` — adapter from backend native shape (`relative_path` + `size` keys) to the data layer's input.
+- `run_curses_ui(root, *, project_label, backend_label) -> None` — thin curses wrapper; manual smoke-test only.
+
+### Tests
+- `pytest tests/` — **1133 passed, 3 skipped** locally on macOS (was 1101, +32 new ncdu tests; the 3 skips are the pre-existing `test_mypy_smoke.py` "mypy not installed" guards).
+- `mypy --strict claude_mirror/` — clean across 42 source files (was 41 + the new `_ncdu.py`).
+
 ---
 
 ## [0.5.62] — 2026-05-09

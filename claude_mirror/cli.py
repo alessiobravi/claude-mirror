@@ -11604,3 +11604,135 @@ def umount(mountpoint: str, config_path: str) -> None:
             f"umount failed: {result.stderr.strip()}"
         )
     click.echo(f"Unmounted {mountpoint}")
+
+
+@cli.command()
+@click.option("--remote", "remote_name", default="",
+              shell_complete=_backend_value_completer,
+              help="Tier 2: target a specific backend by `backend_name` "
+                   "(e.g. 'sftp', 'dropbox'). Default: the primary backend.")
+@click.option("--non-interactive", "non_interactive", is_flag=True, default=False,
+              help="Skip the curses TUI; print the top-N largest paths "
+                   "to stdout in plain text. Useful for cron / CI / "
+                   "scripts that monitor disk-usage drift over time.")
+@click.option("--top", "top_n", type=int, default=20, show_default=True,
+              help="With --non-interactive, how many largest paths to "
+                   "list. Ignored in interactive mode (the TUI shows "
+                   "every child of every directory you navigate into).")
+@click.option("--config", "config_path", default="",
+              help="Config file path. Auto-detected from cwd if omitted.")
+def ncdu(
+    remote_name: str,
+    non_interactive: bool,
+    top_n: int,
+    config_path: str,
+) -> None:
+    """Interactive disk-usage TUI over a configured remote, modeled
+    on `ncdu` / `rclone ncdu`.
+
+    \b
+    Two modes:
+      claude-mirror ncdu                          # interactive curses TUI
+      claude-mirror ncdu --non-interactive        # plain-text top-20 report
+      claude-mirror ncdu --non-interactive --top 50
+
+    \b
+    Tier 2: pick a specific backend with --remote NAME. Without it,
+    ncdu walks the primary backend (matching every other Tier-2-aware
+    command's default).
+
+    \b
+    Interactive keybindings:
+      ↑ / ↓                     move cursor
+      Enter / →                 descend into selected directory
+      ← / Backspace / h         ascend to parent
+      q                         quit
+
+    Windows: the curses module is not in the CPython stdlib on
+    Windows. `claude-mirror ncdu` exits with a friendly hint pointing
+    at `claude-mirror tree --depth N` (the read-only tree view) as
+    the closest cross-platform alternative.
+    """
+    from . import _ncdu
+
+    if sys.platform == "win32":
+        raise click.ClickException(
+            "claude-mirror ncdu is POSIX-only — the curses module is "
+            "not in CPython's stdlib on Windows. The closest "
+            "cross-platform alternative is `claude-mirror tree "
+            "--depth N`, which prints a static directory tree of the "
+            "configured remote with size aggregates per node."
+        )
+
+    if top_n <= 0:
+        raise click.ClickException("--top must be a positive integer")
+
+    engine, config, primary = _load_engine(
+        _resolve_config(config_path), with_pubsub=False,
+    )
+
+    backends_by_name: dict[str, StorageBackend] = {}
+    primary_name = getattr(primary, "backend_name", "") or config.backend or "primary"
+    backends_by_name[primary_name] = primary
+    for mirror in engine._mirrors:
+        name = getattr(mirror, "backend_name", "") or ""
+        if name:
+            backends_by_name[name] = mirror
+
+    if remote_name:
+        if remote_name not in backends_by_name:
+            available = ", ".join(sorted(backends_by_name.keys())) or "(none)"
+            raise click.ClickException(
+                f"Unknown backend `{remote_name}`. Configured "
+                f"backends: {available}."
+            )
+        target = backends_by_name[remote_name]
+        target_label = remote_name
+    else:
+        target = primary
+        target_label = primary_name
+
+    from .events import LOGS_FOLDER
+    from .snapshots import SNAPSHOTS_FOLDER, BLOBS_FOLDER
+
+    excluded = {SNAPSHOTS_FOLDER, BLOBS_FOLDER, LOGS_FOLDER}
+    target_config = getattr(target, "config", None)
+    folder_id = (
+        getattr(target_config, "root_folder", "") if target_config else ""
+    )
+    if not folder_id:
+        folder_id = engine._folder_id
+
+    console.print(
+        f"[dim]Fetching remote listing from "
+        f"[bold]{target_label}[/bold]...[/]"
+    )
+    try:
+        listing = target.list_files_recursive(
+            folder_id, exclude_folder_names=excluded,
+        )
+    except Exception as e:
+        raise click.ClickException(
+            f"Failed to list `{target_label}`: {redact_error(str(e))}"
+        ) from None
+
+    console.print(
+        f"[dim]Fetched {len(listing)} file(s). Building size tree...[/]"
+    )
+    root = _ncdu.build_size_tree(_ncdu.entries_from_backend_listing(listing))
+
+    if non_interactive:
+        click.echo(
+            _ncdu.format_non_interactive(
+                root, top_n, backend_label=target_label,
+            ),
+            nl=False,
+        )
+        return
+
+    project_label = Path(config.project_path).name or config.project_path
+    _ncdu.run_curses_ui(
+        root,
+        project_label=project_label,
+        backend_label=target_label,
+    )

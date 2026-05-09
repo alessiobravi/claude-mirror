@@ -322,6 +322,8 @@ claude-mirror log --follow              # live tail -f: stream new entries as th
 claude-mirror inbox                     # show + clear pending notifications
 claude-mirror snapshot --tag v1.0 --message "first stable"   # explicit named snapshot you can restore by name
 claude-mirror restore --tag v1.0        # restore by tag instead of by timestamp
+claude-mirror ncdu                      # interactive curses TUI of remote disk usage (POSIX only; arrows + Enter to navigate)
+claude-mirror ncdu --non-interactive --top 10   # cron-friendly: print top-10 largest paths and exit
 claude-mirror status --json | jq '.result.summary'   # script-friendly output
 ```
 

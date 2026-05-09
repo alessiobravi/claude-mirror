@@ -48,7 +48,7 @@ def test_list_backends_prints_expected_names_one_per_line():
     assert result.exit_code == 0, result.output
     lines = [line for line in result.output.splitlines() if line.strip()]
     assert lines == [
-        "googledrive", "dropbox", "onedrive", "webdav", "sftp", "ftp", "s3",
+        "googledrive", "dropbox", "onedrive", "webdav", "sftp", "ftp", "s3", "smb",
     ]
 
 

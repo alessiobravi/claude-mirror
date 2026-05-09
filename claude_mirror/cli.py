@@ -448,6 +448,7 @@ _AVAILABLE_BACKENDS: tuple[str, ...] = (
     "sftp",
     "ftp",
     "s3",
+    "smb",
 )
 
 
@@ -476,6 +477,9 @@ def _create_storage(config: Config) -> StorageBackend:
     if backend == "s3":
         from .backends.s3 import S3Backend
         return S3Backend(config)
+    if backend == "smb":
+        from .backends.smb import SmbBackend
+        return SmbBackend(config)
     raise ValueError(f"Unknown storage backend: {backend}")  # pragma: no cover
 
 
@@ -707,6 +711,9 @@ def _create_notifier(config: Config, storage: StorageBackend) -> NotificationBac
         from .notifications.polling import PollingNotifier
         return PollingNotifier(config, storage)
     if backend == "webdav":
+        from .notifications.polling import PollingNotifier
+        return PollingNotifier(config, storage)
+    if backend == "smb":
         from .notifications.polling import PollingNotifier
         return PollingNotifier(config, storage)
     return None
@@ -1285,7 +1292,7 @@ def _run_wizard(
     console.print("\n[bold cyan]claude-mirror setup wizard[/]\n")
     console.print("Press Enter to accept the [dim]default[/] shown in brackets.\n")
 
-    _SUPPORTED_BACKENDS = ("googledrive", "dropbox", "onedrive", "webdav", "sftp", "ftp", "s3")
+    _SUPPORTED_BACKENDS = ("googledrive", "dropbox", "onedrive", "webdav", "sftp", "ftp", "s3", "smb")
 
     # Backend
     console.print(
@@ -1344,6 +1351,15 @@ def _run_wizard(
     s3_prefix = ""
     s3_use_path_style = False
     poll_interval = 30  # default; only meaningful for onedrive/webdav/sftp/s3
+    smb_server = ""
+    smb_port = 445
+    smb_share = ""
+    smb_username = ""
+    smb_password = ""
+    smb_domain = ""
+    smb_folder = ""
+    smb_encryption = True
+    poll_interval = 30  # default; only meaningful for onedrive/webdav/sftp/smb
 
     # ── Profile pre-fill banner ───────────────────────────────────────
     # When the wizard runs under `--profile NAME`, announce which fields
@@ -1796,6 +1812,115 @@ def _run_wizard(
             default=True,
         )
 
+    elif backend == "smb":
+        # Server hostname / IP
+        if profile_data.get("smb_server"):
+            smb_server = profile_data["smb_server"]
+            console.print(
+                f"[dim]SMB server supplied by profile:[/] {smb_server}\n"
+            )
+        else:
+            console.print(
+                "\n[dim]SMB server: hostname or IP of the SMB/CIFS server.[/]"
+                "\n[dim]  Example: nas.local  or  192.168.1.5[/]\n"
+            )
+            while True:
+                smb_server = click.prompt("SMB server").strip()
+                if smb_server:
+                    break
+                console.print("[red]Server cannot be empty.[/]")
+
+        # Port
+        if profile_data.get("smb_port"):
+            smb_port = int(profile_data["smb_port"])
+            console.print(
+                f"[dim]SMB port supplied by profile:[/] {smb_port}\n"
+            )
+        else:
+            console.print(
+                "\n[dim]SMB port: TCP port (default 445; legacy NetBIOS-over-TCP uses 139).[/]\n"
+            )
+            while True:
+                smb_port = click.prompt("SMB port", default=445, type=int)
+                if 1 <= smb_port <= 65535:
+                    break
+                console.print(
+                    "[red]Port must be in range 1..65535.[/]"
+                )
+
+        # Share name
+        if profile_data.get("smb_share"):
+            smb_share = profile_data["smb_share"]
+            console.print(
+                f"[dim]SMB share supplied by profile:[/] {smb_share}\n"
+            )
+        else:
+            console.print(
+                "\n[dim]SMB share: the name after \\\\server\\ — e.g. claude-mirror.[/]\n"
+            )
+            while True:
+                smb_share = click.prompt("SMB share").strip()
+                if smb_share:
+                    break
+                console.print("[red]Share cannot be empty.[/]")
+
+        # Username
+        if profile_data.get("smb_username"):
+            smb_username = profile_data["smb_username"]
+            console.print(
+                f"[dim]SMB username supplied by profile:[/] {smb_username}\n"
+            )
+        else:
+            console.print(
+                "\n[dim]Username for SMB login (local user on the server, or domain user).[/]\n"
+            )
+            while True:
+                smb_username = click.prompt("SMB username").strip()
+                if smb_username:
+                    break
+                console.print("[red]Username cannot be empty.[/]")
+
+        # Password
+        if profile_data.get("smb_password"):
+            smb_password = profile_data["smb_password"]
+            console.print("[dim]SMB password supplied by profile.[/]\n")
+        else:
+            console.print(
+                "\n[red]Password is stored in plain text in the YAML config[/] "
+                "at chmod 0600. SMB3 encryption (default ON) keeps the wire "
+                "traffic confidential.\n"
+            )
+            import getpass
+            smb_password = getpass.getpass("SMB password: ")
+
+        # Domain
+        if profile_data.get("smb_domain"):
+            smb_domain = profile_data["smb_domain"]
+            console.print(
+                f"[dim]SMB domain supplied by profile:[/] {smb_domain}\n"
+            )
+        else:
+            console.print(
+                "\n[dim]Active Directory / NTLM domain. Leave blank for workgroup auth.[/]\n"
+            )
+            smb_domain = click.prompt("SMB domain", default="").strip()
+
+        # Folder within share
+        console.print(
+            "\n[dim]SMB folder: path within the share where project files live.[/]"
+            f"\n[dim]  Example: claude-mirror/{project_name}[/]\n"
+        )
+        smb_folder = click.prompt(
+            "SMB folder", default=f"claude-mirror/{project_name}"
+        ).strip().lstrip("/").lstrip("\\")
+
+        # Encryption
+        smb_encryption = click.confirm(
+            "Force SMB3 per-message encryption? "
+            "(SMB2-only servers negotiate down automatically)",
+            default=True,
+        )
+
     elif backend == "s3":
         # Endpoint URL — empty for AWS, otherwise the provider's S3 host.
         if profile_data.get("s3_endpoint_url"):
@@ -1893,7 +2018,7 @@ def _run_wizard(
         )
 
     # Polling interval for backends without push notifications.
-    if backend in ("onedrive", "webdav", "sftp", "ftp", "s3"):
+    if backend in ("onedrive", "webdav", "sftp", "ftp", "s3", "smb"):
         console.print(
             "\n[dim]Poll interval (seconds): how often the watcher checks for "
             "remote changes. Lower = more responsive, higher = less network use.[/]\n"
@@ -1923,6 +2048,8 @@ def _run_wizard(
             derived_token = str(CONFIG_DIR / f"ftp-{project_name}-token.json")
         elif backend == "s3":
             derived_token = str(CONFIG_DIR / f"s3-{project_name}-token.json")
+        elif backend == "smb":
+            derived_token = str(CONFIG_DIR / f"smb-{project_name}-token.json")
         else:
             derived_token = str(CONFIG_DIR / f"{backend}-{project_name}-token.json")
         raw_token = click.prompt("Token file", default=derived_token)
@@ -2009,7 +2136,17 @@ def _run_wizard(
             console.print(f"  Secret key:    {'*' * 8}")
         console.print(f"  Prefix:        {s3_prefix}")
         console.print(f"  Path style:    {s3_use_path_style}")
-    if backend in ("onedrive", "webdav", "sftp", "ftp", "s3"):
+    elif backend == "smb":
+        console.print(f"  SMB server:    {smb_server}:{smb_port}")
+        console.print(f"  Share:         {smb_share}")
+        console.print(f"  Username:      {smb_username}")
+        if smb_password:
+            console.print(f"  Password:      {'*' * len(smb_password)}")
+        if smb_domain:
+            console.print(f"  Domain:        {smb_domain}")
+        console.print(f"  SMB folder:    {smb_folder}")
+        console.print(f"  Encryption:    {smb_encryption}")
+    if backend in ("onedrive", "webdav", "sftp", "ftp", "s3", "smb"):
         console.print(f"  Poll interval: {poll_interval}s")
     console.print(f"  Patterns:      {', '.join(patterns)}")
 
@@ -2124,6 +2261,14 @@ def _run_wizard(
         s3_secret_access_key=s3_secret_access_key,
         s3_prefix=s3_prefix,
         s3_use_path_style=s3_use_path_style,
+        smb_server=smb_server,
+        smb_port=smb_port,
+        smb_share=smb_share,
+        smb_username=smb_username,
+        smb_password=smb_password,
+        smb_domain=smb_domain,
+        smb_folder=smb_folder,
+        smb_encryption=smb_encryption,
         poll_interval=poll_interval,
         slack_enabled=slack_enabled,
         slack_webhook_url=slack_webhook_url,
@@ -2141,7 +2286,7 @@ def _run_wizard(
 @click.option("--project", default="", help="Path to the Claude project directory.")
 @click.option("--backend", "backend_opt", default="googledrive", show_default=True,
               shell_complete=_backend_value_completer,
-              help="Storage backend: googledrive | dropbox | onedrive | webdav | sftp | ftp | s3.")
+              help="Storage backend: googledrive | dropbox | onedrive | webdav | sftp | ftp | s3 | smb.")
 @click.option("--drive-folder-id", default="", help="Google Drive folder ID to sync into.")
 @click.option("--gcp-project-id", default="", help="Google Cloud project ID.")
 @click.option("--pubsub-topic-id", default="", help="Pub/Sub topic ID.")
@@ -2197,8 +2342,25 @@ def _run_wizard(
 @click.option("--s3-use-path-style/--no-s3-use-path-style",
               "s3_use_path_style", default=False, show_default=True,
               help="Use path-style addressing (https://endpoint/bucket/key). Required for MinIO and a few S3-compat services.")
+@click.option("--smb-server", default="",
+              help="SMB/CIFS server hostname or IP (e.g. nas.local, 192.168.1.5).")
+@click.option("--smb-port", default=445, show_default=True, type=int,
+              help="SMB server port (1..65535). Default 445; 139 for legacy NetBIOS-over-TCP.")
+@click.option("--smb-share", default="",
+              help="SMB share name (the segment after \\\\server\\).")
+@click.option("--smb-username", default="",
+              help="SMB username (local user on the server, or domain user).")
+@click.option("--smb-password", default="",
+              help="SMB password (stored plain in YAML at chmod 0600).")
+@click.option("--smb-domain", default="",
+              help="Active Directory / NTLM domain. Empty for workgroup auth.")
+@click.option("--smb-folder", default="",
+              help="Path within the SMB share (e.g. claude-mirror/myproject).")
+@click.option("--smb-encryption/--no-smb-encryption", "smb_encryption",
+              default=True, show_default=True,
+              help="Force SMB3 per-message encryption. SMB2-only servers negotiate down.")
 @click.option("--poll-interval", "poll_interval", default=30, show_default=True, type=int,
-              help="Polling interval in seconds for backends without push notifications (OneDrive, WebDAV, SFTP, FTP, S3).")
+              help="Polling interval in seconds for backends without push notifications (OneDrive, WebDAV, SFTP, FTP, S3, SMB).")
 @click.option("--slack-webhook-url", default="", help="Slack incoming webhook URL for sync notifications.")
 @click.option("--slack-channel", default="", help="Slack channel override (default: webhook's channel).")
 @click.option("--slack/--no-slack", "slack_flag", default=False, help="Enable/disable Slack notifications.")
@@ -2261,6 +2423,14 @@ def init(
     s3_secret_access_key: str,
     s3_prefix: str,
     s3_use_path_style: bool,
+    smb_server: str,
+    smb_port: int,
+    smb_share: str,
+    smb_username: str,
+    smb_password: str,
+    smb_domain: str,
+    smb_folder: str,
+    smb_encryption: bool,
     poll_interval: int,
     slack_webhook_url: str,
     slack_channel: str,
@@ -2321,6 +2491,14 @@ def init(
         s3_secret_access_key=s3_secret_access_key,
         s3_prefix=s3_prefix,
         s3_use_path_style=s3_use_path_style,
+        smb_server=smb_server,
+        smb_port=smb_port,
+        smb_share=smb_share,
+        smb_username=smb_username,
+        smb_password=smb_password,
+        smb_domain=smb_domain,
+        smb_folder=smb_folder,
+        smb_encryption=smb_encryption,
         poll_interval=poll_interval,
         slack_webhook_url=slack_webhook_url,
         slack_channel=slack_channel,
@@ -2373,6 +2551,14 @@ def _run_init(
     s3_secret_access_key: str,
     s3_prefix: str,
     s3_use_path_style: bool,
+    smb_server: str,
+    smb_port: int,
+    smb_share: str,
+    smb_username: str,
+    smb_password: str,
+    smb_domain: str,
+    smb_folder: str,
+    smb_encryption: bool,
     poll_interval: int,
     slack_webhook_url: str,
     slack_channel: str,
@@ -2460,6 +2646,14 @@ def _run_init(
         s3_secret_access_key = values["s3_secret_access_key"]
         s3_prefix        = values["s3_prefix"]
         s3_use_path_style = values["s3_use_path_style"]
+        smb_server       = values["smb_server"]
+        smb_port         = values["smb_port"]
+        smb_share        = values["smb_share"]
+        smb_username     = values["smb_username"]
+        smb_password     = values["smb_password"]
+        smb_domain       = values["smb_domain"]
+        smb_folder       = values["smb_folder"]
+        smb_encryption   = values["smb_encryption"]
         poll_interval    = values["poll_interval"]
         slack_enabled    = values["slack_enabled"]
         slack_webhook_url = values["slack_webhook_url"]
@@ -2562,6 +2756,21 @@ def _run_init(
                      s3_bucket or profile_data.get("s3_bucket", "")),
                 ] if not val
             ]
+        elif backend == "smb":
+            missing = [
+                name for name, val in [
+                    ("--project", project),
+                    ("--smb-server",
+                     smb_server or profile_data.get("smb_server", "")),
+                    ("--smb-share",
+                     smb_share or profile_data.get("smb_share", "")),
+                    ("--smb-username",
+                     smb_username or profile_data.get("smb_username", "")),
+                    ("--smb-password",
+                     smb_password or profile_data.get("smb_password", "")),
+                    ("--smb-folder", smb_folder),
+                ] if not val
+            ]
         else:
             console.print(f"[red]Unknown backend: {backend}[/]")
             sys.exit(1)
@@ -2645,6 +2854,22 @@ def _run_init(
                     "SFTP backend for any internet-reachable server."
                 )
 
+        # SMB-specific validation: port in range, normalise folder.
+        if backend == "smb":
+            if not (1 <= smb_port <= 65535):
+                console.print(
+                    f"[red]✗ --smb-port must be in range 1..65535 "
+                    f"(got {smb_port}).[/]"
+                )
+                sys.exit(1)
+            smb_folder = smb_folder.strip().lstrip("/").lstrip("\\")
+            if smb_password:
+                console.print(
+                    "[yellow]⚠ SMB password stored in plain text in YAML[/] "
+                    "at chmod 0600. SMB3 encryption (default ON) keeps wire "
+                    "traffic confidential."
+                )
+
         project_path = str(Path(project).expanduser().resolve())
         if not Path(project_path).exists():
             if create_project_if_missing:
@@ -2678,6 +2903,9 @@ def _run_init(
             elif backend == "s3":
                 project_name = Path(project_path).name
                 token_file = str(CONFIG_DIR / f"s3-{project_name}-token.json")
+            elif backend == "smb":
+                project_name = Path(project_path).name
+                token_file = str(CONFIG_DIR / f"smb-{project_name}-token.json")
             else:
                 project_name = Path(project_path).name
                 token_file = str(CONFIG_DIR / f"{backend}-{project_name}-token.json")
@@ -2743,6 +2971,16 @@ def _run_init(
             s3_access_key_id = ""
         if profile_data.get("s3_secret_access_key"):
             s3_secret_access_key = ""
+        if profile_data.get("smb_server"):
+            smb_server = ""
+        if profile_data.get("smb_share"):
+            smb_share = ""
+        if profile_data.get("smb_username"):
+            smb_username = ""
+        if profile_data.get("smb_password"):
+            smb_password = ""
+        if profile_data.get("smb_domain"):
+            smb_domain = ""
 
     config = Config(
         project_path=project_path,
@@ -2779,6 +3017,14 @@ def _run_init(
         s3_secret_access_key=s3_secret_access_key,
         s3_prefix=s3_prefix,
         s3_use_path_style=s3_use_path_style,
+        smb_server=smb_server,
+        smb_port=smb_port,
+        smb_share=smb_share,
+        smb_username=smb_username,
+        smb_password=smb_password,
+        smb_domain=smb_domain,
+        smb_folder=smb_folder,
+        smb_encryption=smb_encryption,
         poll_interval=poll_interval,
         slack_enabled=slack_enabled,
         slack_webhook_url=slack_webhook_url,
@@ -2823,6 +3069,8 @@ def _run_init(
                 "ftp_password", "ftp_tls", "ftp_passive",
                 "s3_endpoint_url", "s3_bucket", "s3_region",
                 "s3_access_key_id", "s3_secret_access_key",
+                "smb_server", "smb_port", "smb_share",
+                "smb_username", "smb_password", "smb_domain",
             ) if profile_data.get(k) not in (None, "")
         )
         config.save(config_path, profile=profile_name, strip_fields=strip)
@@ -2858,6 +3106,11 @@ def _run_init(
         )
         console.print(f"[green]S3 prefix:[/]           {s3_prefix or Path(project_path).name}")
         console.print("\nRun [bold]claude-mirror auth[/] to verify S3 credentials.")
+    elif backend == "smb":
+        console.print(f"[green]SMB server:[/]          {smb_server}:{smb_port}")
+        console.print(f"[green]Share:[/]               {smb_share}")
+        console.print(f"[green]SMB folder:[/]          {smb_folder}")
+        console.print("\nRun [bold]claude-mirror auth[/] to verify the SMB connection.")
 
     # ── Flag-driven (non-wizard) auto-pubsub-setup path (v0.5.47) ──
     # The wizard branch already ran the smoke test + auto-setup above
@@ -3131,7 +3384,7 @@ def _auth_check(config: Config) -> None:
 @click.option("--backend", "backend_opt", required=True,
               type=click.Choice(_AVAILABLE_BACKENDS, case_sensitive=False),
               shell_complete=_backend_value_completer,
-              help="Storage backend to clone from: googledrive | dropbox | onedrive | webdav | sftp | ftp | s3.")
+              help="Storage backend to clone from: googledrive | dropbox | onedrive | webdav | sftp | ftp | s3 | smb.")
 @click.option("--project", "project", required=True, type=str,
               help="Path to the local destination project directory. Created if missing.")
 @click.option("--drive-folder-id", default="", help="Google Drive folder ID to clone from.")
@@ -3188,6 +3441,23 @@ def _auth_check(config: Config) -> None:
 @click.option("--s3-use-path-style/--no-s3-use-path-style",
               "s3_use_path_style", default=False, show_default=True,
               help="Use path-style S3 addressing (required for MinIO).")
+@click.option("--smb-server", default="",
+              help="SMB/CIFS server hostname or IP.")
+@click.option("--smb-port", default=445, show_default=True, type=int,
+              help="SMB server port (1..65535).")
+@click.option("--smb-share", default="",
+              help="SMB share name (the segment after \\\\server\\).")
+@click.option("--smb-username", default="",
+              help="SMB username.")
+@click.option("--smb-password", default="",
+              help="SMB password (stored plain in YAML at chmod 0600).")
+@click.option("--smb-domain", default="",
+              help="Active Directory / NTLM domain. Empty for workgroup auth.")
+@click.option("--smb-folder", default="",
+              help="Path within the SMB share.")
+@click.option("--smb-encryption/--no-smb-encryption", "smb_encryption",
+              default=True, show_default=True,
+              help="Force SMB3 per-message encryption.")
 @click.option("--credentials-file", "credentials_file", default=_DEFAULT_CREDENTIALS, show_default=True,
               help="Path to Google OAuth2 credentials JSON for this project (Drive only).")
 @click.option("--token-file", "token_file", default="",
@@ -3240,6 +3510,14 @@ def clone(
     s3_secret_access_key: str,
     s3_prefix: str,
     s3_use_path_style: bool,
+    smb_server: str,
+    smb_port: int,
+    smb_share: str,
+    smb_username: str,
+    smb_password: str,
+    smb_domain: str,
+    smb_folder: str,
+    smb_encryption: bool,
     credentials_file: str,
     token_file: str,
     config_path: str,
@@ -3335,6 +3613,14 @@ def clone(
                 s3_secret_access_key=s3_secret_access_key,
                 s3_prefix=s3_prefix,
                 s3_use_path_style=s3_use_path_style,
+                smb_server=smb_server,
+                smb_port=smb_port,
+                smb_share=smb_share,
+                smb_username=smb_username,
+                smb_password=smb_password,
+                smb_domain=smb_domain,
+                smb_folder=smb_folder,
+                smb_encryption=smb_encryption,
                 poll_interval=poll_interval,
                 slack_webhook_url="",
                 slack_channel="",
@@ -11879,6 +12165,392 @@ def _run_s3_deep_checks(path: str, config: "Config") -> list[str]:
 
 
 
+def _smb_deep_check_factory(
+    config: "Config",
+) -> dict[str, Any]:
+    """Build the live SMB connection state used by the SMB deep checks.
+
+    Returns a dict with keys:
+      tcp_error          — exception or None from the raw `socket.create_connection`
+                           probe (TRANSIENT bucket — server unreachable).
+      negotiate_error    — exception or None from the SMB protocol-level
+                           negotiation (post-TCP, pre-auth). A non-None value
+                           on a TCP-reachable host typically means SMBv1-only
+                           (which `smbprotocol` refuses) or a misconfigured port.
+      auth_error         — exception or None from `register_session`. Bad
+                           credentials, account locked, or domain mismatch.
+      smbv1_only         — True if negotiate failed with the canonical
+                           "SMBv1 not supported" signature. Surfaces the
+                           security gate explicitly so the deep-check can
+                           refuse the host.
+      encryption_active  — True if SMB3 encryption negotiated; False if
+                           the server downgraded to plaintext.
+
+    Tests monkeypatch this whole function to inject the desired state without
+    needing a live SMB server.
+    """
+    import socket as _socket  # noqa: PLC0415
+
+    server = (getattr(config, "smb_server", "") or "").strip()
+    port = int(getattr(config, "smb_port", 445) or 445)
+
+    tcp_error: Optional[BaseException] = None
+    negotiate_error: Optional[BaseException] = None
+    auth_error: Optional[BaseException] = None
+    smbv1_only = False
+    encryption_active: Optional[bool] = None
+
+    sock: Optional[_socket.socket] = None
+    try:
+        sock = _socket.create_connection((server, port), timeout=5)
+    except BaseException as e:  # noqa: BLE001 — diagnostic must not bubble
+        tcp_error = e
+
+    if sock is not None:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    if tcp_error is None:
+        try:
+            import smbprotocol.connection  # noqa: PLC0415
+            import uuid as _uuid  # noqa: PLC0415
+            conn = smbprotocol.connection.Connection(
+                _uuid.uuid4(), server, port, require_signing=True,
+            )
+            try:
+                conn.connect(timeout=5)
+                dialect = getattr(conn, "dialect", None)
+                if dialect is not None and int(dialect) < 0x0202:
+                    smbv1_only = True
+                    negotiate_error = RuntimeError(
+                        "Server only supports SMBv1; refusing to connect."
+                    )
+            finally:
+                try:
+                    conn.disconnect(close=True)
+                except Exception:
+                    pass
+        except BaseException as e:  # noqa: BLE001
+            negotiate_error = e
+            text = str(e).lower()
+            if "smb 1" in text or "smbv1" in text or "negotiate" in text:
+                # Heuristic: the negotiation refused the dialect set; on
+                # `smbprotocol` this surfaces as `SMBException` mentioning
+                # the negotiated dialect or "no supported dialect".
+                smbv1_only = True
+
+    if tcp_error is None and negotiate_error is None:
+        try:
+            import smbclient  # noqa: PLC0415
+            kwargs: dict[str, Any] = {
+                "username": getattr(config, "smb_username", "") or None,
+                "password": getattr(config, "smb_password", "") or None,
+                "port": port,
+                "encrypt": bool(getattr(config, "smb_encryption", True)),
+            }
+            domain = (getattr(config, "smb_domain", "") or "").strip()
+            uname = kwargs["username"]
+            if domain and uname and "\\" not in str(uname):
+                kwargs["username"] = f"{domain}\\{uname}"
+            smbclient.register_session(server, **kwargs)
+            encryption_active = bool(getattr(config, "smb_encryption", True))
+        except BaseException as e:  # noqa: BLE001
+            auth_error = e
+
+    return {
+        "tcp_error": tcp_error,
+        "negotiate_error": negotiate_error,
+        "auth_error": auth_error,
+        "smbv1_only": smbv1_only,
+        "encryption_active": encryption_active,
+    }
+
+
+def _run_smb_deep_checks(path: str, config: "Config") -> list[str]:
+    """SMB-specific deep diagnostic checks.
+
+    Six checks layered on top of the generic credentials / connectivity
+    pass:
+
+      1. Server reachable — TCP connect to smb_server:smb_port.
+      2. SMB protocol negotiation — server speaks SMB2/3 (NOT SMBv1).
+      3. Authentication — register_session with the configured creds.
+      4. Share access — list root of the share.
+      5. Folder write — write + delete a 1-byte sentinel in the project
+         folder.
+      6. Encryption status — info-only line reporting whether SMB3
+         encryption was negotiated successfully.
+
+    Returns the list of failure summary strings (empty ⇒ all-pass).
+    Auth-class failures bucket: a single AUTH-class fail short-circuits
+    the rest of the chain so the user sees ONE "your access is broken"
+    line not five copies.
+    """
+    failures: list[str] = []
+    smb_server = (getattr(config, "smb_server", "") or "").strip()
+    smb_port = int(getattr(config, "smb_port", 445) or 445)
+    smb_share = (getattr(config, "smb_share", "") or "").strip()
+    smb_folder = (getattr(config, "smb_folder", "") or "").strip()
+    smb_username = (getattr(config, "smb_username", "") or "").strip()
+
+    auth_bucket_reported = False
+
+    def _emit_auth_bucket(headline: str, fix_hint: str, summary: str) -> None:
+        nonlocal auth_bucket_reported
+        if auth_bucket_reported:
+            return
+        auth_bucket_reported = True
+        console.print(
+            f"  [red]✗[/] {headline}\n"
+            f"      [yellow]Fix:[/] {fix_hint}"
+        )
+        failures.append(summary)
+
+    factory_result = _smb_deep_check_factory(config)
+    tcp_error = factory_result.get("tcp_error")
+    negotiate_error = factory_result.get("negotiate_error")
+    auth_error = factory_result.get("auth_error")
+    smbv1_only = bool(factory_result.get("smbv1_only"))
+    encryption_active = factory_result.get("encryption_active")
+
+    # ───── Check 1: server reachable ─────
+    if tcp_error is not None:
+        exc_name = type(tcp_error).__name__
+        exc_text = str(tcp_error)
+        text_lower = exc_text.lower()
+        if isinstance(tcp_error, TimeoutError) or "timeout" in text_lower or "timed out" in text_lower:
+            console.print(
+                f"  [red]✗[/] Connection to "
+                f"[bold]{smb_server}:{smb_port}[/] timed out\n"
+                f"      [yellow]Fix:[/] check that the server is reachable "
+                f"([bold]ping {smb_server}[/]) and that port "
+                f"[bold]{smb_port}[/] is open from this machine."
+            )
+            failures.append(
+                f"SMB connection timeout: {smb_server}:{smb_port}"
+            )
+        elif isinstance(tcp_error, ConnectionRefusedError) or "refused" in text_lower:
+            console.print(
+                f"  [red]✗[/] Server unreachable: "
+                f"[bold]{smb_server}:{smb_port}[/] "
+                f"([dim]{exc_name}: {exc_text[:120]}[/])\n"
+                f"      [yellow]Fix:[/] verify the SMB service is running "
+                f"and port [bold]{smb_port}[/] is open. The default is "
+                f"445; some legacy hosts use 139."
+            )
+            failures.append(
+                f"SMB server unreachable: {smb_server}:{smb_port}"
+            )
+        else:
+            console.print(
+                f"  [red]✗[/] Could not reach "
+                f"[bold]{smb_server}:{smb_port}[/] "
+                f"([dim]{exc_name}: {exc_text[:120]}[/])\n"
+                f"      [yellow]Fix:[/] verify the host/port in "
+                f"[bold]{path}[/]."
+            )
+            failures.append(f"SMB TCP connect failed: {exc_name}")
+        return failures
+    console.print(
+        f"  [green]✓[/] Server reachable: "
+        f"[dim]{smb_server}:{smb_port}[/]"
+    )
+
+    # ───── Check 2: SMB protocol negotiation (SMBv1 rejection) ─────
+    if smbv1_only:
+        console.print(
+            f"  [red]✗[/] Server only speaks SMBv1 — refusing to connect.\n"
+            f"      [dim]SMBv1 is end-of-life and re-opens EternalBlue-class "
+            f"attack surface.[/]\n"
+            f"      [yellow]Fix:[/] enable SMB2 or SMB3 on the server "
+            f"(modern Windows / Samba / NAS firmware do this by default; "
+            f"check the server's SMB protocol settings)."
+        )
+        failures.append(f"SMB server is SMBv1-only: {smb_server}")
+        return failures
+    if negotiate_error is not None:
+        exc_name = type(negotiate_error).__name__
+        exc_text = str(negotiate_error)
+        console.print(
+            f"  [red]✗[/] SMB protocol negotiation failed "
+            f"([dim]{exc_name}: {exc_text[:140]}[/])\n"
+            f"      [yellow]Fix:[/] verify [bold]{smb_server}[/] speaks "
+            f"SMB2 or SMB3. Some firewalls / antivirus filters intercept "
+            f"port [bold]{smb_port}[/] and break the handshake."
+        )
+        failures.append(
+            f"SMB protocol negotiation failed: {exc_name}"
+        )
+        return failures
+    console.print(
+        "  [green]✓[/] SMB2/3 protocol negotiated"
+    )
+
+    # ───── Check 3: authentication ─────
+    if auth_error is not None:
+        exc_name = type(auth_error).__name__
+        exc_text = str(auth_error)
+        if exc_name in ("LogonFailure", "BadAccountName") or "logon" in exc_text.lower():
+            _emit_auth_bucket(
+                headline=(
+                    f"SMB authentication rejected by [bold]{smb_server}[/] "
+                    f"([dim]{exc_name}: {exc_text[:140]}[/])"
+                ),
+                fix_hint=(
+                    f"verify [bold]smb_username[/] / [bold]smb_password[/] / "
+                    f"[bold]smb_domain[/] in [bold]{path}[/]. Account-locked "
+                    f"errors look the same shape — check the server's "
+                    f"audit log."
+                ),
+                summary=f"SMB auth rejected: {smb_server}",
+            )
+            return failures
+        console.print(
+            f"  [red]✗[/] register_session failed "
+            f"([dim]{exc_name}: {exc_text[:140]}[/])\n"
+            f"      [yellow]Fix:[/] inspect the error above and verify "
+            f"[bold]smb_username[/] / [bold]smb_password[/] in "
+            f"[bold]{path}[/]."
+        )
+        failures.append(f"SMB session registration failed: {exc_name}")
+        return failures
+    console.print(
+        f"  [green]✓[/] Authentication succeeded as "
+        f"[dim]{smb_username}[/]"
+    )
+
+    # ───── Check 4: share access ─────
+    try:
+        import smbclient  # noqa: PLC0415
+        share_root = f"\\\\{smb_server}\\{smb_share}"
+        list(smbclient.scandir(share_root))
+        console.print(
+            f"  [green]✓[/] Share accessible: [dim]\\\\{smb_server}\\{smb_share}[/]"
+        )
+    except BaseException as exc:  # noqa: BLE001
+        exc_name = type(exc).__name__
+        exc_text = str(exc)
+        if "AccessDenied" in exc_name or "permission" in exc_text.lower():
+            _emit_auth_bucket(
+                headline=(
+                    f"Permission denied listing share "
+                    f"[bold]\\\\{smb_server}\\{smb_share}[/]"
+                ),
+                fix_hint=(
+                    f"user [bold]{smb_username}[/] lacks list permission on "
+                    f"the share. Adjust share-level ACLs (Windows: Share → "
+                    f"Properties → Sharing tab; Samba: smb.conf) AND the "
+                    f"underlying NTFS / POSIX file-level permissions."
+                ),
+                summary=(
+                    f"SMB share permission denied: {smb_share}"
+                ),
+            )
+            return failures
+        if exc_name in ("BadNetworkName", "ObjectNameNotFound") or "not found" in exc_text.lower():
+            console.print(
+                f"  [red]✗[/] Share not found: "
+                f"[bold]\\\\{smb_server}\\{smb_share}[/]\n"
+                f"      [yellow]Fix:[/] verify [bold]smb_share[/] in "
+                f"[bold]{path}[/] matches a share advertised by the server. "
+                f"List shares with [bold]smbclient -L {smb_server} -U "
+                f"{smb_username}[/]."
+            )
+            failures.append(f"SMB share not found: {smb_share}")
+            return failures
+        console.print(
+            f"  [red]✗[/] Could not list share "
+            f"[bold]\\\\{smb_server}\\{smb_share}[/] "
+            f"([dim]{exc_name}: {exc_text[:140]}[/])\n"
+            f"      [yellow]Fix:[/] inspect the error above and verify "
+            f"[bold]smb_share[/] in [bold]{path}[/]."
+        )
+        failures.append(f"SMB share list failed: {exc_name}")
+        return failures
+
+    # ───── Check 5: folder write (sentinel + delete) ─────
+    project_root = (
+        f"\\\\{smb_server}\\{smb_share}"
+        if not smb_folder
+        else f"\\\\{smb_server}\\{smb_share}\\"
+        + smb_folder.replace("/", "\\").lstrip("\\")
+    )
+    sentinel = f"{project_root.rstrip(chr(92))}\\__claude_mirror_doctor_test"
+    try:
+        import smbclient  # noqa: PLC0415
+        try:
+            smbclient.makedirs(project_root, exist_ok=True)
+        except Exception:
+            pass
+        with smbclient.open_file(sentinel, mode="wb") as f:
+            f.write(b"x")
+        try:
+            smbclient.remove(sentinel)
+        except Exception:
+            pass
+        console.print(
+            f"  [green]✓[/] Folder writable: [dim]{project_root}[/]"
+        )
+    except BaseException as exc:  # noqa: BLE001
+        exc_name = type(exc).__name__
+        exc_text = str(exc)
+        if "AccessDenied" in exc_name or "permission" in exc_text.lower():
+            _emit_auth_bucket(
+                headline=(
+                    f"Permission denied writing to "
+                    f"[bold]{project_root}[/]"
+                ),
+                fix_hint=(
+                    f"user [bold]{smb_username}[/] can list the share but "
+                    f"cannot write. Check BOTH share-level and file-level "
+                    f"(NTFS / POSIX) permissions on [bold]{smb_folder or '/'}[/]."
+                ),
+                summary=(
+                    f"SMB folder write permission denied: {project_root}"
+                ),
+            )
+            try:
+                smbclient.remove(sentinel)
+            except Exception:
+                pass
+            return failures
+        console.print(
+            f"  [red]✗[/] Could not write sentinel to "
+            f"[bold]{project_root}[/] "
+            f"([dim]{exc_name}: {exc_text[:140]}[/])\n"
+            f"      [yellow]Fix:[/] inspect the error above. Verify "
+            f"[bold]smb_folder[/] in [bold]{path}[/] and that the user has "
+            f"write access."
+        )
+        failures.append(f"SMB folder write failed: {exc_name}")
+        return failures
+
+    # ───── Check 6: encryption status (info-only) ─────
+    requested = bool(getattr(config, "smb_encryption", True))
+    if requested and encryption_active:
+        console.print(
+            "  [green]✓[/] SMB3 encryption negotiated "
+            "([dim]per-message AES[/])"
+        )
+    elif requested and not encryption_active:
+        console.print(
+            "  [yellow]⚠[/] SMB3 encryption requested but server "
+            "negotiated down — wire traffic is NOT encrypted. Acceptable "
+            "for closed-LAN setups; risky on the open internet."
+        )
+    else:
+        console.print(
+            "  [yellow]⚠[/] SMB encryption disabled in config — wire "
+            "traffic is NOT encrypted."
+        )
+
+    return failures
+
+
+
+
 def _is_loopback_or_rfc1918_for_doctor(host: str) -> bool:
     """Doctor-side wrapper around the backend's host-classification
     helper. Kept as a thin alias so tests can monkeypatch the doctor's
@@ -11993,6 +12665,11 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
                 "access key + secret in YAML, or boto3's default "
                 "credential chain)"
             )
+        elif backend_name == "smb":
+            console.print(
+                "  [dim]·[/] credentials file: skipped (SMB uses inline "
+                "server/share/user/password in YAML)"
+            )
         else:
             creds_path = Path(config.credentials_file)
             if not creds_path.exists():
@@ -12095,6 +12772,40 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
                     "  [green]✓[/] FTP credentials present in config "
                     "(host + username + password + folder)"
                 )
+        elif backend_name == "smb":
+            smb_server_v = getattr(config, "smb_server", "") or ""
+            smb_share_v = getattr(config, "smb_share", "") or ""
+            smb_user_v = getattr(config, "smb_username", "") or ""
+            smb_pw_v = getattr(config, "smb_password", "") or ""
+            smb_folder_v = getattr(config, "smb_folder", "") or ""
+            smb_missing = []
+            if not smb_server_v:
+                smb_missing.append("smb_server")
+            if not smb_share_v:
+                smb_missing.append("smb_share")
+            if not smb_user_v:
+                smb_missing.append("smb_username")
+            if not smb_pw_v:
+                smb_missing.append("smb_password")
+            if not smb_folder_v:
+                smb_missing.append("smb_folder")
+            if smb_missing:
+                console.print(
+                    f"  [red]✗[/] SMB config incomplete: "
+                    f"missing [bold]{', '.join(smb_missing)}[/] in "
+                    f"[bold]{path}[/]\n"
+                    f"      [yellow]Fix:[/] run "
+                    f"[bold]claude-mirror init --wizard --config {path}[/] "
+                    f"or edit the YAML to add the missing fields."
+                )
+                failures.append(
+                    f"SMB config incomplete ({', '.join(smb_missing)}): {path}"
+                )
+            else:
+                console.print(
+                    "  [green]✓[/] SMB credentials present in config "
+                    "(server + share + username + password + folder)"
+                )
         elif backend_name == "s3":
             # S3 requires a bucket; access key + secret are optional
             # (boto3's default credential chain handles env vars /
@@ -12188,6 +12899,16 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
                 ftp_folder_v = getattr(config, "ftp_folder", "") or "."
                 if ftp_folder_v:
                     ftp_client.cwd(ftp_folder_v)
+            elif backend_name == "smb":
+                # SMB's `config.root_folder` returns just the relative path
+                # within the share, not a full UNC. The backend's internal
+                # `_project_root()` builds the canonical UNC; ask it via
+                # the public method.
+                storage.get_credentials()
+                storage.list_folders(
+                    storage._project_root(),  # type: ignore[attr-defined]
+                    name=None,
+                )
             else:
                 storage.get_credentials()
                 storage.list_folders(config.root_folder, name=None)
@@ -12271,6 +12992,40 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
                         f"host/port/credentials in [bold]{path}[/] and "
                         f"re-run [bold]claude-mirror auth --config {path}[/]."
                     )
+            elif backend_name == "smb":
+                _smb_server = getattr(config, "smb_server", "") or "?"
+                _smb_port = getattr(config, "smb_port", 445)
+                _smb_share = getattr(config, "smb_share", "") or "?"
+                _smb_folder_v = getattr(config, "smb_folder", "") or "?"
+                if is_auth:
+                    hint = (
+                        f"[yellow]Fix:[/] SMB authentication failed. Verify "
+                        f"[bold]smb_username[/] / [bold]smb_password[/] / "
+                        f"[bold]smb_domain[/] in [bold]{path}[/]."
+                    )
+                elif is_network:
+                    hint = (
+                        f"[yellow]Fix:[/] network reachability — check "
+                        f"[bold]ping {_smb_server}[/] and that port "
+                        f"[bold]{_smb_port}[/] is open."
+                    )
+                elif is_permission:
+                    hint = (
+                        f"[yellow]Fix:[/] your account lacks access to "
+                        f"[bold]{_smb_folder_v}[/] on share "
+                        f"[bold]{_smb_share}[/]."
+                    )
+                elif is_not_found:
+                    hint = (
+                        f"[yellow]Fix:[/] share [bold]{_smb_share}[/] or "
+                        f"folder [bold]{_smb_folder_v}[/] does not exist on "
+                        f"[bold]{_smb_server}[/]."
+                    )
+                else:
+                    hint = (
+                        f"[yellow]Fix:[/] inspect the error above. Verify "
+                        f"server/share/credentials in [bold]{path}[/]."
+                    )
             elif is_auth:
                 hint = (
                     f"[yellow]Fix:[/] token revoked or refresh failed. Run "
@@ -12324,6 +13079,12 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
                     f"  [green]✓[/] FTP connectivity ok "
                     f"([dim]session opened + cwd({_ftp_folder_v}) "
                     f"succeeded[/])"
+                )
+            elif backend_name == "smb":
+                _smb_share = getattr(config, "smb_share", "") or "?"
+                console.print(
+                    f"  [green]✓[/] SMB connectivity ok "
+                    f"([dim]session opened on share {_smb_share}[/])"
                 )
             else:
                 console.print(
@@ -12451,6 +13212,10 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
         if backend_name == "s3":
             console.print("\n[bold]S3 deep checks[/]")
             failures.extend(_run_s3_deep_checks(path, config))
+        # ───── SMB deep checks (BACKEND-SMB) ─────
+        if backend_name == "smb":
+            console.print("\n[bold]SMB deep checks[/]")
+            failures.extend(_run_smb_deep_checks(path, config))
 
         # ───── Check 5: project_path exists locally ─────
         # Only check on the primary — every mirror config validated by
@@ -12515,7 +13280,7 @@ def _run_doctor_checks(cfg_path: str, backend_filter: str) -> list[str]:
 @click.option("--backend", "backend_filter", default="",
               shell_complete=_backend_value_completer,
               help="Limit checks to one backend by name "
-                   "(googledrive, dropbox, onedrive, webdav, sftp). Default: "
+                   "(googledrive, dropbox, onedrive, webdav, sftp, smb). Default: "
                    "check all configured backends including Tier 2 mirrors.")
 def doctor(config_path: str, backend_filter: str) -> None:
     """Diagnose claude-mirror configuration health.

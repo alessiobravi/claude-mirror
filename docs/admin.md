@@ -1461,6 +1461,7 @@ The implementation runs the following checks in order. Every per-backend check r
 |---|---|---|
 | OAuth credentials file referenced by `credentials_file` exists on disk | googledrive, dropbox, onedrive | `credentials file missing: PATH` — fix is to re-download `credentials.json` from the provider's developer console |
 | Credentials check skipped (inline in YAML or default chain) | webdav, sftp, s3 | info-only line, never a failure |
+| Credentials check skipped (inline in YAML) | webdav, sftp, smb | info-only line, never a failure |
 
 #### Tokens / inline auth material
 
@@ -1470,6 +1471,7 @@ The implementation runs the following checks in order. Every per-backend check r
 | `webdav_username` and `webdav_password` are non-empty in the YAML | webdav | `WebDAV credentials missing in config: PATH` |
 | `sftp_host`, `sftp_username`, `sftp_folder`, plus at least one of `sftp_key_file` or `sftp_password` are set | sftp | `SFTP config incomplete (missing FIELDS): PATH` |
 | `s3_bucket` is non-empty in the YAML; access key + secret are optional (boto3's default credential chain handles env vars / `~/.aws/credentials` / IAM role when blank) | s3 | `S3 config incomplete (s3_bucket): PATH` |
+| `smb_server`, `smb_share`, `smb_username`, `smb_password`, and `smb_folder` are non-empty in the YAML | smb | `SMB config incomplete (missing FIELDS): PATH` |
 
 #### Connectivity
 
@@ -1771,6 +1773,35 @@ Auth-class failures (`InvalidAccessKeyId`, `SignatureDoesNotMatch`, `AccessDenie
 
 - Backend is not `s3` — the deep section is gated on `backend_name == "s3"` and silently skipped for everything else.
 - Generic Check 3 (`s3_bucket` present in YAML) failed — the deep section still runs, but most checks degrade to "missing bucket" failures pointing back at the YAML.
+### SMB deep checks
+
+When `--backend smb` is in effect (explicitly via the flag, or because the primary / a Tier 2 mirror is `smb`), the doctor runs an additional six checks targeting SMB/CIFS-specific failure modes. These complement the generic credentials/connectivity loop; they don't replace it. Skipped silently for every other backend.
+
+| Check | Failure looks like |
+|---|---|
+| Server reachable (TCP connect to `smb_server:smb_port`) | `Server unreachable: HOST:PORT` (fix: verify the SMB service is up; default port is 445, legacy NetBIOS-over-TCP uses 139) or `Connection timed out` (fix: `ping HOST`, check firewall) |
+| SMB protocol negotiation (SMB2/3 only — SMBv1 rejected) | `Server only speaks SMBv1 — refusing to connect.` plus the explanatory line `SMBv1 is end-of-life and re-opens EternalBlue-class attack surface.` and a fix-hint pointing at the server's protocol settings. Non-v1 negotiation failures (handshake interrupted, dialect mismatch) surface as `SMB protocol negotiation failed` with a firewall / antivirus pointer |
+| Authentication via `register_session` | `SMB authentication rejected by HOST` — bad credentials, account locked, and domain mismatch all bucket as ONE auth-bucket failure with a fix-hint pointing at `smb_username` / `smb_password` / `smb_domain` in the YAML |
+| Share access (`scandir` on the share root) | `Share not found: \\\\HOST\\SHARE` (fix: `smb_share` in the YAML — list shares with `smbclient -L HOST -U USER`) or `Permission denied listing share` (auth-bucket failure pointing at share-level vs file-level ACLs) |
+| Folder write (sentinel `__claude_mirror_doctor_test`) | `Permission denied writing to PATH` — share access succeeded but file-level ACLs deny write; fix points at the underlying NTFS / POSIX permissions on `smb_folder` |
+| Encryption status (info-only) | `SMB3 encryption negotiated (per-message AES)` when requested+active. `SMB3 encryption requested but server negotiated down — wire traffic is NOT encrypted` (yellow warning, NOT a failure) when the server only supports SMB2. `SMB encryption disabled in config` when the user opted out via `smb_encryption: false` |
+
+#### Security gate: SMBv1 rejection
+
+The SMBv1 check is a hard refuse, not a warning. SMBv1 has been end-of-life since 2017 and re-introduces EternalBlue-class attack surface. The deep check fails immediately with the `POSSIBLE…` analogue ("refusing to connect") and the fix-hint points at the server's protocol settings rather than `claude-mirror auth` (re-authenticating won't help — we won't talk to v1 servers regardless). This mirrors the SFTP fingerprint-mismatch security gate in spirit.
+
+#### Auth-failure bucketing
+
+Auth-class failures (bad creds, share access denied, folder write denied) all funnel through ONE auth-bucket — at most one of these fires per run, and the remaining checks are short-circuited so the user doesn't see five copies of "your access is broken" rooted in the same problem.
+
+#### Lazy import
+
+`smbprotocol` and `smbclient` are lazy-imported inside the deep-check function so the import cost is only paid when `--backend smb` is actually exercising these checks. Generic `claude-mirror doctor` invocations on other backends remain fast.
+
+#### When the deep section is skipped
+
+- Backend is not `smb` — the deep section is gated on `backend_name == "smb"` and silently skipped for everything else.
+- Generic Check 3 (SMB credentials present in YAML) failed — the deep section still runs, but most checks degrade to "missing credentials" failures pointing back at the YAML.
 
 ### Sample Dropbox deep-check successful output
 
@@ -1825,10 +1856,11 @@ claude-mirror doctor --backend onedrive                           # generic chec
 ```
 
 The `--backend` filter is case-insensitive and accepts `googledrive`, `dropbox`, `onedrive`, `webdav`, `sftp`, or `ftp`. The primary config is always parsed; only the per-backend loop is filtered. Skipped backends print a dim `── skipped: NAME (PATH) — does not match --backend FILTER` line so the output stays self-explanatory.
+The `--backend` filter is case-insensitive and accepts `googledrive`, `dropbox`, `onedrive`, `webdav`, `sftp`, or `smb`. The primary config is always parsed; only the per-backend loop is filtered. Skipped backends print a dim `── skipped: NAME (PATH) — does not match --backend FILTER` line so the output stays self-explanatory.
 
 ### Where to go next
 
-- Credentials issues (missing `credentials.json`, OAuth client setup) — see the backend setup pages: [backends/google-drive.md](backends/google-drive.md), [backends/dropbox.md](backends/dropbox.md), [backends/onedrive.md](backends/onedrive.md), [backends/webdav.md](backends/webdav.md), [backends/sftp.md](backends/sftp.md).
+- Credentials issues (missing `credentials.json`, OAuth client setup) — see the backend setup pages: [backends/google-drive.md](backends/google-drive.md), [backends/dropbox.md](backends/dropbox.md), [backends/onedrive.md](backends/onedrive.md), [backends/webdav.md](backends/webdav.md), [backends/sftp.md](backends/sftp.md), [backends/smb.md](backends/smb.md).
 - Manifest corruption or surprising sync state — see [conflict-resolution.md](conflict-resolution.md) for how the manifest interacts with the conflict-detection flow.
 - Full flag list — [cli-reference.md#doctor](cli-reference.md#doctor).
 

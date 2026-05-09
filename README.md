@@ -41,6 +41,7 @@ Built originally for Claude Code projects (where most context lives in markdown)
 ## Supported storage backends
 
 Each backend ships in the base install — `pipx install claude-mirror` enables every backend (now seven, with S3 + FTP added in v0.5.65). Per-backend setup walkthroughs live under [docs/backends/](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/):
+Each backend ships in the base install — `pipx install claude-mirror` enables every one. Per-backend setup walkthroughs live under [docs/backends/](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/):
 
 | Backend | Latency | Setup | Reference |
 |---|---|---|---|
@@ -51,6 +52,7 @@ Each backend ships in the base install — `pipx install claude-mirror` enables 
 | **SFTP** | up to `poll_interval` (default 30s) | SSH key (preferred) or password — any OpenSSH-accessible server | [docs/backends/sftp.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/sftp.md) |
 | **S3-compatible** | up to `poll_interval` (default 30s) | Access key ID + secret access key + bucket; endpoint URL for non-AWS services (R2, B2, MinIO, Wasabi, Spaces, Storj, Tigris, IDrive E2, Linode, Hetzner, …) | [docs/backends/s3.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/s3.md) |
 | **FTP / FTPS** | up to `poll_interval` (default 30s) | Host + username + password — cPanel / DirectAdmin / shared hosting / NAS. Plain FTP supported but use FTPS or the SFTP backend wherever possible | [docs/backends/ftp.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/ftp.md) |
+| **SMB/CIFS** | up to `poll_interval` (default 30s) | Server + share + username + password (or domain user) — Windows file shares, Synology, QNAP, TrueNAS, macOS Sharing | [docs/backends/smb.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/backends/smb.md) |
 
 ---
 
@@ -69,6 +71,7 @@ Plus, depending on the backend you choose:
 | SFTP | An SSH-accessible server (VPS / NAS / shared hosting / self-hosted Linux) — SSH key recommended, password fallback OK on LAN |
 | S3-compatible | An S3-compatible bucket (AWS / R2 / B2 / Wasabi / MinIO / Spaces / Storj / Tigris / IDrive E2 / Linode / Hetzner …) — access key ID + secret access key + bucket name |
 | FTP / FTPS | An FTP-accessible server (cPanel / DirectAdmin / legacy shared hosting / NAS). FTPS strongly recommended; plain FTP works but transmits credentials in cleartext — LAN-only |
+| SMB/CIFS | An SMB2/3 server — Windows file share, Synology / QNAP / TrueNAS NAS, macOS Sharing-enabled folder, or any Samba host. SMBv1 is refused (security) |
 
 ---
 

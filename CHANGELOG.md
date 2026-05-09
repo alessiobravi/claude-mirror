@@ -130,6 +130,29 @@ One implementation transparently supports AWS S3, Cloudflare R2, Backblaze B2 (S
 ### Tests
 
 - `pytest tests/` — **1151 passed, 3 skipped** locally on macOS (was 1101 + 50 new S3 tests + 1 init-wizard regression update).
+## [Unreleased]
+
+### Added — SMB/CIFS storage backend (BACKEND-SMB)
+
+Sync directly to Windows file shares, Synology / QNAP / TrueNAS NAS devices, macOS Sharing-enabled folders, or any other SMB2/3 share without configuring WebDAV first. SMB2/3 only (SMBv1 not supported — security). Per-message AES encryption negotiated on by default; falls back gracefully on SMB2-only servers. Adds `smbprotocol>=1.13` to base install (lazy-imported).
+
+- New backend module `claude_mirror/backends/smb.py` — full `StorageBackend` implementation. Lazy-imports `smbprotocol` / `smbclient` per the v0.5.61 fusepy precedent. Path-as-id (UNC paths in canonical backslash form). Uploads use `.tmp` + atomic replace so a crashed transfer never leaves a truncated file at the destination. Hashes computed client-side via streaming SHA-256 (SMB has no native hash primitive). `copy_file` round-trips through memory for files under 50 MiB and through a temp file above that — `smbclient` doesn't expose the SMB2 `FSCTL_SRV_COPYCHUNK` ioctl. The polling watcher (`PollingNotifier`) is reused as-is.
+- New SMB-specific config fields on `Config`: `smb_server`, `smb_port` (default 445), `smb_share`, `smb_username`, `smb_password` (stored at chmod 0600 same posture as `sftp_password`), `smb_domain` (folded into the canonical NTLM `DOMAIN\\user` form by the backend), `smb_folder`, `smb_encryption` (default true). `Config.root_folder` returns `smb_folder` for the SMB backend.
+- New CLI surfaces: `claude-mirror init --backend smb` + `claude-mirror init --wizard --backend smb` with the eight SMB-specific flags (`--smb-server`, `--smb-port`, `--smb-share`, `--smb-username`, `--smb-password`, `--smb-domain`, `--smb-folder`, `--smb-encryption/--no-smb-encryption`). The `clone` command grew the same flag set. Wizard validators reject empty server / share / username; port range-checked 1..65535.
+- New doctor deep checks (`_run_smb_deep_checks`): six-step probe — server reachable (TCP), SMB2/3 protocol negotiation (SMBv1 rejected as a SECURITY GATE — refuses to connect, fix-hint points at the server's protocol settings rather than `claude-mirror auth`), authentication via `register_session`, share access via `scandir`, folder write via a 1-byte sentinel, and an info-only encryption-status line that warns when SMB3 was requested but the server downgraded to plaintext. Auth-class failures bucket into ONE failure line so the user doesn't see five copies of the same root cause.
+- `tests/test_smb_backend.py` — 32 tests covering the full backend surface (auth, upload/download/list/copy/delete/hash, classify_error matrix, encryption flag wiring, UNC path translation, server-side-copy fallback). All offline via an in-memory `FakeShare` mock of the smbclient module surface.
+- `tests/test_doctor_smb_deep.py` — 11 tests covering each of the six deep checks (happy path + failure paths). Includes the SMBv1 security-gate regression: a v1-only server fails the run loudly and short-circuits the rest of the chain.
+- `tests/test_init_wizard.py` — extended with `test_run_wizard_smb_walks_through_prompts` reaching the SMB-specific server / share / username prompts.
+- `tests/test_dyn_comp.py` — updated `_list-backends` expectation to include `smb`.
+- `pyproject.toml` — new base dependency `smbprotocol>=1.13`. New mypy `ignore_missing_imports` overrides for `smbprotocol.*` and `smbclient.*` so `mypy --strict` stays clean.
+- `docs/backends/smb.md` — NEW. Quick-start recipes for Synology, QNAP, TrueNAS, Windows file share, macOS Sharing, and generic Samba. Config-field reference. Permission-model walkthrough (share-level vs file-level — common gotcha on Synology). Deep-check reference. Troubleshooting matrix.
+- `README.md` — backends table grew the SMB row; prerequisites table extended with the SMB row.
+- `docs/README.md` — backends index extended.
+- `docs/admin.md` — generic-doctor matrix extended with the SMB credential row, new `### SMB deep checks` section with the six-check matrix + auth-bucketing + lazy-import notes, `Where to go next` cross-link extended.
+- `docs/cli-reference.md` — top-level `--backend` choices and the SMB-specific flags appended to both `init` and `clone` flag tables.
+
+### Tests
+- `pytest tests/` — **1145 passed, 3 skipped** on macOS (1101 prior + 43 new SMB tests + 1 new init-wizard SMB test, less the renamed `_list-backends` regression test).
 - `mypy --strict claude_mirror/` — clean across 42 source files.
 
 ---

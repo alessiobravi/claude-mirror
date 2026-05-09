@@ -13,6 +13,7 @@ Per-backend setup, config fields, and troubleshooting:
 - [OneDrive](backends/onedrive.md) — Azure AD app, device-code login
 - [WebDAV](backends/webdav.md) — Nextcloud / OwnCloud / NAS / Apache mod_dav
 - [SFTP](backends/sftp.md) — SSH keys, host fingerprints, OpenSSH
+- [SMB/CIFS](backends/smb.md) — Windows file shares, Synology, QNAP, TrueNAS, macOS Sharing
 
 ## Operations and admin
 

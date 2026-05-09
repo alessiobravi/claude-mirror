@@ -257,6 +257,21 @@ class Config:
     # virtual-hosted-style URLs. AWS proper accepts both; default to
     # virtual-hosted-style.
     s3_use_path_style: bool = False
+    # SMB/CIFS-specific (BACKEND-SMB)
+    smb_server: str = ""        # hostname or IP of the SMB server
+    smb_port: int = 445         # default 445; some legacy hosts speak 139 (NetBIOS-over-TCP)
+    smb_share: str = ""         # share name, the segment after \\server\
+    smb_username: str = ""
+    # Stored plain in YAML at chmod 0600 — same posture as sftp_password.
+    # Internet-reachable shares should rely on SMB3 encryption (default on)
+    # to keep credentials and payloads off the wire in cleartext.
+    smb_password: str = ""
+    smb_domain: str = ""        # AD/NTLM domain; empty for workgroup auth
+    smb_folder: str = ""        # path within the share, e.g. "claude-mirror/myproject"
+    # Force SMB3 per-message AES encryption. SMB2-only servers negotiate
+    # down to plaintext — the doctor info-line surfaces the actual
+    # negotiated state so the user can see when encryption was downgraded.
+    smb_encryption: bool = True
     poll_interval: int = 30    # seconds between polling checks (WebDAV, OneDrive)
     # Slack notifications (optional, per-project)
     slack_enabled: bool = False
@@ -670,6 +685,8 @@ class Config:
                 from pathlib import Path as _Path
                 raw = _Path(self.project_path).name or "claude-mirror"
             return raw + "/"
+        if self.backend == "smb":
+            return self.smb_folder
         return self.drive_folder_id
 
     @property

@@ -164,3 +164,51 @@ def test_run_wizard_s3_walks_through_prompts(monkeypatch):
 
     with pytest.raises(_ReachedSummary):
         cli_module._run_wizard(backend_default="s3")
+def test_run_wizard_smb_walks_through_prompts(monkeypatch):
+    """Reach the SMB-specific auth-step prompts.
+
+    Confirms `_run_wizard(backend_default="smb")` lands in the SMB block
+    and exposes the `SMB server` / `SMB share` / `SMB username` prompts
+    in that order. We capture the LABELS of every click.prompt call up
+    to the first password prompt and assert the SMB-specific ones appear.
+    """
+    seen_labels: list[str] = []
+
+    answers = {
+        "Storage backend": "smb",
+        "Project directory": ".",
+        "SMB server": "nas.local",
+        "SMB port": 445,
+        "SMB share": "claude-mirror",
+        "SMB username": "alice",
+    }
+
+    class _StopHere(Exception):
+        pass
+
+    def fake_prompt(label, default=None, **kwargs):
+        text = str(label)
+        seen_labels.append(text)
+        for key, value in answers.items():
+            if key in text:
+                return value
+        # Anything else: stop the wizard so the test stays focused.
+        raise _StopHere()
+
+    def fake_getpass(*args, **kwargs):
+        # The SMB block calls getpass for the password.
+        seen_labels.append("SMB password (getpass)")
+        raise _StopHere()
+
+    monkeypatch.setattr(cli_module.click, "prompt", fake_prompt)
+    import getpass as _getpass
+    monkeypatch.setattr(_getpass, "getpass", fake_getpass)
+
+    with pytest.raises(_StopHere):
+        cli_module._run_wizard(backend_default="smb")
+
+    # The SMB block was reached and asked for server / port / share /
+    # username before getpass.
+    assert any("SMB server" in s for s in seen_labels), seen_labels
+    assert any("SMB share" in s for s in seen_labels), seen_labels
+    assert any("SMB username" in s for s in seen_labels), seen_labels

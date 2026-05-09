@@ -51,6 +51,7 @@ dependencies = [
     "paramiko>=3.0",   # SFTP backend (always installed — see [project.optional-dependencies] for back-compat aliases)
     "dropbox>=12.0",   # Dropbox backend (always installed — see [project.optional-dependencies] for back-compat aliases)
     "msal>=1.24",      # OneDrive backend (always installed — see [project.optional-dependencies] for back-compat aliases)
+    "smbprotocol>=1.13",   # SMB/CIFS backend (always installed — see [project.optional-dependencies] for back-compat aliases)
     "fusepy>=3.0",     # FUSE mount (always installed — see [project.optional-dependencies] for back-compat aliases). Pure Python; the kernel layer (macFUSE / WinFsp / libfuse) is installed separately per platform and only required at mount time, not install time.
     "boto3>=1.34",     # S3-compatible backend (always installed — see [project.optional-dependencies] for back-compat aliases). Lazy-imported inside claude_mirror/backends/s3.py so non-S3 invocations pay zero startup cost.
     # FTP / FTPS backend uses Python's stdlib `ftplib` — no third-party
@@ -130,6 +131,8 @@ module = [
     "paramiko.*",
     "dropbox.*",
     "msal.*",
+    "smbprotocol.*",
+    "smbclient.*",
     "googleapiclient.*",
     "google.api_core.*",
     "google.cloud.*",

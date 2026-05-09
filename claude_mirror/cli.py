@@ -35,7 +35,7 @@ from .notifications import NotificationBackend
 from .notifications.pubsub import PubSubNotifier
 from .notifier import Notifier, read_and_clear_inbox
 from .snapshots import SnapshotManager, _human_size
-from .sync import PullPlan, PushPlan, Status, STATUS_LABELS, SyncEngine
+from .sync import DeletePlan, PullPlan, PushPlan, Status, STATUS_LABELS, SyncEngine
 
 
 def _get_version() -> str:
@@ -4088,6 +4088,103 @@ def _render_pull_plan(plan: PullPlan) -> None:
     )
 
 
+def _plan_delete(
+    engine: SyncEngine,
+    config: Config,
+    files: list[str],
+    *,
+    local: bool,
+) -> DeletePlan:
+    """Classify each requested path against the live status pass without
+    issuing any deletes. Mirrors the side-effect-free contract of
+    `SyncEngine.push(dry_run=True)` / `pull(dry_run=True)`.
+    """
+    states = engine.get_status()
+    state_map = {s.rel_path: s for s in states}
+
+    to_delete_remote: list[str] = []
+    to_delete_local: list[str] = []
+    not_found: list[str] = []
+    local_only: list[str] = []
+
+    for rel_path in files:
+        state = state_map.get(rel_path)
+        if not state:
+            not_found.append(rel_path)
+            continue
+        if state.drive_file_id:
+            to_delete_remote.append(rel_path)
+            if local:
+                local_path = Path(config.project_path) / rel_path
+                if local_path.exists():
+                    to_delete_local.append(rel_path)
+            continue
+        if local:
+            local_path = Path(config.project_path) / rel_path
+            if local_path.exists():
+                to_delete_local.append(rel_path)
+                continue
+        local_only.append(rel_path)
+
+    return DeletePlan(
+        to_delete_remote=to_delete_remote,
+        to_delete_local=to_delete_local,
+        not_found=not_found,
+        local_only=local_only,
+    )
+
+
+def _render_delete_plan(plan: DeletePlan, *, local: bool) -> None:
+    """Render `claude-mirror delete --dry-run` output. `-` markers for
+    every action a real run would take, plus a per-bucket summary and
+    the standard "no writes" footer.
+    """
+    has_action = bool(plan.to_delete_remote or plan.to_delete_local)
+    if not has_action and not plan.not_found and not plan.local_only:
+        console.print(
+            "[dim]Dry-run:[/] nothing to delete — every requested path is "
+            "already absent."
+        )
+        return
+
+    if has_action:
+        table = Table(
+            show_header=True, header_style="bold",
+            title="Delete plan (dry-run)",
+        )
+        table.add_column("Action")
+        table.add_column("Path")
+        for rel in plan.to_delete_remote:
+            table.add_row("[red]- remote[/]", rel)
+        for rel in plan.to_delete_local:
+            table.add_row("[red]- local[/]", rel)
+        console.print(table)
+
+    if plan.not_found:
+        for rel in plan.not_found:
+            console.print(f"  [yellow]⚠[/] {rel} — not found in project or remote storage")
+    if plan.local_only and not local:
+        for rel in plan.local_only:
+            console.print(
+                f"  [yellow]⚠[/] {rel} — present locally only; pass [bold]--local[/] to also "
+                "delete the local copy"
+            )
+
+    parts = []
+    if plan.to_delete_remote:
+        parts.append(f"{len(plan.to_delete_remote)} remote")
+    if plan.to_delete_local:
+        parts.append(f"{len(plan.to_delete_local)} local")
+    if parts:
+        console.print(f"[red]Would delete {' + '.join(parts)} file(s).[/]")
+    else:
+        console.print("[dim]No files matched for deletion.[/]")
+    console.print(
+        "[bold]Run without --dry-run to apply.[/] "
+        "[dim]No network writes, no local writes, no notifications were sent.[/]"
+    )
+
+
 @cli.command()
 @click.argument("path", type=str)
 @click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
@@ -4198,13 +4295,24 @@ def pull(files: tuple[Any, ...], config_path: str, output: str, dry_run: bool) -
 @click.argument("files", nargs=-1, required=True)
 @click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
 @click.option("--local", is_flag=True, default=False, help="Also delete the local file(s).")
-def delete(files: tuple[Any, ...], config_path: str, local: bool) -> None:
+@click.option("--dry-run/--no-dry-run", "dry_run", default=False,
+              help="Preview the run without removing anything from the remote, the manifest, or "
+                   "the local disk. No network writes, no local writes, no notifications.")
+def delete(files: tuple[Any, ...], config_path: str, local: bool, dry_run: bool) -> None:
     """Delete FILES from remote storage (and optionally local).
 
     Removes the specified files from the configured storage backend and clears
     their manifest entries. Use --local to also delete the local copies.
     """
-    engine, config, storage = _load_engine(_resolve_config(config_path), with_pubsub=True)
+    engine, config, storage = _load_engine(
+        _resolve_config(config_path),
+        with_pubsub=not dry_run,
+    )
+
+    if dry_run:
+        plan = _plan_delete(engine, config, list(files), local=local)
+        _render_delete_plan(plan, local=local)
+        return
 
     deleted: list[str] = []
 

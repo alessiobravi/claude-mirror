@@ -53,7 +53,7 @@ claude-mirror sync        [--no-prompt --strategy {keep-local|keep-remote}] [--c
 claude-mirror push        [FILES...] [--force-local] [--config PATH]
 claude-mirror pull        [FILES...] [--output PATH] [--config PATH]
 claude-mirror diff        PATH [--context N] [--config PATH]
-claude-mirror delete      FILES... [--local] [--config PATH]
+claude-mirror delete      FILES... [--local] [--dry-run/--no-dry-run] [--config PATH]
 claude-mirror watch       [--config PATH]
 claude-mirror watch-all   [--config PATH ...]   (default: all configs in ~/.config/claude_mirror/)
 claude-mirror reload
@@ -499,6 +499,8 @@ Print a colorized unified diff (remote → local) for one file, in standard `git
 ### `delete`
 
 Delete files from the remote (and locally with `--local`). Used to remove files that are no longer relevant or were committed by mistake.
+
+`--dry-run / --no-dry-run` previews what a real delete would remove — no backend writes, no manifest mutations, no local unlinks, no notifications. The output is a `Delete plan (dry-run)` table with `- remote` / `- local` rows, plus per-path warnings for paths that aren't found anywhere or that exist locally only and would be skipped without `--local`. Mirrors the same dry-run UX as `push --dry-run` / `pull --dry-run` / `restore --dry-run`.
 
 ### `watch`
 

@@ -119,6 +119,25 @@ class PullPlan:
     total_files: int
 
 
+@dataclass
+class DeletePlan:
+    """Read-only preview of what `delete FILES...` would do. No backend
+    writes, no local unlinks, no manifest mutations, no notifications.
+
+    `to_delete_remote` lists files that would be removed from the
+    primary backend (and every Tier 2 mirror via the recorded per-backend
+    file ids). `to_delete_local` lists files where `--local` was set AND
+    the local copy exists on disk. `not_found` covers paths that don't
+    exist on either side. `local_only` covers paths absent from the
+    remote but present locally — they only get touched if `--local` is
+    passed (otherwise they're silent skips by design).
+    """
+    to_delete_remote: list[str]
+    to_delete_local: list[str]
+    not_found: list[str]
+    local_only: list[str]
+
+
 class SyncEngine:
     def __init__(
         self,

@@ -4,6 +4,23 @@ All notable changes to claude-mirror.
 
 ---
 
+## [Unreleased]
+
+### Added — `delete --dry-run` preview mode
+
+Symmetry with the v0.5.57 `push --dry-run` / `pull --dry-run` plumbing: `claude-mirror delete` now accepts `--dry-run / --no-dry-run`. A dry-run run prints exactly what a real run would remove from the remote and (when `--local` is also set) from local disk, without making any backend writes, manifest mutations, local unlinks, or notification dispatches. Completes the dry-run coverage across every mutating command — `push`, `pull`, `delete`, `restore`, `forget`, `prune`, `gc`, `seed-mirror`, `retry`, `update` all now honor `--dry-run`.
+
+- `claude_mirror/sync.py` — new `DeletePlan` dataclass: `to_delete_remote: list[str]`, `to_delete_local: list[str]`, `not_found: list[str]`, `local_only: list[str]`. Mirrors the `PushPlan` / `PullPlan` shape so the CLI render path is uniform across all three.
+- `claude_mirror/cli.py` — `delete` command grows `--dry-run / --no-dry-run` with the same help string shape as push/pull. New `_plan_delete()` helper classifies each requested path against the live status pass; new `_render_delete_plan()` prints a Rich `Delete plan (dry-run)` table with `- remote` / `- local` rows plus per-path warnings for `not_found` and `local_only-without---local`. The dry-run path constructs the engine with `with_pubsub=False` so a Pub/Sub setup error in a cron-only environment doesn't surface as a fake failure on a preview command.
+- `tests/test_delete_dry_run.py` — new module, **16 tests:** the full bucket-classification matrix (`to_delete_remote` / `to_delete_local` / `not_found` / `local_only`), the `--local` flag composing with planning correctly, side-effect-absence guards (no `delete_file` on the backend, no `unlink` on local files, manifest bytes + mtime byte-identical before vs after), CLI exits 0 with the expected summary, the unknown-path warning, the `--local`-flag-missing warning, and a regression guard ensuring the real (non-dry-run) path still deletes after the wiring change.
+- `docs/cli-reference.md` — `### delete` subsection updated with the new flag; the top-level command list shows `[--dry-run/--no-dry-run]`.
+- `README.md` — Daily usage cheatsheet annotated.
+
+### Documentation
+- `### Total surface area for v0.5.56` → `v0.5.57` (typo carried over from the v0.5.56 → v0.5.57 renumber).
+
+---
+
 ## [0.5.57] — 2026-05-09
 
 Five new user-facing commands and command modes ship together: `push --dry-run` / `pull --dry-run` preview mode, `log --follow` for live streaming, `status --presence` for collaborator visibility, `claude-mirror health` for monitoring-tool integration, and `claude-mirror clone` for one-shot machine bootstrap. Plus a docs cleanup pass (DOC-CLEAN) fixing 6 stale README anchors trimmed during the v0.5.36 doc split, with two new admin.md subsections ("Filtering which events fire", "Is the watcher actually running?"), and a follow-up `mypy --strict` pass that surfaced 5 type-correctness issues across the new code (explicit `return None` on the `push` / `pull` engine paths, `assert plan is not None` narrowing on the `--dry-run` callers, `redact_error(str(exc))` coercion on the presence error path).
@@ -124,7 +141,7 @@ The presence-fetch phase appears as a progress row labelled "Presence" with a li
 - New `### Filtering which events fire` subsection in `docs/admin.md` under `## Notifications` — table of the four dials operators have for shaping notification volume (`*_enabled`, `exclude_patterns` / `.claude_mirror_ignore`, route `on:` filter, route `paths:` filter), with the order-of-evaluation contract spelled out and the heartbeat-event exception documented.
 - New `### Is the watcher actually running?` subsection in `docs/admin.md` under `## Auto-start the watcher` — explicit `launchctl list | grep claude-mirror` (macOS), `systemctl --user status claude-mirror-watch` (Linux), `pgrep -f "claude-mirror watch-all"` (any POSIX), and Windows guidance to use the `--once` polling form via Task Scheduler. Plus log-tail commands per platform and the `claude-mirror reload` re-scan hint.
 
-### Total surface area for v0.5.56
+### Total surface area for v0.5.57
 
 - **918 tests pass locally on macOS** (831 baseline + 87 new): 36 push/pull dry-run + 7 log follow + 17 presence + 22 health + 5 clone.
 - 5 new top-level commands or command modes; 2 new modules (`claude_mirror/_presence.py`, `claude_mirror/_health.py`); `init` and `auth` refactored into reusable `_run_init` / `_run_auth` helpers so the new `clone` command shares the same code path; `_NO_WATCHER_CHECK_CMDS` extended for the new `--json`-quiet `health` command; `--json` envelope schema bumped to v1.1 (additive — `presence` key only emitted when `status --presence` is set).

@@ -294,6 +294,8 @@ claude-mirror pull                      # download remote-ahead files
 claude-mirror pull --output DIR         # preview to DIR without touching local files
 claude-mirror pull --dry-run            # preview the download plan; no network reads, no local writes
 claude-mirror diff path/to/file.md      # colourised unified diff (remote → local)
+claude-mirror delete file.md --dry-run  # preview what a real delete would remove; no writes
+claude-mirror delete file.md --local    # remove from remote AND local disk
 claude-mirror sync                      # full bidirectional with conflict prompts
 claude-mirror sync --no-prompt --strategy keep-local   # cron-friendly: auto-resolve all conflicts
 claude-mirror watch                     # foreground watcher; system notification on remote pushes

@@ -1883,6 +1883,88 @@ def init(
     only collects the project-specific fields (drive_folder_id, dropbox_folder,
     sftp_folder, ...).
     """
+    _run_init(
+        project=project,
+        backend_opt=backend_opt,
+        drive_folder_id=drive_folder_id,
+        gcp_project_id=gcp_project_id,
+        pubsub_topic_id=pubsub_topic_id,
+        dropbox_app_key=dropbox_app_key,
+        dropbox_folder=dropbox_folder,
+        onedrive_client_id=onedrive_client_id,
+        onedrive_folder=onedrive_folder,
+        webdav_url=webdav_url,
+        webdav_username=webdav_username,
+        webdav_password=webdav_password,
+        webdav_insecure_http=webdav_insecure_http,
+        sftp_host=sftp_host,
+        sftp_port=sftp_port,
+        sftp_username=sftp_username,
+        sftp_key_file=sftp_key_file,
+        sftp_password=sftp_password,
+        sftp_known_hosts_file=sftp_known_hosts_file,
+        sftp_strict_host_check=sftp_strict_host_check,
+        sftp_folder=sftp_folder,
+        poll_interval=poll_interval,
+        slack_webhook_url=slack_webhook_url,
+        slack_channel=slack_channel,
+        slack_flag=slack_flag,
+        snapshot_format_opt=snapshot_format_opt,
+        patterns=patterns,
+        exclude_patterns=exclude_patterns,
+        credentials_file=credentials_file,
+        token_file=token_file,
+        config_path=config_path,
+        wizard=wizard,
+        auto_pubsub_setup=auto_pubsub_setup,
+    )
+
+
+def _run_init(
+    *,
+    project: str,
+    backend_opt: str,
+    drive_folder_id: str,
+    gcp_project_id: str,
+    pubsub_topic_id: str,
+    dropbox_app_key: str,
+    dropbox_folder: str,
+    onedrive_client_id: str,
+    onedrive_folder: str,
+    webdav_url: str,
+    webdav_username: str,
+    webdav_password: str,
+    webdav_insecure_http: bool,
+    sftp_host: str,
+    sftp_port: int,
+    sftp_username: str,
+    sftp_key_file: str,
+    sftp_password: str,
+    sftp_known_hosts_file: str,
+    sftp_strict_host_check: bool,
+    sftp_folder: str,
+    poll_interval: int,
+    slack_webhook_url: str,
+    slack_channel: str,
+    slack_flag: bool,
+    snapshot_format_opt: str,
+    patterns: tuple[str, ...],
+    exclude_patterns: tuple[str, ...],
+    credentials_file: str,
+    token_file: str,
+    config_path: str,
+    wizard: bool,
+    auto_pubsub_setup: bool,
+    create_project_if_missing: bool = False,
+) -> tuple[str, Config]:
+    """Module-level implementation of `init`. Returns (config_path, Config).
+
+    Shared by the `init` and `clone` Click commands so the same validation,
+    wizard, profile-inheritance, and YAML-write code path runs in both
+    cases. `create_project_if_missing=True` is set by `clone` because
+    bootstrapping a fresh machine should create the local project dir on
+    the user's behalf rather than erroring out.
+    """
     # Ensure config directory exists before anything else
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -2074,8 +2156,14 @@ def init(
 
         project_path = str(Path(project).expanduser().resolve())
         if not Path(project_path).exists():
-            console.print(f"[red]Project path does not exist: {project_path}[/]")
-            sys.exit(1)
+            if create_project_if_missing:
+                # `clone` lands here on a fresh machine — the local project
+                # directory naturally does not exist yet. Create it so the
+                # subsequent pull has a destination.
+                Path(project_path).mkdir(parents=True, exist_ok=True)
+            else:
+                console.print(f"[red]Project path does not exist: {project_path}[/]")
+                sys.exit(1)
 
         credentials_file = str(Path(credentials_file).expanduser())
         if not token_file:
@@ -2259,6 +2347,8 @@ def init(
     # Auto-reload the watcher if it is running
     _try_reload_watcher()
 
+    return config_path, config
+
 
 @cli.command()
 @click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
@@ -2286,15 +2376,24 @@ def auth(config_path: str, check: bool, keep_existing: bool) -> None:
     --keep-existing skips the move-aside step (refresh-then-fallback semantics
     of older versions) — useful for diagnosing whether refresh works.
     """
+    _run_auth(config_path=config_path, check=check, keep_existing=keep_existing)
+
+
+def _run_auth(
+    *,
+    config_path: str,
+    check: bool = False,
+    keep_existing: bool = False,
+) -> None:
+    """Module-level implementation of `auth`. Shared by the `auth` and
+    `clone` Click commands so the same backup-and-restore semantics, OAuth
+    flow, and notifier setup run in both cases."""
     import shutil as _shutil
     config = Config.load(_resolve_config(config_path))
     if check:
         _auth_check(config)
         return
 
-    # Move existing token aside so the backend's authenticate() sees no
-    # cached credential and goes straight to the interactive OAuth flow.
-    # Restore on any failure — never leave the user worse off than before.
     token_path = Path(config.token_file)
     backup_path: Optional[Path] = None
     if token_path.exists() and not keep_existing:
@@ -2305,23 +2404,18 @@ def auth(config_path: str, check: bool, keep_existing: bool) -> None:
         storage = _create_storage(config)
         creds = storage.authenticate()
     except BaseException:
-        # OAuth flow failed (Ctrl-C, network, browser error, bad credentials_file).
-        # Restore the prior token state so the user can retry without losing
-        # whatever (possibly broken but at least known) state they had.
         if backup_path and backup_path.exists() and not token_path.exists():
             _shutil.move(str(backup_path), str(token_path))
         raise
 
-    # OAuth succeeded — backup is no longer needed.
     if backup_path and backup_path.exists():
         try:
             backup_path.unlink()
         except OSError:
-            pass  # leave it; harmless
+            pass
 
     console.print("[green]Authentication successful.[/]")
 
-    # Set up notification backend
     try:
         notifier = _create_notifier(config, storage)
         if notifier:
@@ -2482,6 +2576,243 @@ def _auth_check(config: Config) -> None:
         "  2. Admin Console → Security → API controls → Manage Third-party app access\n"
         "  3. Set [bold]CLAUDE_MIRROR_AUTH_VERBOSE=1[/] before commands to log\n"
         "     refresh attempts to stderr."
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# clone — one-shot bootstrap from an existing remote project
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@cli.command()
+@click.option("--backend", "backend_opt", required=True,
+              type=click.Choice(_AVAILABLE_BACKENDS, case_sensitive=False),
+              shell_complete=_backend_value_completer,
+              help="Storage backend to clone from: googledrive | dropbox | onedrive | webdav | sftp.")
+@click.option("--project", "project", required=True, type=str,
+              help="Path to the local destination project directory. Created if missing.")
+@click.option("--drive-folder-id", default="", help="Google Drive folder ID to clone from.")
+@click.option("--gcp-project-id", default="", help="Google Cloud project ID (Drive only).")
+@click.option("--pubsub-topic-id", default="", help="Pub/Sub topic ID (Drive only).")
+@click.option("--dropbox-app-key", default="", help="Dropbox app key.")
+@click.option("--dropbox-folder", default="", help="Dropbox folder path (e.g. /claude-mirror/myproject).")
+@click.option("--onedrive-client-id", default="", help="Azure app registration client ID.")
+@click.option("--onedrive-folder", default="", help="OneDrive folder path (e.g. claude-mirror/myproject).")
+@click.option("--webdav-url", default="", help="WebDAV server URL.")
+@click.option("--webdav-username", default="", help="WebDAV username.")
+@click.option("--webdav-password", default="", help="WebDAV password or app password.")
+@click.option("--webdav-insecure-http", "webdav_insecure_http", is_flag=True, default=False,
+              help="Allow http:// WebDAV URLs (cleartext basic-auth). NOT recommended.")
+@click.option("--sftp-host", default="", help="SFTP server hostname or IP.")
+@click.option("--sftp-port", default=22, show_default=True, type=int,
+              help="SFTP server port (1..65535).")
+@click.option("--sftp-username", default="", help="SFTP username.")
+@click.option("--sftp-key-file", default="",
+              help="Path to SSH private key for SFTP auth (tilde-expanded).")
+@click.option("--sftp-password", default="",
+              help="SFTP password (LAN-only fallback; stored plain in YAML).")
+@click.option("--sftp-known-hosts-file", default="~/.ssh/known_hosts", show_default=True,
+              help="Path to SSH known_hosts file used for host-key verification.")
+@click.option("--sftp-strict-host-check/--no-sftp-strict-host-check",
+              "sftp_strict_host_check", default=True, show_default=True,
+              help="Reject unknown SFTP host fingerprints.")
+@click.option("--sftp-folder", default="",
+              help="Absolute server-side folder path for SFTP storage (must start with '/').")
+@click.option("--credentials-file", "credentials_file", default=_DEFAULT_CREDENTIALS, show_default=True,
+              help="Path to Google OAuth2 credentials JSON for this project (Drive only).")
+@click.option("--token-file", "token_file", default="",
+              help="Path to store the OAuth2 token. Auto-derived from credentials filename if omitted.")
+@click.option("--config", "config_path", default="",
+              help="Path to write the config file. Defaults to ~/.config/claude_mirror/<project>.yaml.")
+@click.option("--patterns", multiple=True, default=["**/*.md"], show_default=True,
+              help="File glob patterns to sync (can repeat).")
+@click.option("--exclude", "exclude_patterns", multiple=True, default=[],
+              help="Glob patterns to exclude from sync (can repeat).")
+@click.option("--poll-interval", "poll_interval", default=30, show_default=True, type=int,
+              help="Polling interval in seconds for backends without push notifications.")
+@click.option("--no-pull", "no_pull", is_flag=True, default=False,
+              help="Skip the post-auth pull. Useful when seeding a brand-new remote in the next step.")
+@click.option("--wizard", is_flag=True, default=False,
+              help="Launch the interactive setup wizard instead of specifying flags.")
+def clone(
+    backend_opt: str,
+    project: str,
+    drive_folder_id: str,
+    gcp_project_id: str,
+    pubsub_topic_id: str,
+    dropbox_app_key: str,
+    dropbox_folder: str,
+    onedrive_client_id: str,
+    onedrive_folder: str,
+    webdav_url: str,
+    webdav_username: str,
+    webdav_password: str,
+    webdav_insecure_http: bool,
+    sftp_host: str,
+    sftp_port: int,
+    sftp_username: str,
+    sftp_key_file: str,
+    sftp_password: str,
+    sftp_known_hosts_file: str,
+    sftp_strict_host_check: bool,
+    sftp_folder: str,
+    credentials_file: str,
+    token_file: str,
+    config_path: str,
+    patterns: tuple[str, ...],
+    exclude_patterns: tuple[str, ...],
+    poll_interval: int,
+    no_pull: bool,
+    wizard: bool,
+) -> None:
+    """Bootstrap a fresh machine from an existing remote project in one command.
+
+    Runs init, auth, and the first pull as three phases against the same
+    config — exactly what a new machine joining an existing project needs.
+    Pass `--no-pull` to stop after auth (useful when this machine is the one
+    seeding a brand-new remote). Pass `--wizard` to fill the backend-specific
+    fields interactively instead of via flags.
+
+    On any phase failure, the config file written by the init phase is rolled
+    back so the next attempt starts clean. The error message points at the
+    right next-step (re-run `clone`, or pick up at `auth` / `pull` directly).
+    """
+    from ._progress import make_phase_progress
+
+    written_config_path: Optional[str] = None
+    written_token_path: Optional[str] = None
+    project_dir_created: Optional[Path] = None
+
+    abs_project = str(Path(project).expanduser().resolve())
+    project_existed_before = Path(abs_project).exists()
+
+    def _rollback() -> None:
+        if written_token_path:
+            try:
+                tp = Path(written_token_path)
+                if tp.exists():
+                    tp.unlink()
+            except OSError:
+                pass
+        if written_config_path:
+            try:
+                cp = Path(written_config_path)
+                if cp.exists():
+                    cp.unlink()
+            except OSError:
+                pass
+        if project_dir_created is not None and project_dir_created.exists():
+            try:
+                # Only remove if we created it AND it's still empty — never
+                # delete user data.
+                if not any(project_dir_created.iterdir()):
+                    project_dir_created.rmdir()
+            except OSError:
+                pass
+
+    with make_phase_progress(console) as progress:
+        init_task = progress.add_task(
+            "Initializing", total=1, detail="[1/3] writing config", show_time=True,
+        )
+        try:
+            written_config_path, cfg = _run_init(
+                project=project,
+                backend_opt=backend_opt,
+                drive_folder_id=drive_folder_id,
+                gcp_project_id=gcp_project_id,
+                pubsub_topic_id=pubsub_topic_id,
+                dropbox_app_key=dropbox_app_key,
+                dropbox_folder=dropbox_folder,
+                onedrive_client_id=onedrive_client_id,
+                onedrive_folder=onedrive_folder,
+                webdav_url=webdav_url,
+                webdav_username=webdav_username,
+                webdav_password=webdav_password,
+                webdav_insecure_http=webdav_insecure_http,
+                sftp_host=sftp_host,
+                sftp_port=sftp_port,
+                sftp_username=sftp_username,
+                sftp_key_file=sftp_key_file,
+                sftp_password=sftp_password,
+                sftp_known_hosts_file=sftp_known_hosts_file,
+                sftp_strict_host_check=sftp_strict_host_check,
+                sftp_folder=sftp_folder,
+                poll_interval=poll_interval,
+                slack_webhook_url="",
+                slack_channel="",
+                slack_flag=False,
+                snapshot_format_opt="blobs",
+                patterns=patterns,
+                exclude_patterns=exclude_patterns,
+                credentials_file=credentials_file,
+                token_file=token_file,
+                config_path=config_path,
+                wizard=wizard,
+                auto_pubsub_setup=False,
+                create_project_if_missing=True,
+            )
+        except SystemExit:
+            raise
+        except BaseException as e:
+            progress.update(init_task, advance=1, detail=f"[1/3] FAILED: {e}")
+            console.print(f"[red]✗ init failed: {e}[/]")
+            _rollback()
+            raise SystemExit(1)
+
+        if not project_existed_before and Path(abs_project).exists():
+            project_dir_created = Path(abs_project)
+        progress.update(init_task, advance=1, detail=f"[1/3] config: {written_config_path}")
+
+        auth_task = progress.add_task(
+            "Authenticating", total=1, detail="[2/3] running OAuth flow", show_time=True,
+        )
+        written_token_path = cfg.token_file
+        try:
+            _run_auth(config_path=written_config_path, check=False, keep_existing=False)
+        except SystemExit:
+            raise
+        except BaseException as e:
+            progress.update(auth_task, advance=1, detail=f"[2/3] FAILED: {e}")
+            console.print(
+                f"[red]✗ auth failed: {e}[/]\n"
+                f"The config at {written_config_path} has been removed. "
+                f"Re-run [bold]claude-mirror clone[/] to retry from scratch."
+            )
+            _rollback()
+            raise SystemExit(1)
+        progress.update(auth_task, advance=1, detail=f"[2/3] token: {written_token_path}")
+
+        if no_pull:
+            console.print(
+                f"[green]✓ clone complete (auth-only).[/] "
+                f"Run [bold]claude-mirror pull --config {written_config_path}[/] "
+                f"when you are ready to download the remote files."
+            )
+            return
+
+        pull_task = progress.add_task(
+            "Pulling", total=1, detail="[3/3] downloading remote files", show_time=True,
+        )
+
+    # The pull phase uses its own multi-row progress UI inside SyncEngine,
+    # so we exit the outer phase Progress before invoking it. The phase
+    # rows above remain on screen as the persistent breadcrumb.
+    try:
+        engine, _, _ = _load_engine(written_config_path, with_pubsub=False)
+        engine.pull(None, output_dir=None)
+    except SystemExit:
+        raise
+    except BaseException as e:
+        console.print(
+            f"[red]✗ pull failed: {e}[/]\n"
+            f"Config and token were written successfully. "
+            f"Fix the issue and re-run [bold]claude-mirror pull --config {written_config_path}[/]."
+        )
+        raise SystemExit(1)
+
+    console.print(
+        f"[bold green]✓ clone complete.[/] "
+        f"Project ready at {abs_project}."
     )
 
 

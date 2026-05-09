@@ -95,6 +95,25 @@ The presence-fetch phase appears as a progress row labelled "Presence" with a li
 
 - `pytest tests/test_health.py` — **22 passed locally** on macOS in 0.22s.
 
+### Added — `claude-mirror clone` for one-shot machine bootstrap
+
+- New top-level `clone` command that bootstraps a fresh machine from an existing remote project in one shot. Combines `init` + `auth` + the first `pull` into a single multi-phase invocation, so a new laptop joining an existing project goes from zero to fully-synced with one command instead of three.
+- Supports both **flag-driven** (`claude-mirror clone --backend googledrive --project ~/proj --drive-folder-id <FOLDER_ID> --gcp-project-id <GCP_ID> --pubsub-topic-id <TOPIC>`) and **interactive** (`claude-mirror clone --wizard --backend <NAME> --project <PATH>`) modes — the wizard reuses the same `_run_wizard` machinery `init --wizard` already drives, with the same per-backend prompts and validators.
+- Per-backend identity flags mirror `init` for Google Drive, Dropbox, OneDrive, WebDAV, and SFTP so the same flag set works against any backend.
+- `--no-pull` halts after the auth phase. Useful when this is the machine **seeding** a brand-new remote (no remote files yet to pull, but you still want config + token in place).
+- **Rollback on partial failure.** If the auth phase raises, the YAML written by the init phase is removed before the command exits non-zero, so the next attempt starts from a clean state. If the pull phase fails, the YAML + token are kept (auth succeeded) and the error message points the user at `claude-mirror pull --config <PATH>` to retry just the last step.
+- Live phase progress: `[1/3] Initializing...`, `[2/3] Authenticating...`, `[3/3] Pulling...` rendered via the existing `make_phase_progress` factory so the user sees which step is running and which one failed.
+- **Refactored** rather than duplicated: `init` and `auth` bodies were extracted into module-level `_run_init(...)` / `_run_auth(...)` helpers that both the existing Click commands and the new `clone` command call directly. No `Runner.invoke(init, [...])` re-invocation games — the same code path runs end-to-end.
+
+### Updated docs/files
+- `claude_mirror/cli.py` — new `clone` command (~210 lines), `_run_init`/`_run_auth` helper extraction; `init` and `auth` are now thin shims over the helpers; `_run_init` gains a `create_project_if_missing` flag so the clone path creates the destination directory on a fresh machine.
+- `tests/test_clone.py` — 5 new tests (Drive happy path, `--no-pull`, auth-failure rollback, `--wizard` mode, SFTP variant). All offline, all <100ms each, all using `FakeStorageBackend` from `tests/conftest.py`.
+- `docs/cli-reference.md` — new `### clone` subsection in the `## Setup` group with the full flag list and the rollback-on-failure contract spelled out, plus a cross-link to `docs/scenarios.md` Scenario B (personal multi-machine sync — clone is exactly that scenario's bootstrap step).
+- `README.md` — new "Cloning to a new machine" section near "Your first project" with the one-line invocation.
+
+### Tests
+- `pytest tests/test_clone.py` — **5 passed locally** on macOS; existing init / auth / wizard regressions all still pass after the helper extraction.
+
 ---
 
 ## [0.5.55] — 2026-05-09

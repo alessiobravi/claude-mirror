@@ -237,6 +237,26 @@ claude-mirror push       # upload the local-ahead files; creates a snapshot
 
 > Each collaborator runs `claude-mirror auth` (or `init --wizard` for SFTP-key setups) on their own machine with their own credentials. Tokens are unique per machine, never shared.
 
+### Cloning to a new machine
+
+When the project already exists on the remote (e.g. you set it up on your laptop yesterday and you're now on your desktop, or a teammate is joining a shared project), `claude-mirror clone` does init + auth + the first pull in one shot — instead of three separate commands:
+
+```bash
+claude-mirror clone --backend googledrive \
+                    --project ~/projects/myproject \
+                    --drive-folder-id <FOLDER_ID> \
+                    --gcp-project-id <GCP_ID> \
+                    --pubsub-topic-id <TOPIC>
+```
+
+Or interactively — same wizard prompts as `init --wizard`:
+
+```bash
+claude-mirror clone --wizard --backend googledrive --project ~/projects/myproject
+```
+
+If auth fails, the partial YAML is rolled back automatically so the next attempt starts clean. Use `--no-pull` when this machine is the one **seeding** a brand-new remote (config + token in place, nothing yet to download). Full flag list and rollback semantics in [docs/cli-reference.md — `clone`](https://github.com/alessiobravi/claude-mirror/blob/main/docs/cli-reference.md#clone); the multi-machine workflow this command serves is [docs/scenarios.md — Scenario B](https://github.com/alessiobravi/claude-mirror/blob/main/docs/scenarios.md#b-personal-multi-machine-sync).
+
 ### Multiple projects on the same machine
 
 Repeat `init --wizard` once per project. Every project gets its own config file at `~/.config/claude_mirror/<project>.yaml`. Different projects on the same machine can use different backends — Drive for one, SFTP for another, WebDAV for a third. All commands auto-detect the right config from the current working directory.

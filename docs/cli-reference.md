@@ -29,6 +29,22 @@ claude-mirror init        [--wizard]
                         [--token-file PATH] [--patterns GLOB ...] [--exclude GLOB ...] [--config PATH]
                         [--auto-pubsub-setup]      # googledrive only: auto-create Pub/Sub topic + per-machine subscription + IAM grant after auth
 claude-mirror auth        [--check] [--config PATH]
+claude-mirror clone       --backend googledrive|dropbox|onedrive|webdav|sftp
+                        --project PATH
+                        [--drive-folder-id ID] [--gcp-project-id ID] [--pubsub-topic-id ID]
+                        [--credentials-file PATH]
+                        [--dropbox-app-key KEY] [--dropbox-folder PATH]
+                        [--onedrive-client-id ID] [--onedrive-folder PATH]
+                        [--webdav-url URL] [--webdav-username USER] [--webdav-password PASS]
+                        [--webdav-insecure-http]
+                        [--sftp-host HOST] [--sftp-port PORT] [--sftp-username USER]
+                        [--sftp-key-file PATH] [--sftp-password PASS]
+                        [--sftp-known-hosts-file PATH] [--sftp-strict-host-check/--no-sftp-strict-host-check]
+                        [--sftp-folder PATH]
+                        [--poll-interval SECS]
+                        [--token-file PATH] [--patterns GLOB ...] [--exclude GLOB ...] [--config PATH]
+                        [--no-pull] [--wizard]
+                        # one-shot bootstrap: init + auth + first pull, with rollback on failure
 claude-mirror status      [--short] [--config PATH]
 claude-mirror status --pending                  [--config PATH]
 claude-mirror status --by-backend               [--config PATH]   # Tier 2: per-file table with one column per backend
@@ -350,6 +366,34 @@ See [README — Step 1: Initialize](../README.md#step-1-initialize) for the wiza
 - [backends/onedrive.md](backends/onedrive.md)
 - [backends/webdav.md](backends/webdav.md)
 - [backends/sftp.md](backends/sftp.md)
+
+### `clone`
+
+One-shot bootstrap from an existing remote project — combines `init` + `auth` + the first `pull` into a single multi-phase command. Use this when a new machine is joining a project that already exists on the remote (laptop + desktop sharing the same Drive folder, a developer cloning a team repo, a fresh re-install). The three phases run sequentially and are surfaced as `[1/3] Initializing...`, `[2/3] Authenticating...`, `[3/3] Pulling...` in the live progress display.
+
+`--backend NAME` and `--project PATH` are required. The destination directory at `--project PATH` is created if it does not exist. Per-backend identity flags mirror `init`:
+
+- Google Drive — `--drive-folder-id <FOLDER_ID> --gcp-project-id <GCP_ID> --pubsub-topic-id <TOPIC> --credentials-file <PATH>`
+- Dropbox — `--dropbox-app-key <KEY> --dropbox-folder <PATH>`
+- OneDrive — `--onedrive-client-id <CLIENT_ID> --onedrive-folder <PATH>`
+- WebDAV — `--webdav-url <URL> --webdav-username <USER> --webdav-password <PW>` (add `--webdav-insecure-http` only on closed-LAN test setups)
+- SFTP — `--sftp-host <HOST> --sftp-port <PORT> --sftp-username <USER> --sftp-key-file <KEY> --sftp-known-hosts-file <PATH> --sftp-folder <ABS_PATH>` (or `--sftp-password <PW>` instead of a key)
+
+Common flags:
+
+- `--config <PATH>` — override the auto-derived YAML location.
+- `--token-file <PATH>` — override the auto-derived token-file location.
+- `--patterns <GLOB>` (repeatable, default `**/*.md`), `--exclude <GLOB>` (repeatable), `--poll-interval <SECONDS>` — same semantics as `init`.
+- `--wizard` — drive the per-backend prompt sequence interactively; reuses the same `_run_wizard` flow as `init --wizard`.
+- `--no-pull` — stop after the auth phase. Use this when the local machine is the one **seeding** a fresh remote (config + token in place, no remote files to pull).
+
+**Rollback on partial failure:**
+
+- If the **init phase** fails (validation, missing required flag, write error), no YAML is left behind.
+- If the **auth phase** raises (OAuth error, invalid credentials, network failure), the YAML written by the init phase is removed before exiting non-zero so the next attempt starts clean. The error message points the user at re-running `claude-mirror clone`.
+- If the **pull phase** fails (the YAML and token both wrote successfully, only the first download failed), the config + token are kept and the error message points the user at `claude-mirror pull --config <PATH>` to retry just the last step.
+
+`clone` is the bootstrap step described in [scenarios.md — Scenario B (Personal multi-machine sync)](scenarios.md#b-personal-multi-machine-sync) and the multi-user join in [Scenario C](scenarios.md#c-multi-user-collaboration).
 
 ### `auth`
 

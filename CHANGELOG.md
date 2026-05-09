@@ -4,6 +4,24 @@ All notable changes to claude-mirror.
 
 ---
 
+## [Unreleased]
+
+### Added — AGENTS.md cross-tool sync recipe (AGENTS-MD)
+
+Documents claude-mirror as a first-mover sync tool for the cross-IDE `AGENTS.md` convention. `AGENTS.md` is the project-root markdown file read by Claude Code, Cursor, Codex, Antigravity, and any future agent IDE that converges on the same standard. The engine has always been able to sync any markdown file (default `file_patterns: ["**/*.md"]` already matches `AGENTS.md`); this change adds a worked recipe so users can copy-paste a narrowed pattern set that mirrors only the agent-context files rather than every markdown in the project.
+
+- `docs/profiles/agents-md.yaml` — new sample profile YAML, **~60 lines** including header comments. Sets `file_patterns` to the conservative inclusive default `["AGENTS.md", "**/AGENTS.md", ".AGENTS.md", "**/.AGENTS.md"]` and ships an `exclude_patterns` list covering `node_modules/`, `.venv/` / `venv/`, `**/__pycache__/`, `build/`, `dist/`, and `.git/` so generated dirs never leak in. Deliberately omits backend / credentials fields so the profile composes with whatever backend each project picks. Activation instructions in the file's header.
+- `docs/scenarios.md` — new **Scenario I. Cross-tool AGENTS.md sync** (~80 lines) added after Scenario H; index at the top updated. Same shape as Scenarios A–H: Purpose / How to implement / Daily ops behaviour / Pitfalls and tips, with copy-paste config blocks and cross-links back to `docs/profiles.md`, `docs/profiles/agents-md.yaml`, Scenario B (multi-machine layering), Scenario F (`file_patterns` reference), and `docs/conflict-resolution.md` (conflicts are more common in this scenario because every agent IDE may rewrite `AGENTS.md` as the user works).
+- `docs/profiles.md` — short paragraph + one-line install command added near the top under a new `### Worked sample: cross-tool AGENTS.md sync` subheading, linking out to the sample YAML and Scenario I.
+- `README.md` — value-prop paragraph extended with one sentence flagging cross-tool agent-context sync as a first-class scenario, linking the sample YAML and Scenario I. Documentation index entry under `docs/scenarios.md` updated from "seven deployment topologies" to "eight" with a new bullet for Scenario I.
+- `tests/test_profile.py` — new test `test_agents_md_sample_profile_loads_cleanly` (1 test, ~50 lines). Loads `docs/profiles/agents-md.yaml`, asserts the four `AGENTS.md` patterns and the key exclude entries are present, copies the file into the isolated profiles directory, and round-trips it through `load_profile` + `Config.load(profile=)` to prove the sample stays compatible with the dataclass schema. A future schema change in `Config` that breaks the doc sample will fail here, keeping docs and code aligned.
+
+### Tests
+- `pytest tests/test_profile.py` — **25 passed locally** on macOS in 0.23s (was 24, +1 for the new sample-loads-cleanly test).
+- `pytest tests/` — **941 passed, 3 skipped** locally on macOS in 4.67s (the 3 skips are the pre-existing `test_mypy_smoke.py` "mypy not installed" guards, unchanged).
+
+---
+
 ## [0.5.59] — 2026-05-09
 
 Windows credibility release: closes 7 of the 22 Windows test skips by making the inbox file lock and the `watch-all` hot-reload mechanism cross-platform. `watch-all` is now fully supported on Windows (was POSIX-only since the project's first release).

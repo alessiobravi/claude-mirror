@@ -6,6 +6,17 @@ A *profile* is a YAML file under `~/.config/claude_mirror/profiles/<name>.yaml` 
 
 Profiles are an optional convenience. A user with a single project never needs them. A user with five projects on the same Google account, or one work account + one personal account on the same laptop, gets a much simpler config tree by collapsing the duplicated fields into one place.
 
+### Worked sample: cross-tool AGENTS.md sync
+
+The repo ships a maintained sample profile at [`docs/profiles/agents-md.yaml`](./profiles/agents-md.yaml) that narrows `file_patterns` to the cross-tool `AGENTS.md` convention read by Claude Code, Cursor, Codex, and Antigravity. Drop it in to sync only agent-context files instead of every markdown in the project:
+
+```bash
+mkdir -p ~/.config/claude_mirror/profiles
+cp docs/profiles/agents-md.yaml ~/.config/claude_mirror/profiles/agents-md.yaml
+```
+
+Full walkthrough: [Scenario I. Cross-tool AGENTS.md sync](./scenarios.md#i-cross-tool-agentsmd-sync).
+
 ## Why profiles
 
 Without profiles, every project YAML on the same Google account looks like this:

@@ -1,0 +1,56 @@
+# claude-mirror profile: agents-md
+#
+# Syncs AGENTS.md across machines. AGENTS.md is the cross-tool standard
+# read by Claude Code, Cursor, Codex, Antigravity, and any future
+# agent IDE that converges on the same convention.
+#
+# Use this profile when you want claude-mirror to sync ONLY agent-context
+# files (AGENTS.md + per-directory variants) rather than every markdown
+# file in the project. Keeps the sync surface narrow + auditable.
+#
+# Activation:
+#   1. Save this file to ~/.config/claude_mirror/profiles/agents-md.yaml
+#      (the directory may need creating first):
+#
+#          mkdir -p ~/.config/claude_mirror/profiles
+#          cp docs/profiles/agents-md.yaml \
+#             ~/.config/claude_mirror/profiles/agents-md.yaml
+#
+#   2. Use globally for one command:
+#
+#          claude-mirror --profile agents-md status
+#
+#      Or pin per-project by adding the line `profile: agents-md` to the
+#      top of the project YAML at ~/.config/claude_mirror/<project>.yaml:
+#
+#          echo 'profile: agents-md' >> ~/.config/claude_mirror/<project>.yaml
+#
+#   3. Bring your own backend credentials in the project's YAML. This
+#      profile only sets the file-pattern filter; backend setup
+#      (Google Drive folder ID, Dropbox folder, SFTP host, etc.) stays
+#      per-project.
+#
+# Pattern set rationale:
+#   The four entries below are the conservative inclusive default — they
+#   match AGENTS.md at the project root, AGENTS.md anywhere in the tree
+#   (per-directory overrides that some agent tools read), plus the
+#   hidden-file .AGENTS.md variant that occasionally appears in the wild.
+#   Narrow if a tool you use reads only one form: e.g. drop the nested
+#   "**/AGENTS.md" if your team agreed AGENTS.md lives only at the root.
+
+description: "Cross-tool AGENTS.md sync — Claude Code / Cursor / Codex / Antigravity"
+
+file_patterns:
+  - "AGENTS.md"
+  - "**/AGENTS.md"
+  - ".AGENTS.md"
+  - "**/.AGENTS.md"
+
+exclude_patterns:
+  - "node_modules/**"
+  - ".venv/**"
+  - "venv/**"
+  - "**/__pycache__/**"
+  - "build/**"
+  - "dist/**"
+  - ".git/**"

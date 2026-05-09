@@ -532,3 +532,53 @@ class _StopAfterDriveFolder(Exception):
     """Sentinel — raised by the patched click.prompt to abort the wizard
     once the test has confirmed the credentials prompt was skipped."""
     pass
+
+
+# ─── docs/profiles/agents-md.yaml sample (AGENTS-MD) ───────────────────────
+
+def test_agents_md_sample_profile_loads_cleanly(
+    isolated_config_dir, tmp_path, monkeypatch
+):
+    """The docs/profiles/agents-md.yaml sample is a maintainer-curated
+    copy-paste source. Make sure it stays valid YAML that Config can
+    apply without errors. A future schema change in Config that breaks
+    the sample will fail here, so docs and code stay aligned."""
+    sample = (
+        Path(__file__).parent.parent / "docs" / "profiles" / "agents-md.yaml"
+    )
+    assert sample.exists(), f"Sample profile YAML missing at {sample}"
+
+    raw = yaml.safe_load(sample.read_text())
+    assert isinstance(raw, dict), "Sample must be a YAML mapping"
+
+    assert "AGENTS.md" in raw["file_patterns"]
+    assert "**/AGENTS.md" in raw["file_patterns"]
+    assert ".AGENTS.md" in raw["file_patterns"]
+    assert "**/.AGENTS.md" in raw["file_patterns"]
+
+    assert "node_modules/**" in raw["exclude_patterns"]
+    assert ".git/**" in raw["exclude_patterns"]
+
+    profiles_dir = isolated_config_dir / "profiles"
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+    (profiles_dir / "agents-md.yaml").write_text(sample.read_text())
+
+    loaded = load_profile("agents-md")
+    assert loaded["file_patterns"] == raw["file_patterns"]
+    assert loaded["exclude_patterns"] == raw["exclude_patterns"]
+
+    cfg_path = tmp_path / "project.yaml"
+    cfg_path.write_text(yaml.dump({
+        "profile": "agents-md",
+        "project_path": str(tmp_path),
+        "backend": "googledrive",
+        "drive_folder_id": "FOLDER",
+        "credentials_file": str(tmp_path / "creds.json"),
+        "token_file": str(tmp_path / "token.json"),
+        "gcp_project_id": "test-gcp",
+        "pubsub_topic_id": "test-topic",
+    }))
+    cfg = Config.load(str(cfg_path))
+    assert "AGENTS.md" in cfg.file_patterns
+    assert "**/AGENTS.md" in cfg.file_patterns
+    assert "node_modules/**" in cfg.exclude_patterns

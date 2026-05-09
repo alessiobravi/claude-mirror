@@ -8,7 +8,7 @@
 
 **Mirror your project files across machines and cloud backends — with multi-cloud redundancy, time-travel disaster recovery, and real-time collaboration signals.**
 
-Built originally for Claude Code projects (where most context lives in markdown), but the file-pattern glob is configurable to sync any file type. The default `file_patterns: ["**/*.md"]` keeps just Claude context files in sync; set it to `["**/*"]` to mirror the entire project tree, or any other glob (e.g. `["**/*.py", "**/*.md"]`) to scope what gets synced.
+Built originally for Claude Code projects (where most context lives in markdown), but the file-pattern glob is configurable to sync any file type. The default `file_patterns: ["**/*.md"]` keeps just Claude context files in sync; set it to `["**/*"]` to mirror the entire project tree, or any other glob (e.g. `["**/*.py", "**/*.md"]`) to scope what gets synced. **Cross-tool agent-context sync is a first-class scenario:** a single `AGENTS.md` file (the cross-IDE convention read by Claude Code, Cursor, Codex, and Antigravity) can be kept in lockstep across every machine via the worked sample profile at [docs/profiles/agents-md.yaml](https://github.com/alessiobravi/claude-mirror/blob/main/docs/profiles/agents-md.yaml) — see [docs/scenarios.md — Scenario I](https://github.com/alessiobravi/claude-mirror/blob/main/docs/scenarios.md#i-cross-tool-agentsmd-sync).
 
 ### Why use it
 
@@ -157,7 +157,7 @@ The trimmed README covers install, your first project, daily-usage cheatsheet, n
 - [docs/profiles.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/profiles.md) — credentials profiles: factor `credentials_file` / `token_file` / app keys out of every project YAML
 
 **Topology guides** (pick the one that matches your situation):
-- [docs/scenarios.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/scenarios.md) — seven deployment topologies, end to end:
+- [docs/scenarios.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/scenarios.md) — eight deployment topologies, end to end:
   - **A. Standalone** — local ↔ 1 backend
   - **B. Personal multi-machine** — local ⇄ 1 backend ⇄ local'
   - **C. Multi-user collaboration** — Alice ⇄ shared backend ⇄ Bob
@@ -165,6 +165,7 @@ The trimmed README covers install, your first project, daily-usage cheatsheet, n
   - **F. Selective sync** — custom `file_patterns` + exclusions
   - **G. Multi-user + multi-backend (production-realistic)** — shared primary + shared mirror, full Alice/Bob YAMLs and command-by-command transcript
   - **H. Multi-project enterprise** — many configs in `~/.config/claude_mirror/`
+  - **I. Cross-tool AGENTS.md sync** — single `AGENTS.md` shared by Claude Code / Cursor / Codex / Antigravity, narrow pattern set via the [`agents-md`](https://github.com/alessiobravi/claude-mirror/blob/main/docs/profiles/agents-md.yaml) sample profile
 
 ---
 

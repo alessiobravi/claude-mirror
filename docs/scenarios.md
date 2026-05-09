@@ -16,6 +16,7 @@ For backend-specific setup details (OAuth flow, app registration, NAS configurat
 - [F. Selective sync](#f-selective-sync)
 - [G. Multi-user + multi-backend (production-realistic)](#g-multi-user--multi-backend-production-realistic)
 - [H. Multi-project enterprise](#h-multi-project-enterprise)
+- [I. Cross-tool AGENTS.md sync](#i-cross-tool-agentsmd-sync)
 
 ---
 
@@ -981,6 +982,96 @@ Or via `claude-mirror-install` for an auto-starting service.
 - **Slack channels per project.** The whole point of separate projects is they don't interfere; give each one its own webhook (or its own channel-override) so the team chat for the work project doesn't get spammed by side-hustle pushes.
 - **`watch-all --config <path> ...` lets you watch a subset.** If most projects should be watched but one is paused, list only the ones you want — the others are simply not subscribed-to until you re-include them.
 - **Retire projects deliberately.** Just deleting the YAML doesn't delete the remote — that's a feature (you keep the snapshot history) but means storage costs persist until you `delete --local` the project or wipe the remote folder by hand.
+
+---
+
+## I. Cross-tool AGENTS.md sync
+
+### Purpose
+
+You use more than one agent IDE — Claude Code on the laptop, Cursor on the desktop, Codex on a remote machine, Antigravity for a specific subproject — and they all read the same `AGENTS.md` convention for project context. The file lives at the root of the project (sometimes also at directory level for nested overrides), and you want it to stay in lockstep across every machine and every tool. This scenario narrows claude-mirror's sync surface to *only* the cross-tool agent-context files, so the team's `README.md`, design notes, and incidental project markdown don't get mirrored alongside.
+
+This is the right scenario when:
+
+- Your project root holds a `AGENTS.md` (and possibly per-directory variants) read by two or more agent IDEs.
+- The project also holds other markdown — `README.md`, `docs/*.md`, `CHANGELOG.md` — that you do NOT want round-tripped to the cloud (it lives in git already, or it's not agent-context).
+- You want a single, auditable sync recipe so any new machine or any new agent IDE that joins the team picks up the AGENTS.md context automatically.
+
+If you also want the rest of the project's markdown synced, drop this profile and use the default `file_patterns: ["**/*.md"]` with [Scenario A](#a-standalone-mirror) or [Scenario B](#b-personal-multi-machine-sync) instead. If you want different agent files synced to different backends (work vs personal AGENTS.md), layer this on top of [Scenario H](#h-multi-project-enterprise) — one profile, multiple project YAMLs, different backends per project.
+
+### How to implement
+
+The repo ships a worked sample at [`docs/profiles/agents-md.yaml`](./profiles/agents-md.yaml). Copy it into your real profiles directory:
+
+```bash
+mkdir -p ~/.config/claude_mirror/profiles
+cp docs/profiles/agents-md.yaml ~/.config/claude_mirror/profiles/agents-md.yaml
+```
+
+The profile sets only `file_patterns` and `exclude_patterns`:
+
+```yaml
+# ~/.config/claude_mirror/profiles/agents-md.yaml
+description: "Cross-tool AGENTS.md sync — Claude Code / Cursor / Codex / Antigravity"
+
+file_patterns:
+  - "AGENTS.md"            # root-level
+  - "**/AGENTS.md"         # nested per-directory overrides
+  - ".AGENTS.md"           # hidden variant some tools accept
+  - "**/.AGENTS.md"
+
+exclude_patterns:
+  - "node_modules/**"
+  - ".venv/**"
+  - "venv/**"
+  - "**/__pycache__/**"
+  - "build/**"
+  - "dist/**"
+  - ".git/**"
+```
+
+It deliberately omits the credential-bearing fields (`backend`, `credentials_file`, `token_file`, etc.) so it composes with whatever backend each project uses. The project YAML supplies the backend.
+
+Pin the profile per-project. Initialise the project as you normally would for the chosen backend, then either pass `--profile agents-md` for one-off commands or add a single line to the project YAML so every command picks it up automatically:
+
+```bash
+cd ~/projects/myproject
+claude-mirror init --wizard --backend googledrive
+echo 'profile: agents-md' >> ~/.config/claude_mirror/myproject.yaml
+claude-mirror auth
+claude-mirror sync
+```
+
+That's it. The first `sync` walks the project tree, matches only the four `AGENTS.md` patterns, uploads them to the configured backend, and creates a snapshot. From here, every agent IDE that opens the project on any machine reads the same `AGENTS.md`.
+
+For multi-machine (typical for this scenario — one user, laptop + desktop), the YAML on the second machine is identical except for `project_path`, `machine_name`, and the per-machine token file. Same `agents-md` profile reference; same backend config. See [Scenario B](#b-personal-multi-machine-sync) for the multi-machine setup mechanics.
+
+### Daily ops behaviour
+
+| Event | What happens |
+|---|---|
+| You run `claude-mirror status` | Lists only files matching the four AGENTS.md patterns. The project's `README.md`, `CHANGELOG.md`, `docs/*.md` are invisible — they don't match `file_patterns`. |
+| Cursor edits AGENTS.md on the desktop | Next `claude-mirror push` from the desktop uploads it. The laptop's watcher (if running) fires within seconds. |
+| You add `subsystem-x/AGENTS.md` for a per-directory override | Matches `**/AGENTS.md`, picked up by the next `status`, uploaded by the next `push`. |
+| You add a new `README.md` | Doesn't match — invisible to claude-mirror, never uploaded. (This is the point of the narrow pattern.) |
+| You forget to pull on machine A and edit AGENTS.md while machine B already pushed | Conflict. Interactive resolution: keep local, keep remote, or merge in `$EDITOR`. See [`docs/conflict-resolution.md`](./conflict-resolution.md). Conflicts are more common in this scenario than most because every agent IDE may rewrite AGENTS.md as the user works — keep the watcher running on every machine. |
+| You delete an AGENTS.md you no longer need | Next `push` removes it from the backend; every snapshot still has it. `claude-mirror history AGENTS.md` + `claude-mirror restore <ts> AGENTS.md` brings it back. |
+
+### Pitfalls and tips
+
+- **Per-directory `AGENTS.md` overrides are sometimes project-specific.** If `subsystem-x/AGENTS.md` only makes sense on the machine where you run that subsystem, exclude it explicitly: add `subsystem-x/AGENTS.md` to `exclude_patterns` in the project YAML (project values stack with the profile's). Or drop the `**/AGENTS.md` line entirely if you only want the root file synced.
+- **`.claude_mirror_ignore` at the project root takes precedence.** If a developer drops a `.claude_mirror_ignore` line matching `AGENTS.md` (e.g. for a temporary local-only override), it wins over the profile's `file_patterns`. See [`docs/admin.md` — `.claude_mirror_ignore`](./admin.md#claude_mirror_ignore--project-tree-exclusions).
+- **Conflict resolution matters more here.** Two machines editing the same `AGENTS.md` is the common case in cross-tool setups, not the exception. Either keep the watcher running on every machine (so a `pull` is one click before you start editing) or use `claude-mirror sync --no-prompt --strategy keep-local` on a cron timer to surface drift early.
+- **Agent IDEs may rewrite AGENTS.md non-deterministically.** Some tools reformat the file on save (line endings, trailing whitespace, heading capitalisation). If you see frequent "unchanged content but new hash" pushes, normalise the file via a pre-commit hook or accept that snapshots will accumulate fast and tighten retention with `keep_last` / `keep_daily`.
+- **Don't put credentials inside AGENTS.md.** Standard agent-context advice, but worth restating: the file gets mirrored to a cloud backend. Keep tokens out. The profile's `exclude_patterns` excludes generated dirs (`node_modules/`, `.venv/`) but it can't reach into a file's contents.
+- **Profiles compose.** This profile doesn't pin a backend, so the same `agents-md` profile works for a Drive-backed work project AND a Dropbox-backed personal project on the same machine. Two project YAMLs, two `profile: agents-md` lines, two different backends — one shared pattern set.
+
+### Cross-links
+
+- [`docs/profiles.md`](./profiles.md) — full credentials-profiles guide; explains `--profile NAME` resolution and the merge precedence rule (project YAML wins over profile defaults).
+- [`docs/profiles/agents-md.yaml`](./profiles/agents-md.yaml) — the maintained sample profile YAML.
+- [Scenario B. Personal multi-machine sync](#b-personal-multi-machine-sync) — the typical topology this scenario layers on top of.
+- [Scenario F. Selective sync](#f-selective-sync) — full reference for `file_patterns` / `exclude_patterns` semantics, the `.claude_mirror_ignore` file, and how exclusions interact with previously-synced remote leftovers.
 
 ---
 

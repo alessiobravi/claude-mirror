@@ -379,6 +379,11 @@ _NO_WATCHER_CHECK_CMDS = {
     # would corrupt completion. The same banner-leak failure mode that
     # broke `--json` mode in v0.5.39 → v0.5.44 applies here.
     "_list-backends",
+    # `prompt` (SHELL-PROMPT) is invoked on every PS1 redraw — must be
+    # silent. A "watcher not running" banner here would tear the user's
+    # shell prompt on every command, defeating the whole point of the
+    # subcommand.
+    "prompt",
 }
 
 
@@ -6621,6 +6626,120 @@ def find_config(path: str) -> None:
             err=True,
         )
     sys.exit(1)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# `claude-mirror prompt` — shell-prompt status segment (SHELL-PROMPT)
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Inspired by git's `__git_ps1`: a fast, network-free, silent one-liner
+# users can drop into their PS1 / PROMPT / fish_prompt / starship config
+# to glance at sync state on every command. Unlike every other CLI surface
+# in this codebase, `prompt` MUST NOT render live progress, MUST NOT block
+# on the network, and MUST NEVER exit non-zero — a non-zero exit would
+# break the user's prompt rendering for every subsequent shell command.
+#
+# The heavy lifting lives in `claude_mirror._prompt`. This handler is a
+# thin Click wrapper.
+@cli.command()
+@click.option(
+    "--config", "config_path", default="",
+    help="Config file path. Auto-detected from cwd if omitted; if no "
+         "config is found, exits 0 with empty stdout (a non-claude-mirror "
+         "directory shouldn't print anything in the prompt).",
+)
+@click.option(
+    "--format", "fmt",
+    type=click.Choice(["text", "ascii", "symbols", "json"], case_sensitive=False),
+    default="symbols", show_default=True,
+    help="Output format. `symbols` uses UTF-8 (check / up-arrow / "
+         "down-arrow / tilde / question / warning), `ascii` uses "
+         "OK / +N / -N / ~N / ? / !, `text` uses words, `json` emits a "
+         "parseable dict to stdout.",
+)
+@click.option(
+    "--prefix", "prefix", default="", metavar="STR",
+    help="String prepended to the output (only when output is non-empty). "
+         "Use to embed in larger prompts.",
+)
+@click.option(
+    "--suffix", "suffix", default="", metavar="STR",
+    help="String appended to the output (only when output is non-empty).",
+)
+@click.option(
+    "--quiet-when-clean", "quiet_when_clean", is_flag=True, default=False,
+    help="Emit empty string when fully in sync. Default is to emit the "
+         "in-sync symbol so the user always sees something.",
+)
+def prompt(
+    config_path: str,
+    fmt: str,
+    prefix: str,
+    suffix: str,
+    quiet_when_clean: bool,
+) -> None:
+    """Emit a one-line sync status snippet for shell prompts (PS1).
+
+    Network-free, silent, sub-50ms — designed to run on every PS1 redraw.
+    Exits 0 even on error (a corrupt manifest, missing config, etc.) so
+    the user's prompt rendering never breaks; problems surface as a
+    single short stderr line plus a warning symbol on stdout.
+
+    See README "Shell prompt integration" for ready-to-paste recipes for
+    bash, zsh, fish, and starship.
+    """
+    from . import _prompt as _prompt_mod
+
+    try:
+        if config_path:
+            resolved = config_path
+            if not Path(resolved).exists():
+                return
+            config = Config.load(resolved)
+        else:
+            resolved = _resolve_config(config_path)
+            if not Path(resolved).exists():
+                return
+            config = Config.load(resolved)
+            try:
+                project = Path(config.project_path).resolve()
+                cwd = Path.cwd().resolve()
+                if project != cwd and project not in cwd.parents:
+                    return
+            except OSError:
+                return
+    except (OSError, ValueError, TypeError) as exc:
+        click.echo(
+            f"claude-mirror prompt: could not load config: {exc}",
+            err=True,
+        )
+        click.echo(_prompt_mod.SYMBOL_ERROR)
+        return
+    except Exception as exc:
+        click.echo(
+            f"claude-mirror prompt: unexpected config error: {exc}",
+            err=True,
+        )
+        click.echo(_prompt_mod.SYMBOL_ERROR)
+        return
+
+    try:
+        out = _prompt_mod.compute_prompt(
+            config,
+            fmt=fmt.lower(),
+            prefix=prefix,
+            suffix=suffix,
+            quiet_when_clean=quiet_when_clean,
+        )
+    except Exception as exc:
+        click.echo(
+            f"claude-mirror prompt: unexpected error: {exc}",
+            err=True,
+        )
+        click.echo(_prompt_mod.SYMBOL_ERROR)
+        return
+
+    click.echo(out)
 
 
 # ──────────────────────────────────────────────────────────────────────────

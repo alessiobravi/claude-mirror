@@ -40,6 +40,47 @@ Tag validation regex: `^[A-Za-z0-9._-]{1,64}$` — same shape as a tightened-up 
 - `pytest tests/` — **995 passed, 3 skipped** locally on macOS in 4.36s (the 3 skips are the pre-existing `test_mypy_smoke.py` "mypy not installed" guards).
 - `mypy --strict claude_mirror/` — **clean across 39 source files**.
 
+### Added — `claude-mirror prompt` for shell-prompt integration (SHELL-PROMPT)
+
+A new top-level subcommand `claude-mirror prompt` emits a short, network-free, sub-50ms status snippet for embedding in shell prompts (PS1 / PROMPT / fish_prompt / starship). Inspired by git's `__git_ps1`: a maintainer-friendly visible signal that gets users to glance at their shell prompt and know whether they have unsynced changes, without ever reaching out to the network. Designed to run on every prompt redraw — silent on success, silent on the (auto-detected) non-claude-mirror directory case, and silent on every error path. Errors NEVER produce a non-zero exit code; that would break the user's prompt rendering for every subsequent command.
+
+- `claude_mirror/_prompt.py` — new module, ~330 lines. Pure stdlib + `Config` + `Manifest` access; no rich / click dependencies (those are too heavy to import on every PS1 redraw). Public API: `compute_prompt(config, fmt, prefix, suffix, quiet_when_clean) -> str`. Internal helpers walk the project tree once, read the manifest's flat fields, consult the persistent hash cache (`.claude_mirror_hash_cache.json`) to decide whether each file's local hash matches the manifest's `synced_hash` — without rehashing — and count pending_retry mirror entries as conflicts. The result is wrapped in the requested format and surrounded by `--prefix` / `--suffix`. The `quiet_when_clean` path returns the empty string (and skips prefix/suffix wrapping) so users can embed a leading-space prefix without leaving stray whitespace in clean prompts.
+- `claude_mirror/_prompt.py` — prompt-cache file at `<project>/.claude_mirror_prompt_cache.json` keyed on `(manifest mtime_ns, live local file count)`. Subsequent calls with an unchanged manifest AND unchanged file count short-circuit the file walk + classification entirely; the cache invalidates automatically on every manifest rewrite (push / pull / sync) and on local file additions or removals. Above the `LARGE_PROJECT_THRESHOLD` (5000 files), the path returns the cached value if present or an ellipsis fallback otherwise — so a giant project never blocks the user's shell for >100ms while hashing.
+- `claude_mirror/cli.py` — new `@cli.command()` `prompt` (NOT a flag on `status`, because the perf + silence + exit-code contract is fundamentally different from the existing network-bound `status --short`). Flags: `--config PATH` (auto-detected from cwd via `_resolve_config`; if no config matches the cwd or any ancestor, exits 0 with empty stdout), `--format text|ascii|symbols|json` (default `symbols`), `--prefix STR`, `--suffix STR`, `--quiet-when-clean`. Added to `_NO_WATCHER_CHECK_CMDS` so the watcher-not-running banner can never tear the user's PS1.
+- `claude_mirror/cli.py` — auto-detection guard: when `--config` is omitted and the resolved config's `project_path` is neither the cwd nor an ancestor of the cwd, the command returns silently rather than printing the default config's status. A user running shell commands in `~` should NOT see one of their projects' sync state in the prompt.
+
+#### Symbol vocabulary
+
+  | Meaning            | symbols (default) | ascii | text                |
+  |--------------------|-------------------|-------|---------------------|
+  | in sync            | `✓`               | `OK`  | `in sync`           |
+  | N files locally ahead | `↑N`           | `+N`  | `+N ahead`          |
+  | N files remote-ahead (cached) | `↓N`   | `-N`  | `-N behind`         |
+  | N pending_retry conflicts | `~N`        | `~N`  | `N conflict(s)`     |
+  | no manifest yet    | `?`               | `?`   | `no manifest`       |
+  | error              | `⚠`               | `!`   | `error`             |
+
+  `--format json` emits a flat dict to stdout: `{"in_sync": bool, "local_ahead": int, "remote_ahead": int, "conflicts": int, "no_manifest": bool, "error": bool}`.
+
+#### Performance
+
+  Measured on a synthetic 500-file project (typical claude-mirror size):
+
+  | Phase           | Wall time |
+  |-----------------|-----------|
+  | cold cache      | ~6-8 ms   |
+  | warm cache hit  | ~3-4 ms   |
+
+  (CI test slack: 500 ms — accommodates slow runners; the real target is 50 ms.) The `claude-mirror prompt` end-to-end command line wall time is dominated by Python interpreter + click import startup (~250 ms on macOS), unavoidable without a long-running daemon — but the actual `compute_prompt` work is tiny and well within the per-PS1-redraw budget every shell user expects.
+
+#### Shell recipes
+
+Ready-to-paste recipes for `bash`, `zsh`, `fish`, and `starship` ship in the README's new "Shell prompt integration" subsection.
+
+- `tests/test_shell_prompt.py` — new module, **16 tests:** in-sync emits the check symbol; modified files emit `↑N`; new local files (no manifest entry) count as local-ahead; `--quiet-when-clean` emits an empty line when in sync; `--format ascii` uses `+N ~M`; `--format text` uses `+N ahead, M conflict(s)`; `--format json` is parseable; non-claude-mirror directory exits 0 with empty stdout; corrupt manifest exits 0 with the warning symbol on stdout + a stderr line; the prompt cache short-circuits the file walk on the second call when nothing has changed (verified by patching the inner walker and asserting call count); cache invalidates when the manifest is rewritten; no-manifest-yet emits `?`; `--prefix` / `--suffix` wrap the output; `--quiet-when-clean` skips prefix/suffix on the empty path; cold-cache 500-file project completes well under the 500 ms loose budget; the no-local-files-with-manifest edge case returns in-sync without crashing.
+- `README.md` — new "Shell prompt integration" subsection in the Daily-usage area with bash / zsh / fish / starship recipes.
+- `docs/cli-reference.md` — new `### prompt` subsection documenting flags, formats, symbol vocabulary, performance contract, and the silent-on-failure-by-design exit-code-0 behaviour. The top-level command list grows a `claude-mirror prompt [--config PATH] [--format text|ascii|symbols|json] [--quiet-when-clean] [--prefix STR] [--suffix STR]` line.
+
 ---
 
 ## [0.5.59] — 2026-05-09

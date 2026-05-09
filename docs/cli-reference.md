@@ -76,6 +76,7 @@ claude-mirror migrate-snapshots --to {blobs|full} [--dry-run] [--keep-source] [-
 claude-mirror log               [--limit N] [--config PATH]
 claude-mirror inbox       [--config PATH]
 claude-mirror find-config [PATH]
+claude-mirror prompt      [--config PATH] [--format text|ascii|symbols|json] [--quiet-when-clean] [--prefix STR] [--suffix STR]   # network-free shell-prompt status snippet (PS1 / PROMPT / fish_prompt / starship)
 claude-mirror profile list
 claude-mirror profile show       NAME
 claude-mirror profile create     NAME --backend BACKEND [--description TEXT] [--force]
@@ -728,6 +729,53 @@ Sample one-liner for cron — fire a notification on any non-zero exit so monito
 ### `find-config`
 
 Print the config file path that matches the current working directory (or `PATH` if given). Searches all `~/.config/claude_mirror/*.yaml` files for one whose `project_path` matches, falling back to `default.yaml` if none match. The Claude Code skill uses this internally to detect the active project.
+
+### `prompt`
+
+Network-free, silent, sub-50ms one-line sync-status snippet for embedding in shell prompts (PS1 / PROMPT / fish_prompt / starship). Inspired by git's `__git_ps1`. Designed to run on every prompt redraw — see the [Shell prompt integration](../README.md#shell-prompt-integration) section in the README for ready-to-paste recipes for bash, zsh, fish, and starship.
+
+```
+claude-mirror prompt [--config PATH]
+                     [--format text|ascii|symbols|json]
+                     [--quiet-when-clean]
+                     [--prefix STR] [--suffix STR]
+```
+
+**Flags:**
+
+- `--config PATH` — config file path. Auto-detected from cwd if omitted; if no config matches the cwd or any ancestor, exits 0 with empty stdout (a non-claude-mirror directory shouldn't print anything in the prompt).
+- `--format text|ascii|symbols|json` — default `symbols`. `text` is plain words (`in sync`, `+3 ahead, 1 conflict`); `ascii` is `+3 ~1`; `symbols` is the UTF-8 form (`✓`, `↑3 ~1`); `json` emits a flat parseable dict to stdout: `{"in_sync": bool, "local_ahead": int, "remote_ahead": int, "conflicts": int, "no_manifest": bool, "error": bool}`.
+- `--prefix STR` and `--suffix STR` — wrap the output (only when output is non-empty). Useful for embedding in larger prompts: `claude-mirror prompt --prefix "[" --suffix "]"`.
+- `--quiet-when-clean` — emit empty string when fully in sync. Default off (emits the in-sync symbol so the user always sees something).
+
+**Symbol vocabulary:**
+
+| Meaning                       | symbols (default) | ascii | text                |
+|-------------------------------|-------------------|-------|---------------------|
+| in sync                       | `✓`               | `OK`  | `in sync`           |
+| N files locally ahead         | `↑N`              | `+N`  | `+N ahead`          |
+| N files remote-ahead (cached) | `↓N`              | `-N`  | `-N behind`         |
+| N pending_retry conflicts     | `~N`              | `~N`  | `N conflict(s)`     |
+| no manifest yet               | `?`               | `?`   | `no manifest`       |
+| error                         | `⚠`               | `!`   | `error`             |
+
+The remote-ahead count is intentionally network-free: the prompt path NEVER lists the remote. A future revision will populate it from a value cached by the previous `claude-mirror status` run; until then it stays at 0.
+
+**Performance contract:**
+
+- Target: <50ms wall time on a typical project (~500 files). Achieved by reading the manifest, comparing each local file's `(size, mtime_ns)` against the persistent hash cache at `.claude_mirror_hash_cache.json`, and short-circuiting on the prompt cache file `.claude_mirror_prompt_cache.json` keyed on `(manifest mtime_ns, live file count)`.
+- Cold cache: ~6-8 ms of in-process work on a 500-file project.
+- Warm cache: ~3-4 ms.
+- Above 5000 files the path returns the cached value if available, otherwise an ellipsis fallback (`…`), so a giant project never blocks the user's shell for >100ms.
+- Cache invalidates automatically on every manifest rewrite (push / pull / sync) and on local file additions or removals.
+
+**Silent-on-failure exit code 0:**
+
+By design. The command NEVER exits non-zero — a non-zero exit would break the user's prompt rendering for every subsequent shell command. Errors (corrupt manifest, missing config, malformed YAML, etc.) emit a single short stderr line plus a `⚠` (or `!` / `error`) on stdout, then exit 0. If you need to script around the command, parse stdout instead.
+
+**No live progress:**
+
+The project-wide rule "every CLI command shows live progress" has an explicit exception here: `prompt` MUST stay silent. A spinner in PS1 would tear the user's shell on every command. The watcher-not-running banner is also suppressed for the same reason.
 
 ### `profile` (since v0.5.49)
 

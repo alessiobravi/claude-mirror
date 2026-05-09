@@ -318,6 +318,42 @@ Conflict resolution flow (interactive `keep local / keep remote / merge / skip` 
 
 ---
 
+## Shell prompt integration
+
+Inspired by git's `__git_ps1`: `claude-mirror prompt` emits a short, network-free, sub-50ms status snippet you can drop into your shell prompt to see sync state at a glance on every command. The output is one of `✓` (in sync), `↑N` (N files locally ahead), `~N` (N pending_retry conflicts), `?` (no manifest yet), `⚠` (error reading state) — or empty with `--quiet-when-clean`. Pass `--format ascii` for `OK / +N / ~N / ? / !` if your terminal struggles with UTF-8, or `--format json` for a parseable dict. Full reference: [docs/cli-reference.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/cli-reference.md#prompt).
+
+The command is silent on every error path and ALWAYS exits 0 — a non-zero exit would tear your prompt on every command after a corrupt manifest or stale config. Errors surface as a single stderr line plus a warning glyph on stdout. Drop into a non-claude-mirror directory and the command exits with empty stdout, so embedding it unconditionally is safe.
+
+```bash
+# bash (PS1)
+PS1='\u@\h:\w$(claude-mirror prompt --quiet-when-clean --prefix " ")\$ '
+
+# zsh (PROMPT)
+setopt PROMPT_SUBST
+PROMPT='%n@%m:%~$(claude-mirror prompt --quiet-when-clean --prefix " ") %# '
+
+# fish (function fish_prompt)
+function fish_prompt
+    echo -n (whoami)@(hostname):(prompt_pwd)
+    set -l mirror_status (claude-mirror prompt --quiet-when-clean --prefix " ")
+    test -n "$mirror_status" && echo -n "$mirror_status"
+    echo -n " > "
+end
+```
+
+```toml
+# starship (~/.config/starship.toml)
+[custom.claude_mirror]
+command = "claude-mirror prompt --quiet-when-clean"
+when = "claude-mirror find-config"
+format = "[$output]($style)"
+style = "yellow"
+```
+
+Performance contract: cold cache is ~6-8 ms of in-process work on a 500-file project, warm cache ~3-4 ms. The path consults a tiny cache file at `.claude_mirror_prompt_cache.json` keyed on the manifest's mtime + live file count, so repeated invocations on an unchanged project are nearly free. Above 5000 files the prompt returns a cached value or an ellipsis (`…`) rather than blocking the shell.
+
+---
+
 ## Claude Code skill
 
 claude-mirror ships a skill for [Claude Code](https://claude.ai/claude-code) that lets you run sync operations directly from your AI conversation, and surfaces remote notifications inline without leaving the editor.

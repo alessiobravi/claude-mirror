@@ -4,7 +4,9 @@ All notable changes to claude-mirror.
 
 ---
 
-## [Unreleased]
+## [0.5.60] — 2026-05-09
+
+Three independent additions land together: snapshots become git-commit-shaped (named + messaged + tag-protected from auto-pruning), `AGENTS.md` cross-tool sync gets a first-class scenario page + sample profile, and a new `claude-mirror prompt` subcommand emits a fast network-free status snippet for embedding in shell prompts (PS1 / starship / fish / zsh).
 
 ### Added — AGENTS.md cross-tool sync recipe (AGENTS-MD)
 

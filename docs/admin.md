@@ -1238,6 +1238,18 @@ Your own machine's entries are filtered by default; the section answers "who els
 
 For the full chronological audit log (every push from every collaborator over the lifetime of the project, not just the last 24h), use [`claude-mirror log`](cli-reference.md#log).
 
+### Activity stats over a window
+
+Where `status --presence` answers "who is here right now?" and `log` is the raw chronological feed, [`claude-mirror stats`](cli-reference.md#stats) is the rolled-up companion: it aggregates the same shared `_sync_log.json` into a small table with one row per group key — by `user`, `machine`, `action`, `day`, or `backend` — over a window the caller picks (`--since 7d`, `--since 2026-04-01 --until 2026-04-30`, etc.).
+
+```bash
+claude-mirror stats --since 30d --by user           # top contributors over the last 30 days
+claude-mirror stats --since 2w --by day --top 14    # daily activity pattern, two weeks
+claude-mirror stats --by action                     # push vs. pull vs. sync vs. delete mix (default 7d window)
+```
+
+Default window is the last 7 days; default group-by axis is `backend`. The `--json` flag emits the same v1 envelope shape used by `status` / `log` / `snapshots` (additive v1.1 `result` shape — see [`stats --json`](cli-reference.md#stats---json-schema-v11-additive)).
+
 ## Multi-backend mirroring (Tier 2)
 
 A single project can be synced to multiple storage backends at the same time. Push uploads to all of them in parallel, snapshots are mirrored across all of them (configurable), and pull / status read from the primary. If a mirror fails transiently it is retried automatically on the next push; permanent failures are quarantined and surfaced via `claude-mirror status --pending` and the desktop / Slack notifiers.

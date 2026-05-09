@@ -42,6 +42,20 @@ Pure-data API exposed by `claude_mirror/_ncdu.py`:
 - `pytest tests/` — **1133 passed, 3 skipped** locally on macOS (was 1101, +32 new ncdu tests; the 3 skips are the pre-existing `test_mypy_smoke.py` "mypy not installed" guards).
 - `mypy --strict claude_mirror/` — clean across 42 source files (was 41 + the new `_ncdu.py`).
 
+### Added — claude-mirror stats for aggregated usage summary (STATS)
+
+`claude-mirror stats` is a new read-only subcommand that aggregates the project's `_sync_log.json` into a usage summary inspired by `rclone --stats`. Pairs with PRESENCE (v0.5.60) for team visibility — PRESENCE shows who is active right now, STATS shows the rolled-up activity over a configurable window.
+
+Default window is the last 7 days; `--since` and `--until` accept the same vocabulary as `history --since/--until` (ISO date `2026-04-15`, ISO datetime, or relative duration `Nd` / `Nw` / `Nm` / `Ny`). The `--by` axis groups rows by `backend` (default), `user`, `machine`, `action`, or `day`. `--top N` caps the row count (default 20). `--json` emits a v1 envelope with the additive v1.1 `result` shape `{since, until, group_by, rows[], totals}`. Avg-latency and per-event byte counts are NOT reported — the existing `SyncEvent` schema does not record them, so the stats output stays truthful and surfaces only `events` / `files` / `conflicts` (where conflicts comes from the existing `auto_resolved_files` audit trail).
+
+- New module `claude_mirror/_stats.py` — pure aggregation function `aggregate_log(entries, since, until, group_by, top, backend_label)` returning a `StatsResult` with typed `rows[]` and `totals`. No I/O, no clocks; 100% unit-testable with hand-built dicts.
+- New CLI command in `claude_mirror/cli.py` — wires `--since` / `--until` through the existing `parse_relative_or_iso_date` helper, fetches the remote log via the existing `_log_fetch_remote` helper (no re-implementation), renders the Rich table or the v1.1 JSON envelope.
+- `_NO_WATCHER_CHECK_CMDS` extended with `stats` so the watcher banner cannot leak into stdout ahead of the JSON envelope (same pattern as `health` / `prompt` / `log`).
+- `tests/test_stats.py` — 21 tests: 14 pure-function tests covering every group-by axis (USER / MACHINE / ACTION / DAY / BACKEND), time-window filtering on both bounds, `--top` capping, conflict counting from `auto_resolved_files`, malformed-entry resilience, the unknown-axis ValueError path, Z-suffix timestamps, and dataclass typing; 7 CLI-level tests covering JSON envelope shape, empty-log path, relative-duration acceptance, invalid `--since` error envelope, no-banner-leak in `--json` mode, default Rich table rendering, and the empty-state message. Offline against the FakeStorageBackend, every test under 100ms.
+- `docs/cli-reference.md` — top-level command list grows `claude-mirror stats …`. New `### stats` subsection with the flag table, sample table output, and JSON envelope. The `## JSON output` index lists `stats --json` as the sixth read-only command supporting `--json`.
+- `docs/admin.md` — new "Activity stats over a window" subsection under "Who else is editing this project?" pointing at `stats` as the rolled-up companion to `status --presence` and `log`.
+- `README.md` — Daily usage cheatsheet grows a `claude-mirror stats --since 7d` line.
+
 ---
 
 ## [0.5.62] — 2026-05-09

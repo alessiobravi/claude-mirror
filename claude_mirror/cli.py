@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional, cast
 
@@ -32,6 +33,7 @@ from .events import SyncEvent, SyncLog, SYNC_LOG_NAME, LOGS_FOLDER
 from .manifest import Manifest
 from .merge import MergeHandler
 from ._presence import PresenceEntry, aggregate_presence, humanize_age
+from ._stats import StatsResult, aggregate_log as _stats_aggregate_log
 from .notifications import NotificationBackend
 from .notifications.pubsub import PubSubNotifier
 from .notifier import Notifier, read_and_clear_inbox
@@ -384,6 +386,11 @@ _NO_WATCHER_CHECK_CMDS = {
     # shell prompt on every command, defeating the whole point of the
     # subcommand.
     "prompt",
+    # `stats` (STATS) is a read-only aggregation over the remote sync
+    # log; the watcher banner is unrelated noise. Same `--json` banner-
+    # leak failure mode as `health` / `log` etc. is gated by the
+    # json_mode check below.
+    "stats",
 }
 
 
@@ -7530,6 +7537,228 @@ def log(
         return
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# stats — aggregate `_sync_log.json` into a usage summary (STATS)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+_STATS_GROUP_BY_CHOICES: tuple[str, ...] = (
+    "backend", "user", "machine", "action", "day",
+)
+
+
+def _stats_log_to_dicts(sync_log: SyncLog) -> list[dict[str, Any]]:
+    """Convert a parsed `SyncLog` into the raw-dict shape `_stats`
+    consumes. Mirrors the on-disk `_sync_log.json` element shape: every
+    dataclass field is surfaced verbatim including `auto_resolved_files`
+    (which the conflict-count derivation reads)."""
+    out: list[dict[str, Any]] = []
+    for ev in sync_log.events:
+        out.append({
+            "timestamp": ev.timestamp,
+            "user": ev.user,
+            "machine": ev.machine,
+            "action": ev.action,
+            "files": list(ev.files),
+            "project": ev.project,
+            "auto_resolved_files": [dict(e) for e in ev.auto_resolved_files],
+        })
+    return out
+
+
+def _stats_render_table(result: "StatsResult", *, since_label: str) -> None:
+    """Print the default Rich rendering of one StatsResult."""
+    axis = result.group_by
+    if not result.rows:
+        console.print(
+            f"[dim]No sync events in window ({since_label}).[/]"
+        )
+        return
+    title = f"Project usage stats — {since_label}"
+    column_label = {
+        "backend": "Backend",
+        "user": "User",
+        "machine": "Machine",
+        "action": "Action",
+        "day": "Day",
+    }.get(axis, axis.title())
+    console.print(f"[bold]{title}[/]")
+    console.print(f"[dim]By {axis}:[/]")
+    table = Table(show_header=True, header_style="bold")
+    table.add_column(column_label)
+    table.add_column("Events", justify="right")
+    table.add_column("Files", justify="right")
+    table.add_column("Conflicts", justify="right")
+    for row in result.rows:
+        table.add_row(
+            row.key,
+            str(row.events),
+            str(row.files),
+            str(row.conflicts),
+        )
+    console.print(table)
+    totals = result.totals
+    console.print(
+        f"[dim]Totals:[/] events: {totals.events}    "
+        f"files: {totals.files}    conflicts: {totals.conflicts}"
+    )
+
+
+def _stats_iso_z(dt: Optional[datetime]) -> Optional[str]:
+    """Render a datetime as `YYYY-MM-DDTHH:MM:SSZ` for the JSON envelope.
+    None → None so absent bounds round-trip cleanly through json.dumps."""
+    if dt is None:
+        return None
+    return str(dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+
+def _stats_result_to_json(result: "StatsResult") -> dict[str, Any]:
+    """Shape one StatsResult into the v1.1 envelope's `result` dict."""
+    return {
+        "since": _stats_iso_z(result.since),
+        "until": _stats_iso_z(result.until),
+        "group_by": result.group_by,
+        "rows": [
+            {
+                "key": r.key,
+                "events": r.events,
+                "files": r.files,
+                "conflicts": r.conflicts,
+            }
+            for r in result.rows
+        ],
+        "totals": {
+            "events": result.totals.events,
+            "files": result.totals.files,
+            "conflicts": result.totals.conflicts,
+        },
+    }
+
+
+def _stats_window_label(
+    since: Optional[datetime], until: Optional[datetime],
+) -> str:
+    """Friendly one-liner describing the resolved [since, until] window
+    for the table header and the empty-state message."""
+    s = _stats_iso_z(since) or "beginning"
+    u = _stats_iso_z(until) or "now"
+    return f"since {s} until {u}"
+
+
+@cli.command()
+@click.option("--config", "config_path", default="",
+              help="Config file path. Auto-detected from cwd if omitted.")
+@click.option("--since", "since", default="7d", show_default=True,
+              help="Start of the aggregation window. Accepts an ISO date "
+                   "(2026-04-15), an ISO datetime (2026-04-15T10:00:00Z), "
+                   "or a relative duration: Nd / Nw / Nm / Ny.")
+@click.option("--until", "until", default="",
+              help="End of the aggregation window. Same accepted forms as "
+                   "--since. Default: now.")
+@click.option("--by", "group_by", default="backend",
+              type=click.Choice(_STATS_GROUP_BY_CHOICES, case_sensitive=False),
+              show_default=True,
+              help="Group-by axis: backend, user, machine, action, or day.")
+@click.option("--top", "top", type=int, default=20, show_default=True,
+              help="Cap the number of rows shown.")
+@click.option("--json", "json_output", is_flag=True, default=False,
+              help="Emit a single flat JSON document to stdout instead of "
+                   "the Rich table. Schema: v1, additive `result` shape "
+                   "(v1.1) — {since, until, group_by, rows[], totals}.")
+def stats(
+    config_path: str,
+    since: str,
+    until: str,
+    group_by: str,
+    top: int,
+    json_output: bool,
+) -> None:
+    """Show aggregated usage stats from the project's sync log.
+
+    \b
+    Examples:
+      claude-mirror stats
+      claude-mirror stats --since 30d --by user
+      claude-mirror stats --by day --top 14
+      claude-mirror stats --since 2026-04-01 --until 2026-04-30 --by action
+      claude-mirror stats --json | jq '.result.totals'
+
+    Aggregates every push / pull / sync / delete entry in the project's
+    `_sync_log.json` into one row per group key, with totals across all
+    rows. The default window is the last 7 days; pass --since / --until
+    to slice differently. Avg-latency and per-event byte counts are not
+    recorded in the log schema and are not reported.
+    """
+    from .snapshots import parse_relative_or_iso_date as _parse_date
+
+    if json_output:
+        try:
+            with _JsonMode():
+                since_dt = _parse_date(since, flag_label="--since") if since else None
+                until_dt = _parse_date(until, flag_label="--until") if until else None
+                if since_dt is not None and until_dt is not None and since_dt > until_dt:
+                    raise ValueError(
+                        f"--since ({since}) is later than --until ({until}); "
+                        "no events can match an empty range."
+                    )
+                config = Config.load(_resolve_config(config_path))
+                storage = _create_storage(config)
+                sync_log = _log_fetch_remote(storage, config.root_folder)
+                entries = _stats_log_to_dicts(sync_log) if sync_log else []
+                result = _stats_aggregate_log(
+                    entries,
+                    since=since_dt,
+                    until=until_dt,
+                    group_by=group_by,
+                    top=top,
+                    backend_label=config.backend,
+                )
+            _emit_json_success("stats", _stats_result_to_json(result))
+            return
+        except SystemExit:
+            raise
+        except BaseException as e:
+            _emit_json_error("stats", e)
+
+    try:
+        since_dt = _parse_date(since, flag_label="--since") if since else None
+        until_dt = _parse_date(until, flag_label="--until") if until else None
+    except ValueError as e:
+        console.print(f"[red]{e}[/]")
+        sys.exit(1)
+    if since_dt is not None and until_dt is not None and since_dt > until_dt:
+        console.print(
+            f"[red]--since ({since}) is later than --until ({until}); "
+            "no events can match an empty range.[/]"
+        )
+        sys.exit(1)
+
+    config = Config.load(_resolve_config(config_path))
+    storage = _create_storage(config)
+
+    from ._progress import make_phase_progress
+    with make_phase_progress(console) as progress:
+        load_task = progress.add_task(
+            "Stats", total=None, detail="fetching sync log…", show_time=True,
+        )
+        try:
+            sync_log = _log_fetch_remote(storage, config.root_folder)
+        except BaseException:
+            progress.remove_task(load_task)
+            raise
+        progress.update(load_task, detail="aggregating…")
+        entries = _stats_log_to_dicts(sync_log) if sync_log else []
+        result = _stats_aggregate_log(
+            entries,
+            since=since_dt,
+            until=until_dt,
+            group_by=group_by,
+            top=top,
+            backend_label=config.backend,
+        )
+        progress.update(load_task, detail="done")
+
+    _stats_render_table(result, since_label=_stats_window_label(since_dt, until_dt))
 
 
 # ──────────────────────────────────────────────────────────────────────────

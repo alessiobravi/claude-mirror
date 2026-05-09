@@ -319,6 +319,7 @@ claude-mirror watch --once --quiet      # single polling cycle (cron-friendly: *
 claude-mirror watch-all                 # watch every config in ~/.config/claude_mirror/
 claude-mirror log                       # who pushed what, when, across machines
 claude-mirror log --follow              # live tail -f: stream new entries as they arrive
+claude-mirror stats --since 7d          # rolled-up usage summary; --by user|machine|action|day|backend
 claude-mirror inbox                     # show + clear pending notifications
 claude-mirror snapshot --tag v1.0 --message "first stable"   # explicit named snapshot you can restore by name
 claude-mirror restore --tag v1.0        # restore by tag instead of by timestamp

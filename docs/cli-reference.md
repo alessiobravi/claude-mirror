@@ -74,6 +74,7 @@ claude-mirror doctor            [--backend NAME] [--config PATH]   # end-to-end 
 claude-mirror health            [--no-backends] [--timeout N] [--json] [--config PATH]   # machine-readable monitoring probe; exit 0 ok / 1 warn / 2 fail
 claude-mirror migrate-snapshots --to {blobs|full} [--dry-run] [--keep-source] [--no-update-config] [--config PATH]
 claude-mirror log               [--limit N] [--config PATH]
+claude-mirror stats             [--since DATE/DURATION] [--until DATE/DURATION] [--by backend|user|machine|action|day] [--top N] [--json] [--config PATH]
 claude-mirror inbox       [--config PATH]
 claude-mirror find-config [PATH]
 claude-mirror tree        [PATH] [--depth N] [--remote BACKEND] [--show-size/--no-show-size] [--show-mtime/--no-show-mtime] [--ascii] [--config PATH]
@@ -112,6 +113,7 @@ Supported commands:
 - `claude-mirror inbox --json`
 - `claude-mirror log --json`
 - `claude-mirror snapshots --json`
+- `claude-mirror stats --json`
 - `claude-mirror health --json` (uses a sibling envelope shape — see [`### health`](#health) below; exits `0`/`1`/`2` for ok/warn/fail rather than `0`/`1` for ok/error)
 
 Exit codes match the non-JSON path: `0` on success (an empty inbox is a success and produces `{... "result": {"events": []}}`), `1` on any actual error (config not found, network failure, malformed snapshot). On error, a JSON error envelope is written to **stderr** rather than the success document on stdout, so a script can `2>/dev/null` the failure stream without losing structured info.
@@ -345,6 +347,27 @@ Newest-first, capped by `--limit` (default 20). `snapshot_timestamp` is reserved
 
 Newest-first. `size_bytes` is `null` when not recorded (full-format snapshots and older blobs manifests don't track end-to-end byte totals). `source_backend` is `"primary"` today — `snapshots` lists from the primary backend; in a future release it may report the actual backend name when listing per-mirror. `tag` and `message` are additive SNAP-TAG fields (since the post-v0.5.59 release); both are `null` for snapshots taken before SNAP-TAG or for untagged / unmessaged snapshots.
 
+### `stats --json` (schema v1.1, additive)
+
+```json
+{
+  "version": 1,
+  "command": "stats",
+  "result": {
+    "since": "2026-05-02T00:00:00Z",
+    "until": "2026-05-09T00:00:00Z",
+    "group_by": "user",
+    "rows": [
+      {"key": "alice", "events": 42, "files": 127, "conflicts": 0},
+      {"key": "bob",   "events": 18, "files":  53, "conflicts": 2}
+    ],
+    "totals": {"events": 60, "files": 180, "conflicts": 2}
+  }
+}
+```
+
+`since` / `until` are ISO-Z timestamps reflecting the resolved window. `since` defaults to "7 days ago" when the flag is omitted; `until` is `null` when `--until` is omitted (meaning "no upper bound"). `group_by` echoes the `--by` flag (one of `backend`, `user`, `machine`, `action`, `day`). `rows[]` is sorted descending by `events` for the non-day axes and descending by ISO date for the `day` axis; `--top N` caps the row count after sort while `totals` always reflects every event in the window. The schema does not surface a per-event byte total or a latency column — `SyncEvent` does not record either, and the `result` shape stays truthful rather than synthetic.
+
 ### Common piping recipes
 
 ```bash
@@ -362,6 +385,12 @@ claude-mirror history memory/notes.md --json | jq '.result.versions[] | {version
 
 # Drain inbox into a script
 claude-mirror inbox --json | jq -r '.result.events[] | "[\(.timestamp)] \(.user)@\(.machine): \(.action) \(.files | join(","))"'
+
+# Top contributors over the last 30 days
+claude-mirror stats --since 30d --by user --json | jq '.result.rows[] | "\(.key): \(.events) events, \(.files) files"'
+
+# Daily activity pattern over the last 2 weeks
+claude-mirror stats --since 2w --by day --json | jq '.result.rows[] | {day: .key, events}'
 ```
 
 ---
@@ -549,6 +578,37 @@ Flags:
 | `--interval N` | 5 | Polling interval in seconds when `--follow` is set. Must be a positive integer. Rejected when passed without `--follow`. |
 
 Transient backend errors during a follow loop (network blip, 5xx, rate-limit) print one yellow `[poll error: ...] retrying in <N>s` line and continue — the loop only exits non-zero on permanent auth-class failures (token revoked, permission removed) or a real Ctrl+C.
+
+### `stats`
+
+Aggregate the project's sync log into a usage summary. Inspired by `rclone --stats`. Reads the same `_sync_log.json` that `log` and `status --presence` consume, but rolls events up by a configurable group-by axis over a configurable time window — answers questions like "who pushed the most this month?" or "what does our daily activity pattern look like?" without manual `awk` over `claude-mirror log --json`.
+
+Flags:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--config PATH` | auto-detected from cwd | Path to a specific config YAML when more than one project lives under `~/.config/claude_mirror/`. |
+| `--since DATE/DURATION` | `7d` | Start of the aggregation window. Accepts an ISO date (`2026-04-15`), an ISO datetime (`2026-04-15T10:00:00Z`), or a relative duration (`Nd`, `Nw`, `Nm`, `Ny`). Same vocabulary as `history --since`. |
+| `--until DATE/DURATION` | now | End of the aggregation window. Same accepted forms as `--since`. |
+| `--by AXIS` | `backend` | Group rows by `backend`, `user`, `machine`, `action`, or `day`. The `day` axis groups by UTC ISO date and sorts rows newest-first. |
+| `--top N` | 20 | Cap the number of rows shown after sort. `totals` always reflects every event in the window, not just the rows kept after the cap. |
+| `--json` | off | Emit a single flat JSON document to stdout (v1 envelope, additive v1.1 `result` shape — see [`stats --json`](#stats---json-schema-v11-additive) above). |
+
+Sample output:
+
+```
+Project usage stats — since 2026-05-02T00:00:00Z until 2026-05-09T12:00:00Z
+By user:
+  User       Events    Files    Conflicts
+  alice          42      127            0
+  bob            18       53            2
+
+Totals: events: 60    files: 180    conflicts: 2
+```
+
+Reported metrics: `events` (one count per matching log entry), `files` (sum of `len(entry.files)`), `conflicts` (sum of `len(entry.auto_resolved_files)` — the audit trail populated by `sync --no-prompt --strategy keep-{local,remote}`). The current `SyncEvent` schema does not record per-event byte totals or a latency measurement, so neither column is reported — the output stays truthful rather than synthetic.
+
+When the window contains no events, the table is replaced by a dim `No sync events in window (since … until …).` line.
 
 ---
 

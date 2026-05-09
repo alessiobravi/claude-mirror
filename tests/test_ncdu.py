@@ -330,6 +330,12 @@ def _patched_engine(monkeypatch: pytest.MonkeyPatch, listing: list[dict[str, Any
     return primary
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="ncdu is POSIX-only (curses isn't in CPython's Windows stdlib); the "
+           "CLI dispatch tests below exercise behaviour reachable only on POSIX. "
+           "Windows-specific gating is verified by test_cli_windows_gated_with_friendly_message.",
+)
 def test_cli_non_interactive_prints_top_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     listing = [
         {"relative_path": "docs/a.md", "size": 1000, "id": "x"},
@@ -344,6 +350,7 @@ def test_cli_non_interactive_prints_top_paths(monkeypatch: pytest.MonkeyPatch) -
     assert "total: 3.4 KB across 3 files" in result.output
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="ncdu CLI flow is POSIX-only")
 def test_cli_non_interactive_default_top_is_20(monkeypatch: pytest.MonkeyPatch) -> None:
     listing = [{"relative_path": f"f{i}.md", "size": 10 + i, "id": str(i)}
                for i in range(30)]
@@ -353,6 +360,7 @@ def test_cli_non_interactive_default_top_is_20(monkeypatch: pytest.MonkeyPatch) 
     assert "Top 20 largest paths" in result.output
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="ncdu CLI flow is POSIX-only")
 def test_cli_remote_dispatches_to_named_mirror(monkeypatch: pytest.MonkeyPatch) -> None:
     sftp_mirror = MagicMock()
     sftp_mirror.backend_name = "sftp"
@@ -377,6 +385,7 @@ def test_cli_remote_dispatches_to_named_mirror(monkeypatch: pytest.MonkeyPatch) 
     sftp_mirror.list_files_recursive.assert_called_once()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="ncdu CLI flow is POSIX-only")
 def test_cli_unknown_remote_clean_error(monkeypatch: pytest.MonkeyPatch) -> None:
     _patched_engine(monkeypatch, [])
     result = CliRunner().invoke(
@@ -387,6 +396,7 @@ def test_cli_unknown_remote_clean_error(monkeypatch: pytest.MonkeyPatch) -> None
     assert "doesnotexist" in result.output
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="ncdu CLI flow is POSIX-only")
 def test_cli_top_must_be_positive(monkeypatch: pytest.MonkeyPatch) -> None:
     _patched_engine(monkeypatch, [])
     result = CliRunner().invoke(

@@ -12901,7 +12901,7 @@ def ncdu(
 
     if sys.platform == "win32":
         raise click.ClickException(
-            "claude-mirror ncdu is POSIX-only — the curses module is "
+            "claude-mirror ncdu is POSIX-only - the curses module is "
             "not in CPython's stdlib on Windows. The closest "
             "cross-platform alternative is `claude-mirror tree "
             "--depth N`, which prints a static directory tree of the "

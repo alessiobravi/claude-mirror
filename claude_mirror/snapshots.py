@@ -27,6 +27,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -70,6 +71,58 @@ SNAPSHOT_META_FILE = "_snapshot_meta.json"          # per-folder sidecar (full f
 
 MANIFEST_FORMAT_VERSION = "v2"
 MANIFEST_SUFFIX = ".json"
+
+# Tag-name validation: 1-64 chars, ASCII alnum + '.', '_', '-'. Same shape as
+# git tag names with the more dangerous characters (slashes, spaces, '@')
+# stripped out. Stays additive on top of v2 manifests — see SNAP-TAG.
+_TAG_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+# Free-form tag annotation cap. Big enough for a sentence, small enough that
+# a manifest stays under typical backend metadata limits.
+MAX_MESSAGE_LEN = 1024
+
+
+def _validate_tag_name(name: str) -> None:
+    """Raise ValueError if `name` is not a valid snapshot tag.
+
+    Rule: 1-64 ASCII characters, alphanumeric or '.', '_', '-'. Empty string
+    and whitespace-only strings are rejected. The regex source of truth is
+    `_TAG_NAME_RE` — keep error message and docs in sync. We use
+    `fullmatch` (not `match`) so a trailing newline doesn't slip through
+    the implicit `$`-allows-final-newline rule."""
+    if not isinstance(name, str) or not _TAG_NAME_RE.fullmatch(name):
+        raise ValueError(
+            f"Invalid tag name: {name!r}. Tags must match "
+            "^[A-Za-z0-9._-]{1,64}$ (1-64 chars, ASCII alphanumerics and "
+            "'.', '_', '-' only — no spaces, slashes, '@', or unicode)."
+        )
+
+
+def _validate_message(message: str) -> None:
+    """Raise ValueError if `message` exceeds MAX_MESSAGE_LEN."""
+    if len(message) > MAX_MESSAGE_LEN:
+        raise ValueError(
+            f"Snapshot message too long: {len(message)} chars "
+            f"(max {MAX_MESSAGE_LEN})."
+        )
+
+
+# Width target for the `Message` column in the `snapshots` table — long
+# enough to convey context, short enough that the table stays readable
+# next to a 20-char ISO timestamp + a 24-char triggered_by cell.
+_MESSAGE_TABLE_WIDTH = 50
+
+
+def _truncate_message_for_table(message: Optional[str]) -> str:
+    """Render a snapshot message for the snapshots table cell. Empty /
+    None becomes a dim em-dash; long messages collapse trailing whitespace
+    + truncate to ~_MESSAGE_TABLE_WIDTH chars with a unicode ellipsis."""
+    if not message:
+        return "[dim]—[/]"
+    flat = " ".join(message.split())
+    if len(flat) <= _MESSAGE_TABLE_WIDTH:
+        return flat
+    return flat[: _MESSAGE_TABLE_WIDTH - 1] + "…"
 
 
 def _safe_join(base: Path, rel_path: str) -> Path:
@@ -327,26 +380,97 @@ class SnapshotManager:
     # Public entry points
     # ------------------------------------------------------------------
 
-    def create(self, action: str, files_changed: list[str]) -> str:
+    def create(
+        self,
+        action: str,
+        files_changed: list[str],
+        tag: Optional[str] = None,
+        message: Optional[str] = None,
+    ) -> str:
         """Create a snapshot in the project's configured format. When
         Tier 2 mirrors are configured AND `effective_snapshot_on()` is
         `"all"`, the same snapshot is also created on every mirror in
         parallel; mirror failures surface as warnings but never abort
         the primary snapshot.
 
+        tag / message are optional named annotations (SNAP-TAG): when
+        `tag` is set we validate the name + enforce per-project tag
+        uniqueness against the existing manifest set before writing
+        anything. message is free-form, capped at MAX_MESSAGE_LEN. Both
+        keys are written into the manifest dict additively — pre-SNAP-TAG
+        manifests load with both fields = None.
+
         Returns the snapshot timestamp string (always sourced from the
         primary's snapshot)."""
+        if tag is not None:
+            _validate_tag_name(tag)
+            existing = self.find_by_tag(tag)
+            if existing is not None:
+                raise ValueError(
+                    f"Tag {tag!r} already in use by snapshot "
+                    f"{existing['timestamp']!r}. Pick a different name, "
+                    f"or run `claude-mirror forget {existing['timestamp']}` "
+                    "first to free the tag."
+                )
+        if message is not None:
+            _validate_message(message)
+
         fmt = (self.config.snapshot_format or "full").lower()
         mirror_mode = self.config.effective_snapshot_on()
         mirrors_active = bool(self._mirrors) and mirror_mode == "all"
 
         if fmt == "blobs":
             return self._create_blobs(
-                action, files_changed, mirrors_active=mirrors_active
+                action, files_changed,
+                mirrors_active=mirrors_active,
+                tag=tag, message=message,
             )
         return self._create_full(
-            action, files_changed, mirrors_active=mirrors_active
+            action, files_changed,
+            mirrors_active=mirrors_active,
+            tag=tag, message=message,
         )
+
+    def find_by_tag(self, tag: str) -> Optional[dict[str, Any]]:
+        """Return the snapshot dict matching `tag`, or None.
+
+        Lazily walks `self.list()` — same scan the user-facing snapshot
+        listing uses, so tag uniqueness check costs the same as one
+        `claude-mirror snapshots` invocation."""
+        for snap in self.list():
+            if snap.get("tag") == tag:
+                return snap
+        return None
+
+    def list_tags(self) -> List[str]:
+        """Return the set of in-use tag names, sorted. Helper for the
+        CLI's restore-by-tag error path so we can list candidates when
+        the user passes an unknown tag."""
+        return sorted(
+            {
+                str(s["tag"]) for s in self.list()
+                if s.get("tag")
+            }
+        )
+
+    def resolve_tag_to_timestamp(self, tag: str) -> str:
+        """Return the timestamp of the snapshot tagged `tag`. Raises
+        ValueError with the available-tags hint when the tag isn't found.
+        Used by `restore --tag NAME` so the existing restore() path
+        (which keys off timestamp) doesn't need a parallel API."""
+        _validate_tag_name(tag)
+        snap = self.find_by_tag(tag)
+        if snap is not None:
+            return str(snap["timestamp"])
+        available = self.list_tags()
+        if available:
+            hint = "Available tags: " + ", ".join(repr(t) for t in available) + "."
+        else:
+            hint = (
+                "No snapshots in this project carry a tag yet. Create one "
+                "with `claude-mirror snapshot --tag NAME`."
+            )
+        raise ValueError(f"Snapshot tag {tag!r} not found. {hint}")
 
     # ------------------------------------------------------------------
     # FULL format (legacy, server-side copy)
@@ -355,6 +479,8 @@ class SnapshotManager:
     def _create_full(
         self, action: str, files_changed: list[str],
         mirrors_active: bool = False,
+        tag: Optional[str] = None,
+        message: Optional[str] = None,
     ) -> str:
         """Create a full server-side-copy snapshot. No data passes through
         the client. When `mirrors_active`, the same snapshot is also
@@ -368,20 +494,27 @@ class SnapshotManager:
         # Always do the primary first (synchronously) so we can return
         # its timestamp even if every mirror fails.
         try:
-            self._create_full_on(self.storage, timestamp, action, files_changed)
+            self._create_full_on(
+                self.storage, timestamp, action, files_changed,
+                tag=tag, message=message,
+            )
         except Exception as e:
             # Primary failure DOES propagate — caller (sync engine) needs
             # to know the snapshot didn't take.
             raise
 
         if mirrors_active and self._mirrors:
-            self._mirror_full_in_parallel(timestamp, action, files_changed)
+            self._mirror_full_in_parallel(
+                timestamp, action, files_changed, tag=tag, message=message,
+            )
 
         return timestamp
 
     def _create_full_on(
         self, backend: StorageBackend, timestamp: str,
         action: str, files_changed: list[str],
+        tag: Optional[str] = None,
+        message: Optional[str] = None,
     ) -> None:
         """Internal: create the full-format snapshot on one specific
         backend. Each backend has to do its own server-side copies
@@ -432,6 +565,8 @@ class SnapshotManager:
                 "files_changed": meta.files_changed,
                 "total_files": meta.total_files,
                 "format": "full",
+                "tag": tag,
+                "message": message,
             },
             indent=2,
         ).encode()
@@ -446,12 +581,16 @@ class SnapshotManager:
 
     def _mirror_full_in_parallel(
         self, timestamp: str, action: str, files_changed: list[str],
+        tag: Optional[str] = None, message: Optional[str] = None,
     ) -> None:
         """Fan out full-format snapshot creation to every mirror in
         parallel. Per-mirror failures are reported, never raised."""
         def _one(backend: StorageBackend) -> tuple[StorageBackend, Optional[Exception]]:
             try:
-                self._create_full_on(backend, timestamp, action, files_changed)
+                self._create_full_on(
+                    backend, timestamp, action, files_changed,
+                    tag=tag, message=message,
+                )
                 return backend, None
             except Exception as e:
                 return backend, e
@@ -474,6 +613,8 @@ class SnapshotManager:
     def _create_blobs(
         self, action: str, files_changed: list[str],
         mirrors_active: bool = False,
+        tag: Optional[str] = None,
+        message: Optional[str] = None,
     ) -> str:
         """Create a content-addressed snapshot. Local files are SHA-256'd
         (with HashCache for repeat speed), unique blobs are uploaded once
@@ -528,6 +669,8 @@ class SnapshotManager:
             files_changed=files_changed,
             path_to_hash=path_to_hash,
             hash_to_local=hash_to_local,
+            tag=tag,
+            message=message,
         )
 
         if mirrors_active and self._mirrors:
@@ -537,6 +680,8 @@ class SnapshotManager:
                 files_changed=files_changed,
                 path_to_hash=path_to_hash,
                 hash_to_local=hash_to_local,
+                tag=tag,
+                message=message,
             )
 
         return timestamp
@@ -551,6 +696,8 @@ class SnapshotManager:
         files_changed: list[str],
         path_to_hash: dict[str, str],
         hash_to_local: dict[str, Path],
+        tag: Optional[str] = None,
+        message: Optional[str] = None,
     ) -> str:
         """Internal: create the blobs-format snapshot on one specific backend.
 
@@ -600,6 +747,8 @@ class SnapshotManager:
             "files_changed": _truncate_files(files_changed),
             "total_files": len(path_to_hash),
             "files": path_to_hash,
+            "tag": tag,
+            "message": message,
         }
         manifest_bytes = json.dumps(manifest, indent=2, sort_keys=True).encode()
         backend.upload_bytes(
@@ -625,6 +774,8 @@ class SnapshotManager:
         files_changed: list[str],
         path_to_hash: dict[str, str],
         hash_to_local: dict[str, Path],
+        tag: Optional[str] = None,
+        message: Optional[str] = None,
     ) -> None:
         """Fan out blobs-format snapshot creation to every mirror in
         parallel. Per-mirror failures are reported, never raised."""
@@ -641,6 +792,8 @@ class SnapshotManager:
                     files_changed=files_changed,
                     path_to_hash=path_to_hash,
                     hash_to_local=hash_to_local,
+                    tag=tag,
+                    message=message,
                 )
                 return backend, None
             except Exception as e:
@@ -734,13 +887,18 @@ class SnapshotManager:
                         meta = json.loads(raw)
                 except Exception:
                     pass
-                return {
+                # `tag` / `message` default to None when missing — keeps
+                # pre-SNAP-TAG meta sidecars loadable as v2 manifests.
+                base = {
                     "timestamp": item["name"],
                     "folder_id": item["id"],
                     "created": item.get("createdTime", ""),
                     "format": "full",
-                    **meta,
+                    "tag": None,
+                    "message": None,
                 }
+                base.update(meta)
+                return base
 
             def _fetch_blob_meta(item: dict[str, Any]) -> dict[str, Any]:
                 meta: dict[str, Any] = {}
@@ -762,6 +920,8 @@ class SnapshotManager:
                     "action": meta.get("action", ""),
                     "files_changed": meta.get("files_changed", []),
                     "total_files": meta.get("total_files", 0),
+                    "tag": meta.get("tag"),
+                    "message": meta.get("message"),
                 }
 
             if folders:
@@ -911,6 +1071,8 @@ class SnapshotManager:
                 "action": manifest.get("action", ""),
                 "files_changed": manifest.get("files_changed", []),
                 "total_files": manifest.get("total_files", len(files)),
+                "tag": manifest.get("tag"),
+                "message": manifest.get("message"),
             },
             "files": list(files),
         }
@@ -950,6 +1112,8 @@ class SnapshotManager:
                 "action": meta.get("action", ""),
                 "files_changed": meta.get("files_changed", []),
                 "total_files": meta.get("total_files", len(files)),
+                "tag": meta.get("tag"),
+                "message": meta.get("message"),
             },
             "files": list(files),
         }
@@ -1001,6 +1165,7 @@ class SnapshotManager:
                         "timestamp": snap["timestamp"],
                         "format": "blobs",
                         "hash": files[path],
+                        "tag": snap.get("tag"),
                     }
             except Exception:
                 pass
@@ -1027,6 +1192,7 @@ class SnapshotManager:
                     "timestamp": snap["timestamp"],
                     "format": "full",
                     "hash": None,  # would need download to compute
+                    "tag": snap.get("tag"),
                 }
             except Exception:
                 pass
@@ -1136,8 +1302,11 @@ class SnapshotManager:
             else:
                 version_cell = f"[dim]{ver}[/]"
             prev_version = ver
+            ts_cell = e["timestamp"]
+            if e.get("tag"):
+                ts_cell = f"{ts_cell} [dim][{e['tag']}][/]"
             table.add_row(
-                e["timestamp"],
+                ts_cell,
                 version_cell,
                 e["format"],
                 h[:12] if h else "[dim]?[/]",
@@ -1188,13 +1357,18 @@ class SnapshotManager:
             shown = files
 
         # Header
-        console.print(
+        header = (
             f"\n[bold]Snapshot[/] [cyan]{timestamp}[/]  "
             f"[dim]format=[/]{fmt}\n"
             f"  triggered_by:  {meta.get('triggered_by', '?')}\n"
             f"  action:        {meta.get('action', '?')}\n"
             f"  total_files:   {meta.get('total_files', '?')}"
         )
+        if meta.get("tag"):
+            header += f"\n  tag:           [cyan]{meta['tag']}[/]"
+        if meta.get("message"):
+            header += f"\n  message:       {meta['message']}"
+        console.print(header)
         if path_filter:
             console.print(
                 f"  filter:        [yellow]{path_filter}[/]  "
@@ -1232,24 +1406,32 @@ class SnapshotManager:
 
         table = Table(title="Snapshots", show_header=True)
         table.add_column("Timestamp", style="bold")
+        table.add_column("Tag")
         table.add_column("Format")
         table.add_column("By")
         table.add_column("Action")
         table.add_column("Changed")
         table.add_column("Total files")
+        table.add_column("Message")
 
         for s in snapshots:
             changed = s.get("files_changed", [])
             changed_str = ", ".join(changed[:3])
             if len(changed) > 3:
                 changed_str += f" +{len(changed) - 3} more"
+            tag_cell = (
+                f"[cyan]{s['tag']}[/]" if s.get("tag") else "[dim]—[/]"
+            )
+            msg_cell = _truncate_message_for_table(s.get("message"))
             table.add_row(
                 s["timestamp"],
+                tag_cell,
                 s.get("format", "?"),
                 s.get("triggered_by", "unknown"),
                 s.get("action", ""),
                 changed_str or "[dim]—[/]",
                 str(s.get("total_files", "?")),
+                msg_cell,
             )
 
         console.print(table)
@@ -2181,15 +2363,24 @@ class SnapshotManager:
         keep_last: Optional[int] = None,
         keep_days: Optional[int] = None,
         dry_run: bool = False,
+        include_tagged: bool = False,
     ) -> dict[str, Any]:
         """Delete snapshots matching one of the four selectors.
 
         timestamps: explicit list — delete snapshots whose timestamp string
             matches exactly. Use `claude-mirror snapshots` to find timestamps.
+            This selector ALWAYS deletes whatever is named, regardless of
+            tag — explicit user choice, no surprise.
         before: ISO date ("2026-04-15") or relative ("30d", "2w", "3m") —
             delete every snapshot strictly older than that point in time.
         keep_last: keep the N newest snapshots, delete the rest.
         keep_days: keep snapshots from the last N days, delete older.
+
+        SNAP-TAG: for the rule-based selectors (`before`, `keep_last`,
+        `keep_days`) tagged snapshots are skipped by default — same model
+        as `git tag` shielding a commit from `git gc`. Pass
+        `include_tagged=True` to opt in to deleting tagged snapshots
+        too.
 
         For `full`-format snapshots, the snapshot folder is deleted via the
         backend. For `blobs`-format, the manifest JSON is deleted; blobs in
@@ -2217,15 +2408,42 @@ class SnapshotManager:
         all_snapshots = self.list()
         if not all_snapshots:
             console.print("[dim]No snapshots on remote — nothing to forget.[/]")
-            return {"selected": 0, "deleted": 0, "errors": 0}
+            return {
+                "selected": 0, "deleted": 0, "errors": 0,
+                "skipped_tagged": [],
+            }
 
         targets = self._select_to_forget(
             all_snapshots, timestamps, before, keep_last, keep_days
         )
 
+        # Tag-protected pruning: when the selector is rule-based (NOT an
+        # explicit-timestamp list), shield tagged snapshots unless the
+        # caller explicitly passed include_tagged=True. Explicit
+        # `timestamps=` always wins so the user can still forget a
+        # tagged snapshot by name without flipping the flag.
+        protected: list[dict[str, Any]] = []
+        if not timestamps and not include_tagged:
+            protected = [s for s in targets if s.get("tag")]
+            if protected:
+                protected_set = {s["timestamp"] for s in protected}
+                targets = [
+                    s for s in targets if s["timestamp"] not in protected_set
+                ]
+
         if not targets:
-            console.print("[dim]No snapshots matched the selector — nothing to forget.[/]")
-            return {"selected": 0, "deleted": 0, "errors": 0}
+            if protected:
+                console.print(
+                    f"[dim]No snapshots matched the selector after "
+                    f"shielding {len(protected)} tagged snapshot(s) — "
+                    "nothing to forget. Pass --include-tagged to opt in.[/]"
+                )
+            else:
+                console.print("[dim]No snapshots matched the selector — nothing to forget.[/]")
+            return {
+                "selected": 0, "deleted": 0, "errors": 0,
+                "skipped_tagged": [s["timestamp"] for s in protected],
+            }
 
         kept = len(all_snapshots) - len(targets)
         console.print(
@@ -2233,6 +2451,11 @@ class SnapshotManager:
             f"  total snapshots:  {len(all_snapshots)}\n"
             f"  to delete:        {len(targets)}\n"
             f"  to keep:          {kept}"
+            + (
+                f"\n  tagged shielded:  {len(protected)}  "
+                "[dim](pass --include-tagged to opt in)[/]"
+                if protected else ""
+            )
             + ("\n  [dim](dry run — no writes)[/]" if dry_run else "")
         )
         for s in targets:
@@ -2242,7 +2465,10 @@ class SnapshotManager:
             )
 
         if dry_run:
-            return {"selected": len(targets), "deleted": 0, "errors": 0}
+            return {
+                "selected": len(targets), "deleted": 0, "errors": 0,
+                "skipped_tagged": [s["timestamp"] for s in protected],
+            }
 
         with make_phase_progress(console) as progress:
             del_task = progress.add_task(
@@ -2276,7 +2502,10 @@ class SnapshotManager:
                 "[dim]Tip: run [bold]claude-mirror gc[/] to reclaim blob space "
                 "from blobs no longer referenced by any remaining manifest.[/]"
             )
-        return {"selected": len(targets), "deleted": deleted, "errors": errors}
+        return {
+            "selected": len(targets), "deleted": deleted, "errors": errors,
+            "skipped_tagged": [s["timestamp"] for s in protected],
+        }
 
     def prune_per_retention(
         self,
@@ -2286,6 +2515,7 @@ class SnapshotManager:
         keep_monthly: int = 0,
         keep_yearly: int = 0,
         dry_run: bool = True,
+        include_tagged: bool = False,
     ) -> dict[str, Any]:
         """Apply a multi-bucket retention policy to the snapshot set.
 
@@ -2293,6 +2523,10 @@ class SnapshotManager:
         the union is retained, the rest is deleted. With every parameter
         at 0 the policy is disabled and the call is a no-op (returns
         zero deletions).
+
+        SNAP-TAG: tagged snapshots are skipped by default — same model as
+        `forget --before`. Pass `include_tagged=True` to opt in to
+        pruning tagged snapshots too.
 
         Returns a dict with `selected`, `deleted`, `errors`, plus
         `to_keep` and `to_delete` lists of timestamp strings — handy for
@@ -2302,14 +2536,14 @@ class SnapshotManager:
         if not any((keep_last, keep_daily, keep_monthly, keep_yearly)):
             return {
                 "selected": 0, "deleted": 0, "errors": 0,
-                "to_keep": [], "to_delete": [],
+                "to_keep": [], "to_delete": [], "skipped_tagged": [],
             }
 
         all_snapshots = self.list()
         if not all_snapshots:
             return {
                 "selected": 0, "deleted": 0, "errors": 0,
-                "to_keep": [], "to_delete": [],
+                "to_keep": [], "to_delete": [], "skipped_tagged": [],
             }
 
         keep_set = self._compute_retention_keep_set(
@@ -2322,10 +2556,24 @@ class SnapshotManager:
         to_delete = [s for s in all_snapshots if s["timestamp"] not in keep_set]
         to_keep_ts = [s["timestamp"] for s in all_snapshots if s["timestamp"] in keep_set]
 
+        # Tag-protected pruning: shield tagged snapshots from automated
+        # retention unless include_tagged=True. Mirrors `forget`.
+        protected: list[dict[str, Any]] = []
+        if not include_tagged:
+            protected = [s for s in to_delete if s.get("tag")]
+            if protected:
+                protected_set = {s["timestamp"] for s in protected}
+                to_delete = [s for s in to_delete if s["timestamp"] not in protected_set]
+                # Tagged snapshots that retention would have deleted are
+                # effectively kept — fold them into the "to_keep" view so
+                # downstream callers get a complete keep-set.
+                to_keep_ts = list(to_keep_ts) + [s["timestamp"] for s in protected]
+
         if not to_delete:
             return {
                 "selected": 0, "deleted": 0, "errors": 0,
                 "to_keep": to_keep_ts, "to_delete": [],
+                "skipped_tagged": [s["timestamp"] for s in protected],
             }
 
         policy_summary = ", ".join(
@@ -2343,6 +2591,11 @@ class SnapshotManager:
             f"  total snapshots:  {len(all_snapshots)}\n"
             f"  to delete:        {len(to_delete)}\n"
             f"  to keep:          {len(to_keep_ts)}"
+            + (
+                f"\n  tagged shielded:  {len(protected)}  "
+                "[dim](pass --include-tagged to opt in)[/]"
+                if protected else ""
+            )
             + ("\n  [dim](dry run — no writes)[/]" if dry_run else "")
         )
         for s in to_delete:
@@ -2356,6 +2609,7 @@ class SnapshotManager:
                 "selected": len(to_delete), "deleted": 0, "errors": 0,
                 "to_keep": to_keep_ts,
                 "to_delete": [s["timestamp"] for s in to_delete],
+                "skipped_tagged": [s["timestamp"] for s in protected],
             }
 
         deleted = 0
@@ -2384,6 +2638,7 @@ class SnapshotManager:
             "selected": len(to_delete), "deleted": deleted, "errors": errors,
             "to_keep": to_keep_ts,
             "to_delete": [s["timestamp"] for s in to_delete],
+            "skipped_tagged": [s["timestamp"] for s in protected],
         }
 
     def _compute_retention_keep_set(
@@ -2617,6 +2872,8 @@ class SnapshotManager:
             "total_files": len(path_to_hash),
             "files": path_to_hash,
             "migrated_from": "full",
+            "tag": original_meta.get("tag"),
+            "message": original_meta.get("message"),
         }
         manifest_bytes = json.dumps(manifest, indent=2, sort_keys=True).encode()
         self.storage.upload_bytes(
@@ -2689,6 +2946,8 @@ class SnapshotManager:
                 "total_files": len(path_to_hash),
                 "format": "full",
                 "migrated_from": "blobs",
+                "tag": manifest.get("tag"),
+                "message": manifest.get("message"),
             },
             indent=2,
         ).encode()

@@ -57,17 +57,18 @@ claude-mirror delete      FILES... [--local] [--dry-run/--no-dry-run] [--config 
 claude-mirror watch       [--config PATH]
 claude-mirror watch-all   [--config PATH ...]   (default: all configs in ~/.config/claude_mirror/)
 claude-mirror reload
+claude-mirror snapshot          [--tag NAME] [--message TEXT] [--config PATH]   # create a snapshot on demand; tags + messages are optional
 claude-mirror snapshots         [--config PATH]
 claude-mirror inspect           TIMESTAMP [--paths GLOB] [--config PATH]
 claude-mirror history           PATH [--since DATE/DURATION] [--until DATE/DURATION] [--config PATH]
 claude-mirror snapshot-diff     TS1 TS2 [--all] [--paths GLOB] [--unified PATH] [--config PATH]
 claude-mirror retry             [--backend NAME] [--dry-run] [--config PATH]
 claude-mirror seed-mirror       [--backend NAME] [--dry-run] [--config PATH]   # populate a freshly-added mirror with files already on the primary; auto-detects when exactly one mirror is unseeded
-claude-mirror restore           TIMESTAMP [PATH ...] [--backend NAME] [--output PATH] [--dry-run/--no-dry-run] [--config PATH]
+claude-mirror restore           [TIMESTAMP] [PATH ...] [--tag NAME] [--backend NAME] [--output PATH] [--dry-run/--no-dry-run] [--config PATH]   # pass either TIMESTAMP or --tag NAME, not both
 claude-mirror forget            TIMESTAMP... | --before DATE/DURATION | --keep-last N | --keep-days N
-                              [--delete] [--yes] [--config PATH]   # dry-run by default; --delete to actually delete
+                              [--delete] [--yes] [--include-tagged] [--config PATH]   # dry-run by default; --delete to actually delete; tagged snapshots shielded from rule-based selectors unless --include-tagged
 claude-mirror prune             [--keep-last N] [--keep-daily N] [--keep-monthly N] [--keep-yearly N]
-                              [--delete] [--yes] [--config PATH]   # dry-run by default; reads keep_* from config
+                              [--delete] [--yes] [--include-tagged] [--config PATH]   # dry-run by default; reads keep_* from config; tagged snapshots shielded unless --include-tagged
 claude-mirror gc                [--backend NAME] [--delete] [--yes] [--config PATH]   # dry-run by default; --delete to actually delete; --backend targets a specific mirror (Tier 2)
 claude-mirror doctor            [--backend NAME] [--config PATH]   # end-to-end self-test: config + credentials + connectivity + project + manifest (+ deep checks under --backend googledrive or --backend dropbox)
 claude-mirror health            [--no-backends] [--timeout N] [--json] [--config PATH]   # machine-readable monitoring probe; exit 0 ok / 1 warn / 2 fail
@@ -314,20 +315,24 @@ Newest-first, capped by `--limit` (default 20). `snapshot_timestamp` is reserved
       "format": "blobs",
       "file_count": 12,
       "size_bytes": null,
-      "source_backend": "primary"
+      "source_backend": "primary",
+      "tag": "v1.0",
+      "message": "first stable release"
     },
     {
       "timestamp": "2026-05-07T09-00-00Z",
       "format": "full",
       "file_count": 10,
       "size_bytes": null,
-      "source_backend": "primary"
+      "source_backend": "primary",
+      "tag": null,
+      "message": null
     }
   ]
 }
 ```
 
-Newest-first. `size_bytes` is `null` when not recorded (full-format snapshots and older blobs manifests don't track end-to-end byte totals). `source_backend` is `"primary"` today — `snapshots` lists from the primary backend; in a future release it may report the actual backend name when listing per-mirror.
+Newest-first. `size_bytes` is `null` when not recorded (full-format snapshots and older blobs manifests don't track end-to-end byte totals). `source_backend` is `"primary"` today — `snapshots` lists from the primary backend; in a future release it may report the actual backend name when listing per-mirror. `tag` and `message` are additive SNAP-TAG fields (since the post-v0.5.59 release); both are `null` for snapshots taken before SNAP-TAG or for untagged / unmessaged snapshots.
 
 ### Common piping recipes
 
@@ -538,9 +543,18 @@ Transient backend errors during a follow loop (network blip, 5xx, rate-limit) pr
 
 ## Snapshots
 
+### `snapshot`
+
+Create a snapshot of the current project state on demand. Pushes auto-create snapshots already; this command is for the case where a maintainer wants an explicit, optionally-named rollback target before a risky change. Both flags are optional:
+
+- `--tag NAME` — short identifier (must match `^[A-Za-z0-9._-]{1,64}$`), unique per project. Restorable later via `claude-mirror restore --tag NAME`. Tagged snapshots are shielded from automated retention pruning unless `--include-tagged` is passed to `prune` / `forget`.
+- `--message TEXT` — free-form annotation, max 1024 chars. Visible in `claude-mirror snapshots` and `claude-mirror inspect`. Composes with or stands alone from `--tag` (a messaged-but-untagged snapshot is fine — same shape as a git commit message without a `git tag` later).
+
+A duplicate tag exits 1 with a hint to pick a different name or `forget` the existing snapshot first. See [admin.md — Naming a snapshot](admin.md#naming-a-snapshot).
+
 ### `snapshots`
 
-List every available snapshot for the project, with a `Format` column distinguishing `blobs` from `full` snapshots. Both formats are listed together.
+List every available snapshot for the project, with a `Format` column distinguishing `blobs` from `full` snapshots. Both formats are listed together. Includes `Tag` and `Message` columns surfacing the SNAP-TAG metadata (empty cells for untagged / unmessaged snapshots — both are optional).
 
 ### `inspect`
 
@@ -556,15 +570,21 @@ Show what changed between two snapshots. `TS1` is the "from" snapshot; `TS2` is 
 
 ### `restore`
 
-Restore one or more files (or the whole snapshot) from `TIMESTAMP`. With Tier 2, falls back to mirrors in `mirror_config_paths` order if the snapshot is missing on the primary; pass `--backend NAME` to force a specific source. Use `--output PATH` to restore to a safe inspection directory instead of overwriting the project. Pass `--dry-run` to preview every file the restore would write (Path / Action / Source backend / Size) without touching local disk; the summary ends with `Run without --dry-run to apply.`. Default is `--no-dry-run` (existing behaviour). Auto-detects the snapshot's format. See [admin.md — Previewing a restore](admin.md#previewing-a-restore).
+Restore one or more files (or the whole snapshot) from `TIMESTAMP`. Pass either a positional TIMESTAMP or `--tag NAME` (mutually exclusive — passing both, or neither, exits 1 with a clear error). With Tier 2, falls back to mirrors in `mirror_config_paths` order if the snapshot is missing on the primary; pass `--backend NAME` to force a specific source. Use `--output PATH` to restore to a safe inspection directory instead of overwriting the project. Pass `--dry-run` to preview every file the restore would write (Path / Action / Source backend / Size) without touching local disk; the summary ends with `Run without --dry-run to apply.`. Default is `--no-dry-run` (existing behaviour). Auto-detects the snapshot's format.
+
+`--tag NAME` resolves to the matching snapshot's timestamp before the existing restore path runs — composes with all the same flags. If the tag doesn't exist in this project the command lists the available tags and exits 1. See [admin.md — Naming a snapshot](admin.md#naming-a-snapshot) and [admin.md — Previewing a restore](admin.md#previewing-a-restore).
 
 ### `forget`
 
 Delete snapshots matching one selector: positional `TIMESTAMP...`, `--before DATE/DURATION` (`30d` / `2w` / `3m` / `1y` accepted), `--keep-last N`, or `--keep-days N`. Dry-run by default. Pass `--delete` plus a typed `YES` confirmation to actually delete (or `--yes` to skip the prompt for cron / CI).
 
+Tagged snapshots (see [admin.md — Naming a snapshot](admin.md#naming-a-snapshot)) are shielded from rule-based selectors (`--before` / `--keep-last` / `--keep-days`) by default — same model as `git tag` protecting commits from automated GC. Pass `--include-tagged` to opt in to deleting tagged snapshots too. Explicit positional `forget TIMESTAMP` deletions are NEVER shielded — naming a tagged snapshot directly is an explicit user choice, no surprise.
+
 ### `prune`
 
 Apply the YAML retention policy (`keep_last`, `keep_daily`, `keep_monthly`, `keep_yearly`) by hand. Same dry-run / `--delete` / `--yes` contract as `forget`. Any `--keep-*` flag overrides the corresponding config field for that one run only.
+
+Tagged snapshots are shielded from retention pruning by default. Pass `--include-tagged` to opt in.
 
 ### `migrate-snapshots`
 

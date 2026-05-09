@@ -5150,6 +5150,68 @@ def reload() -> None:
 
 
 @cli.command()
+@click.option("--tag", "tag", default="",
+              help="Optional named tag for the snapshot. Must match "
+                   "^[A-Za-z0-9._-]{1,64}$. Tagged snapshots are "
+                   "restorable by name (`restore --tag NAME`) and are "
+                   "skipped by `prune` / `forget --before` unless "
+                   "`--include-tagged` is passed. Per-project unique.")
+@click.option("--message", "message", default="",
+              help="Optional free-form annotation (max 1024 chars) "
+                   "attached to the snapshot's manifest. Visible in "
+                   "`claude-mirror snapshots` and `claude-mirror inspect`. "
+                   "Composes with --tag or stands alone (a messaged "
+                   "snapshot without a tag is fine — same as a git "
+                   "commit message without a `git tag` later).")
+@click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
+def snapshot(tag: str, message: str, config_path: str) -> None:
+    """Create a snapshot of the current project state.
+
+    \b
+    Pushes auto-create snapshots already; this command lets a maintainer
+    take an explicit, optionally tagged + messaged snapshot — handy
+    before a risky change so the rollback target has a memorable name.
+
+    \b
+    Examples:
+      claude-mirror snapshot
+      claude-mirror snapshot --tag v1.0
+      claude-mirror snapshot --message "before the big refactor"
+      claude-mirror snapshot --tag v1.0 --message "first stable release"
+
+    Tag rules: 1-64 ASCII chars, alphanumeric or '.', '_', '-' only —
+    no spaces, no slashes, no '@', no unicode. Tags are unique per
+    project; pick a different name (or `forget` the existing one
+    first) if the tag is already in use.
+
+    Restore by name later:
+      claude-mirror restore --tag v1.0
+    """
+    config = Config.load(_resolve_config(config_path))
+    storage, mirrors = _create_storage_set(config)
+    snap = SnapshotManager(config, storage, mirrors=mirrors)
+    try:
+        ts = snap.create(
+            action="manual",
+            files_changed=[],
+            tag=tag or None,
+            message=message or None,
+        )
+    except ValueError as e:
+        console.print(f"[red]{e}[/]")
+        sys.exit(1)
+    extras = []
+    if tag:
+        extras.append(f"tag=[cyan]{tag}[/]")
+    if message:
+        extras.append(f"message=[dim]{message[:60]}[/]")
+    suffix = f"  ({', '.join(extras)})" if extras else ""
+    console.print(
+        f"[green]Snapshot created:[/] [bold]{ts}[/]{suffix}"
+    )
+
+
+@cli.command()
 @click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
 @click.option("--json", "json_output", is_flag=True, default=False,
               help="Emit a single flat JSON document to stdout instead of "
@@ -5203,12 +5265,21 @@ def _snapshot_entry_to_json(entry: dict[str, Any]) -> dict[str, Any]:
         "file_count": file_count,
         "size_bytes": size_bytes,
         "source_backend": entry.get("source_backend", "primary"),
+        "tag": entry.get("tag"),
+        "message": entry.get("message"),
     }
 
 
 @cli.command()
-@click.argument("timestamp")
+@click.argument("timestamp", required=False, default="")
 @click.argument("paths", nargs=-1)
+@click.option("--tag", "tag", default="",
+              help="Restore the snapshot tagged NAME instead of by "
+                   "timestamp. Mutually exclusive with the positional "
+                   "TIMESTAMP argument. The tag must match "
+                   "^[A-Za-z0-9._-]{1,64}$ and exist in this project; "
+                   "if not, the available tags are listed and the "
+                   "command exits 1.")
 @click.option("--output", default="", help="Directory to restore files into. Defaults to project path.")
 @click.option("--backend", "backend_name", default="",
               shell_complete=_backend_value_completer,
@@ -5222,13 +5293,14 @@ def _snapshot_entry_to_json(entry: dict[str, Any]) -> dict[str, Any]:
                    "disk. Exits 0 after printing the plan. Default: "
                    "--no-dry-run (the actual restore runs as before).")
 @click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
-def restore(timestamp: str, paths: tuple[Any, ...], output: str, backend_name: str,
+def restore(timestamp: str, paths: tuple[Any, ...], tag: str, output: str, backend_name: str,
             dry_run: bool, config_path: str) -> None:
     """
     Restore a snapshot to a local directory.
 
     TIMESTAMP is the snapshot name shown by `claude-mirror snapshots`
-    (e.g. 2026-03-05T10-30-00Z).
+    (e.g. 2026-03-05T10-30-00Z). Alternatively, pass --tag NAME to
+    restore by named tag (mutually exclusive with TIMESTAMP).
 
     PATHS is an optional list of relative paths or fnmatch globs to
     restrict the restore to specific files only — by default the whole
@@ -5241,6 +5313,8 @@ def restore(timestamp: str, paths: tuple[Any, ...], output: str, backend_name: s
       claude-mirror restore 2026-05-05T10-15-22Z '*.md'
       claude-mirror restore 2026-05-05T10-15-22Z --backend dropbox
       claude-mirror restore 2026-05-05T10-15-22Z --dry-run
+      claude-mirror restore --tag v1.0
+      claude-mirror restore --tag pre-refactor 'memory/**' --output ~/tmp/recovery
 
     By default, files are restored to the original project path (with
     a confirmation prompt). Use --output to restore to a separate
@@ -5262,9 +5336,33 @@ def restore(timestamp: str, paths: tuple[Any, ...], output: str, backend_name: s
     target without the fallback chain (e.g. when the primary is
     unreachable or you know which mirror has the right version).
     """
+    # Mutually exclusive: --tag NAME OR positional TIMESTAMP.
+    if tag and timestamp:
+        console.print(
+            "[red]Pass either TIMESTAMP or --tag NAME, not both.[/]"
+        )
+        sys.exit(1)
+    if not tag and not timestamp:
+        console.print(
+            "[red]Missing snapshot identifier:[/] pass either a "
+            "TIMESTAMP positional argument or --tag NAME."
+        )
+        sys.exit(1)
+
     config = Config.load(_resolve_config(config_path))
     storage, mirrors = _create_storage_set(config)
     snap = SnapshotManager(config, storage, mirrors=mirrors)
+
+    if tag:
+        try:
+            timestamp = snap.resolve_tag_to_timestamp(tag)
+        except ValueError as e:
+            console.print(f"[red]{e}[/]")
+            sys.exit(1)
+        console.print(
+            f"[dim]Resolved tag[/] [cyan]{tag}[/] [dim]→[/] "
+            f"[bold]{timestamp}[/]"
+        )
 
     if dry_run:
         try:
@@ -6103,6 +6201,13 @@ def _emit_unified_diff(
 @click.option("--yes", "skip_confirm", is_flag=True, default=False,
               help="With --delete, skip both confirmation prompts. Required "
                    "for non-interactive use.")
+@click.option("--include-tagged", "include_tagged", is_flag=True, default=False,
+              help="Include tagged snapshots in rule-based deletions "
+                   "(--before / --keep-last / --keep-days). Default: "
+                   "tagged snapshots are shielded from these selectors "
+                   "— same model as `git tag` protecting commits from "
+                   "automated GC. Explicit positional TIMESTAMP "
+                   "deletions are NEVER shielded.")
 @click.option("--config", "config_path", default="",
               help="Config file path. Auto-detected from cwd if omitted.")
 def forget(
@@ -6113,6 +6218,7 @@ def forget(
     do_delete: bool,
     dry_run: bool,
     skip_confirm: bool,
+    include_tagged: bool,
     config_path: str,
 ) -> None:
     """Delete one or more snapshots from remote storage.
@@ -6161,6 +6267,7 @@ def forget(
         before=before or None,
         keep_last=keep_last,
         keep_days=keep_days,
+        include_tagged=include_tagged,
     )
 
     # Up-front banner when running in dry-run mode (no --delete) so the
@@ -6234,6 +6341,11 @@ def forget(
 @click.option("--yes", "skip_confirm", is_flag=True, default=False,
               help="With --delete, skip the typed-YES confirmation prompt. "
                    "Required for non-interactive use (cron, CI).")
+@click.option("--include-tagged", "include_tagged", is_flag=True, default=False,
+              help="Include tagged snapshots in retention pruning. "
+                   "Default: tagged snapshots are shielded from "
+                   "automated retention — same model as `git tag` "
+                   "protecting commits from `git gc`.")
 @click.option("--config", "config_path", default="",
               help="Config file path. Auto-detected from cwd if omitted.")
 def prune(
@@ -6243,6 +6355,7 @@ def prune(
     keep_yearly: Optional[int],
     do_delete: bool,
     skip_confirm: bool,
+    include_tagged: bool,
     config_path: str,
 ) -> None:
     """Apply a multi-bucket retention policy to remote snapshots.
@@ -6301,6 +6414,7 @@ def prune(
         keep_monthly=eff_keep_monthly,
         keep_yearly=eff_keep_yearly,
         dry_run=True,
+        include_tagged=include_tagged,
     )
 
     if not do_delete:
@@ -6343,6 +6457,7 @@ def prune(
         keep_monthly=eff_keep_monthly,
         keep_yearly=eff_keep_yearly,
         dry_run=False,
+        include_tagged=include_tagged,
     )
 
 

@@ -83,7 +83,44 @@ By default the project's YAML is updated to the new format on success. Pass `--n
 claude-mirror snapshots
 ```
 
-Both formats are listed together with a `Format` column.
+Both formats are listed together with a `Format` column. Two further columns surface tag-snapshot metadata: `Tag` (the named tag, if any) and `Message` (a free-form annotation truncated to ~50 chars in the table).
+
+### Naming a snapshot
+
+Pushes auto-create snapshots already; sometimes a maintainer wants an explicit, memorable rollback target. `claude-mirror snapshot` takes a snapshot on demand and lets you attach an optional `--tag NAME` (a short identifier) and/or `--message TEXT` (a free-form annotation) so you can find it by name later instead of having to remember a UTC timestamp:
+
+```bash
+# Take a named snapshot before a risky change
+claude-mirror snapshot --tag pre-refactor --message "before the big sync-engine refactor"
+
+# Roll back to it later by name (no need to remember the timestamp)
+claude-mirror restore --tag pre-refactor
+
+# Tagged snapshots are skipped by `prune` (`--include-tagged` to override)
+claude-mirror prune --keep-last 5 --delete                    # tagged snapshots are shielded
+claude-mirror prune --keep-last 5 --include-tagged --delete   # opt in to deleting them
+```
+
+Tag rules: names must match the regex `^[A-Za-z0-9._-]{1,64}$` — 1 to 64 ASCII characters, alphanumeric or `.`, `_`, `-` only. No spaces, no slashes, no `@`, no unicode. Tags are unique per project; trying to reuse a tag exits 1 with a hint to either pick a different name or `forget` the existing snapshot first. Both flags are optional and compose freely:
+
+```bash
+claude-mirror snapshot                                   # untagged, no message — same as before
+claude-mirror snapshot --tag v1.0
+claude-mirror snapshot --message "before the big refactor"
+claude-mirror snapshot --tag v1.0 --message "first stable release"
+```
+
+Restore by tag composes with the existing flags (`--output PATH`, `[PATHS...]`, `--dry-run`, `--backend NAME`):
+
+```bash
+claude-mirror restore --tag v1.0 --output ~/tmp/recovery
+claude-mirror restore --tag v1.0 'memory/**'
+claude-mirror restore --tag v1.0 --dry-run
+```
+
+If the tag doesn't exist in this project, the command exits 1 with the available tags listed so you can pick the right one. Mutual-exclusion: pass `--tag NAME` OR a positional TIMESTAMP, not both.
+
+The `_claude_mirror_snapshots/{TIMESTAMP}.json` (blobs) and `_claude_mirror_snapshots/{TIMESTAMP}/` (full) on-disk identities are unchanged — tags are an additive annotation on top of the existing manifest. Pre-SNAP-TAG snapshots (taken before this release) load cleanly with both fields blank.
 
 ### Delete old snapshots
 

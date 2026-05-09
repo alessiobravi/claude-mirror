@@ -305,6 +305,8 @@ claude-mirror watch-all                 # watch every config in ~/.config/claude
 claude-mirror log                       # who pushed what, when, across machines
 claude-mirror log --follow              # live tail -f: stream new entries as they arrive
 claude-mirror inbox                     # show + clear pending notifications
+claude-mirror snapshot --tag v1.0 --message "first stable"   # explicit named snapshot you can restore by name
+claude-mirror restore --tag v1.0        # restore by tag instead of by timestamp
 claude-mirror status --json | jq '.result.summary'   # script-friendly output
 ```
 

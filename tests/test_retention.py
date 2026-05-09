@@ -99,7 +99,7 @@ def test_prune_all_zero_policy_is_noop(make_config):
     out = mgr.prune_per_retention(dry_run=False)
     assert out == {
         "selected": 0, "deleted": 0, "errors": 0,
-        "to_keep": [], "to_delete": [],
+        "to_keep": [], "to_delete": [], "skipped_tagged": [],
     }
     assert mgr.deleted_timestamps == []
 
@@ -220,7 +220,7 @@ def test_prune_no_snapshots_is_clean_noop(make_config):
     out = mgr.prune_per_retention(keep_last=10, dry_run=False)
     assert out == {
         "selected": 0, "deleted": 0, "errors": 0,
-        "to_keep": [], "to_delete": [],
+        "to_keep": [], "to_delete": [], "skipped_tagged": [],
     }
 
 

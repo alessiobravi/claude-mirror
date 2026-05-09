@@ -306,7 +306,10 @@ class SnapshotManager:
         for pattern in self.config.file_patterns:
             for path in project.glob(pattern):
                 if path.is_file() and path.name != ".claude_mirror_manifest.json":
-                    rel = str(path.relative_to(project))
+                    # `.as_posix()` (NOT `str()`) — see the matching
+                    # comment in `sync.py`'s walker for why manifest
+                    # keys must be forward-slash on Windows too.
+                    rel = path.relative_to(project).as_posix()
                     if not self._is_excluded(rel):
                         found[rel] = path
         return sorted(found.items())

@@ -3514,7 +3514,11 @@ def diff(path: str, config_path: str, context_lines: int) -> None:
     candidate = Path(path)
     if candidate.is_absolute():
         try:
-            rel_path = str(candidate.resolve().relative_to(project_root))
+            # `.as_posix()` so the rel_path matches manifest keys (which
+            # are forward-slash on every platform — see snapshots.py /
+            # sync.py walker). On Windows this normalises `memory\note.md`
+            # → `memory/note.md` so glob matches and lookups work.
+            rel_path = candidate.resolve().relative_to(project_root).as_posix()
         except ValueError:
             console.print(
                 f"[red]Path is outside the project root.[/]\n"

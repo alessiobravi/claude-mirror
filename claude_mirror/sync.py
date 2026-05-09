@@ -258,7 +258,13 @@ class SyncEngine:
         for pattern in self.config.file_patterns:
             for path in self._project.glob(pattern):
                 if path.is_file() and path.name != ".claude_mirror_manifest.json":
-                    rel = str(path.relative_to(self._project))
+                    # `.as_posix()` (NOT `str()`) so manifest keys use
+                    # forward slashes on Windows too — keys flow into
+                    # remote storage paths and have to be cross-platform
+                    # stable. A Windows machine writing `a\b.md` to the
+                    # manifest would break sync against a Linux machine
+                    # reading the same remote.
+                    rel = path.relative_to(self._project).as_posix()
                     if not self._is_excluded(rel):
                         found.add(rel)
         return sorted(found)

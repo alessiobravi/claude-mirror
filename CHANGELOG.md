@@ -4,6 +4,35 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.53] — 2026-05-09
+
+Hotfix for v0.5.52. The Windows-runner CI matrix added in WIN-CI surfaced a real cross-platform source bug that the WIN-CI agent missed because it ran tests only on macOS (which uses forward slashes natively): manifest keys + glob comparisons were using OS-native path separators on Windows.
+
+### Fixed — Manifest keys and glob comparisons now use forward slashes on Windows
+- **The bug:** three source sites used `str(path.relative_to(project_root))` to compute relative paths. On macOS / Linux this returns forward slashes; on Windows it returns backslashes (`memory\note.md`). Manifest keys flow into remote storage paths, so a Windows machine writing `memory\note.md` to the manifest would break sync against a Linux machine reading the same remote — the keys wouldn't match.
+- **What CI caught:** 10 test failures on the new Windows runners flagged by path-separator assertions in `test_snapshots.py`, `test_restore_dry_run.py`, etc. The assertions were correct; the source code was wrong.
+- **Fix:** all 3 sites now use `Path.relative_to(...).as_posix()` instead of `str(...)`. Forward slashes everywhere, regardless of platform. Sites:
+  - `claude_mirror/sync.py:_local_files()` — file walker building the local-file set fed to `engine.get_status()`.
+  - `claude_mirror/snapshots.py:_collect_local_paths()` — snapshot creator collecting paths to upload.
+  - `claude_mirror/cli.py:_resolve_path()` — absolute-path-to-relative resolver used by `diff`, `restore`, and friends.
+- The corrected `as_posix()` calls also affect `_is_excluded()` and `fnmatch.fnmatchcase()` glob comparisons. Users' YAML `file_patterns: ["**/*.md"]` and `exclude_patterns: ["archive/**"]` are typically authored with forward slashes; on Windows they would have failed to match the OS-native separator paths the walker was previously producing. Now they match consistently.
+
+### Lesson learned
+- The WIN-CI agent's macOS-local "all tests pass" check was insufficient — Linux uses forward slashes too, so forward-slash assertions pass on macOS. Windows is the only OS that surfaces this bug class. Cross-platform CI is genuinely necessary; it caught what Linux-only CI would never have caught.
+- Memory `feedback_agent_integration_pattern.md` updated with a new note: when an agent ships a multi-platform feature, treat the absence of failures on the agent's own platform as zero evidence that the OTHER platforms work. Cross-platform claims need cross-platform CI.
+
+### Updated docs/files
+- `claude_mirror/sync.py` (1-line fix + comment).
+- `claude_mirror/snapshots.py` (1-line fix + comment).
+- `claude_mirror/cli.py` (1-line fix + comment).
+- `pyproject.toml` (version 0.5.52 → 0.5.53).
+
+### Tests
+- `pytest tests/` — **834 passed locally on macOS** (same as v0.5.52 — these tests were already correct; the source code was wrong).
+- The Windows CI runs that flagged the bug in v0.5.52 will now pass after this fix lands.
+
+---
+
 ## [0.5.52] — 2026-05-09
 
 Two internal-quality additions: Windows in the CI matrix and `mypy --strict` as a separate CI gate. **MYPY caught a real runtime bug** — `redact_error` was called at four sites in `cli.py` but never imported, which would have raised `NameError` on every invocation. Plus 5 latent type-correctness issues that mypy surfaced as real defects (not just style).

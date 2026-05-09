@@ -9,12 +9,9 @@ is the regression guard for that fix.
 from __future__ import annotations
 
 import json
-import sys
 import threading
 import time
 from pathlib import Path
-
-import pytest
 
 from claude_mirror.notifier import (
     INBOX_FILENAME,
@@ -64,15 +61,6 @@ def test_inbox_read_when_empty_returns_empty_list(project_dir: Path) -> None:
     assert read_and_clear_inbox(str(project_dir)) == []
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason=(
-        "Inbox locking uses fcntl (POSIX-only). On Windows the fallback path "
-        "is a no-op, so strict TOCTOU atomicity between concurrent writers "
-        "and the drain cannot be guaranteed today. Tracked separately as a "
-        "Windows-locking gap (msvcrt.locking / portalocker)."
-    ),
-)
 def test_inbox_read_clears_atomically_against_concurrent_writer(project_dir: Path) -> None:
     """TOCTOU regression test — v0.5.5 fix.
 

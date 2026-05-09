@@ -524,7 +524,7 @@ pgrep -f "claude-mirror watch-all"      # PID(s) if running, exit 1 if not
 claude-mirror watch-all                 # foreground run; Ctrl+C to stop
 ```
 
-**Windows:** `watch-all` is POSIX-only today (it uses `SIGHUP` for hot-reload). Use the cron-style polling form instead — `claude-mirror watch --once --quiet` from Task Scheduler at the cadence you want.
+**Windows:** `watch-all` is POSIX-only today (it uses `SIGHUP` for hot-reload). Use the cron-style polling form instead — `claude-mirror watch --once --quiet` from Task Scheduler at the cadence you want. The inbox file lock that serializes concurrent watcher threads is now cross-platform (`msvcrt.locking` on Windows, `fcntl.flock` on POSIX), so the previous v0.5.54 caveat about Windows watchers losing lines under concurrent drains no longer applies — the strict TOCTOU regression test now runs on every platform.
 
 If the process is alive but a specific project still isn't getting events, run `claude-mirror reload` to send the running watcher a `SIGHUP` (re-scans `~/.config/claude_mirror/` for new configs). If that doesn't help, [`claude-mirror doctor`](#doctor) will tell you whether the project's backend itself is reachable and whether the notification channel (Drive Pub/Sub, Dropbox cursor, OneDrive/WebDAV/SFTP poll loop) is configured correctly.
 

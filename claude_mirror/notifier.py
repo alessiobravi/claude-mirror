@@ -7,10 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-try:
-    import fcntl  # POSIX file locking — used to serialize inbox appends
-except ImportError:  # pragma: no cover — Windows fallback
-    fcntl = None  # type: ignore[assignment]  # POSIX-only module; None sentinel triggers fallback path
+from ._filelock import exclusive_lock
 
 INBOX_FILENAME = ".claude_mirror_inbox.jsonl"
 
@@ -91,7 +88,7 @@ class Notifier:
 
     def _write_inbox(self, title: str, message: str, event: dict[str, Any] | None) -> None:
         """Append notification to the project-scoped inbox file under an exclusive
-        flock so concurrent watcher threads can't interleave their JSON lines."""
+        lock so concurrent watcher threads can't interleave their JSON lines."""
         try:
             entry = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -102,20 +99,9 @@ class Notifier:
                 entry.update(event)
             line = json.dumps(entry) + "\n"
             with self._inbox.open("a") as f:
-                if fcntl is not None:
-                    try:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                    except OSError:
-                        pass
-                try:
+                with exclusive_lock(f):
                     f.write(line)
                     f.flush()
-                finally:
-                    if fcntl is not None:
-                        try:
-                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                        except OSError:
-                            pass
         except Exception:
             pass
 
@@ -158,23 +144,19 @@ class Notifier:
 def read_and_clear_inbox(project_path: str) -> list[dict[str, Any]]:
     """Read all pending notifications for a project and clear the inbox.
 
-    Atomic against concurrent writers: opens the inbox r+, takes LOCK_EX,
-    reads the full contents, truncates the file to 0 bytes, fsyncs, then
-    releases the lock. Concurrent _write_inbox() calls (which take the
-    same LOCK_EX before appending) therefore can't have their lines lost
-    between read and clear. Idempotent if the inbox doesn't exist.
+    Atomic against concurrent writers: opens the inbox r+, takes the
+    exclusive lock, reads the full contents, truncates the file to 0
+    bytes, fsyncs, then releases the lock. Concurrent _write_inbox()
+    calls (which take the same exclusive lock before appending) therefore
+    can't have their lines lost between read and clear. Idempotent if
+    the inbox doesn't exist.
     """
     path = inbox_path(project_path)
     if not path.exists():
         return []
     try:
         with path.open("r+") as f:
-            if fcntl is not None:
-                try:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                except OSError:
-                    pass
-            try:
+            with exclusive_lock(f):
                 data = f.read()
                 f.seek(0)
                 f.truncate(0)
@@ -184,12 +166,6 @@ def read_and_clear_inbox(project_path: str) -> list[dict[str, Any]]:
                     _os.fsync(f.fileno())
                 except OSError:
                     pass
-            finally:
-                if fcntl is not None:
-                    try:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                    except OSError:
-                        pass
         lines = data.strip().splitlines()
         return [json.loads(line) for line in lines if line.strip()]
     except FileNotFoundError:

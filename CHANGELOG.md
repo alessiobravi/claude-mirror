@@ -4,6 +4,24 @@ All notable changes to claude-mirror.
 
 ---
 
+## [Unreleased]
+
+### Added — cross-platform inbox file locking (WIN-LOCK)
+
+The notification inbox at `{project_path}/.claude_mirror_inbox.jsonl` is now serialized by an exclusive OS-level lock on every platform, not just POSIX. Before this change `claude_mirror/notifier.py` imported `fcntl` inside a `try / except ImportError` block and silently fell back to a no-op on Windows, which meant the strict TOCTOU contract documented in `tests/test_notifier_inbox.py::test_inbox_read_clears_atomically_against_concurrent_writer` only held on macOS and Linux. On Windows two threads (or two processes) racing the inbox could lose lines mid-drain. WIN-LOCK closes that gap with stdlib only — no new third-party dependency.
+
+- `claude_mirror/_filelock.py` — new module, ~55 lines. Single public helper `exclusive_lock(file_obj)` exposed as a `@contextmanager` that takes an exclusive lock for the duration of the `with` block and releases on exit (success OR exception). On POSIX it dispatches to `fcntl.flock(fd, LOCK_EX)` / `fcntl.flock(fd, LOCK_UN)` — same semantics the inbox shipped with through v0.5.58. On Windows it dispatches to `msvcrt.locking(fd, LK_LOCK, IO_LOCK_BYTES)` / `msvcrt.locking(fd, LK_UNLCK, IO_LOCK_BYTES)`. `IO_LOCK_BYTES = 0x7FFFFFFF` is the documented maximum byte range. Because `msvcrt.locking` locks N bytes from the current file pointer rather than the whole file, the wrapper saves `file_obj.tell()`, seeks to byte 0, takes the lock against the sentinel range, restores the saved position before yielding, and restores again before unlocking on exit so the unlock targets the exact same range. `LK_LOCK` blocks (retrying every ~1s up to ~10s) rather than returning immediately — appropriate for the inbox where hold time is sub-second and contention is local-user-only; `LK_NBLCK` would have forced every caller into a retry loop, which is harder to make correct than relying on the OS's blocking lock.
+- `claude_mirror/notifier.py` — both call sites (`Notifier._write_inbox()` and `read_and_clear_inbox()`) now use `with exclusive_lock(f):` instead of the inline `fcntl.flock(...)` / `flock(...LOCK_UN)` `try / finally` blocks. The conditional `try: import fcntl / except ImportError: fcntl = None` shim at module top is gone — that was the no-op fallback that broke Windows. Behaviour outside the lock block (the JSON line write, the read-then-truncate-then-fsync sequence on the drain side) is unchanged.
+- `tests/test_filelock.py` — new module, **4 tests** that all run cross-platform without `skipif`: serialization of two threads contending the same lock (Barrier-coordinated; final file is exactly the two markers, no interleave), release on exception (a re-acquirer in a second thread finishes), file-position restore across the lock cycle (the Windows seek-back contract; trivially holds on POSIX too), and a sanity check that the helper accepts a text-mode file handle (the inbox opens in `a` / `r+` text mode).
+- `tests/test_notifier_inbox.py` — `test_inbox_read_clears_atomically_against_concurrent_writer` used to be guarded by `@pytest.mark.skipif(sys.platform == "win32", reason="...fcntl POSIX-only...fallback path is a no-op...")`. The skipif is gone; the test now runs on every platform. The unused `import sys` and `import pytest` lines were removed in the same edit.
+
+### Tests
+- `pytest tests/test_filelock.py tests/test_notifier_inbox.py` — **11 passed locally** on macOS in 0.16s.
+- `pytest tests/` — **938 passed, 3 skipped** locally on macOS in 4.82s (the 3 skips are the pre-existing `test_mypy_smoke.py` "mypy not installed" guards, unchanged by WIN-LOCK).
+- `mypy --strict claude_mirror/` — **clean across 39 source files**.
+
+---
+
 ## [0.5.58] — 2026-05-09
 
 Symmetry release: `delete` joins the `--dry-run` family. Plus a small CHANGELOG cosmetic fix carried over from the v0.5.56 → v0.5.57 renumber.

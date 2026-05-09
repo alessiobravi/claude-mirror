@@ -4,6 +4,20 @@ All notable changes to claude-mirror.
 
 ---
 
+## [Unreleased]
+
+### Added — `claude-mirror tree` for remote-listing visualization (TREE)
+
+A new top-level `claude-mirror tree [PATH]` subcommand prints a `tree(1)`-style view of remote files with sizes and (optionally) modification timestamps. Inspired by `rclone tree`. Reuses the same `StorageBackend.list_files_recursive(...)` path that `status` / `push` / `pull` already exercise — no engine changes, no new third-party dependencies. Pure rendering happens in a new `claude_mirror/_tree.py` module so the layout logic is unit-testable without spinning up the CLI.
+
+- `claude_mirror/_tree.py` — new module. `render_tree(entries, *, sub_path, depth, show_size, show_mtime, ascii_only, root_label)` synthesises a directory tree from a flat listing payload, sorts directories before files (alphabetical within each group), renders Unicode (`├──` / `└──` / `│   `) or ASCII (`+--` / `\\--` / `|   `) connectors, and appends a `N directories, M files (TOTAL total)` footer. `--depth N` truncates deeper subtrees and adds a `... (K more files in subtrees)` summary line.
+- `claude_mirror/cli.py` — new `@cli.command()` `tree` wired in next to `find-config`. Optional `[PATH]` positional restricts the rendering to a sub-path; missing PATH errors out cleanly via `FileNotFoundError`. Tier 2 `--remote NAME` dispatches to the named mirror's listing instead of the primary; unknown `NAME` exits 1 with the list of configured backend names. The listing fetch shows a dual-line phase Progress (`Listing  explored N folder(s), M file(s) ... done. (K files)`); the local rendering is synchronous and does not wrap in a Progress.
+- `tests/test_tree.py` — 15 offline tests covering empty / single-file / deeply-nested / depth-limited / Unicode-vs-ASCII / size+mtime toggles / sort order / subpath filtering / Tier 2 `--remote` dispatch / unknown-remote error / missing-PATH error. All run against `FakeStorageBackend` from `conftest.py`. <100ms each.
+- `README.md` — Daily usage cheatsheet: new `claude-mirror tree` line.
+- `docs/cli-reference.md` — top-level command list block extended with the full `tree` invocation; new `### tree` subsection with the flag table and a sample rendering.
+
+---
+
 ## [0.5.62] — 2026-05-09
 
 Hotfix on top of v0.5.61's MOUNT release. v0.5.61 commits were pushed to origin but not tagged because Linux + Windows CI failed at test collection: importing `claude_mirror/_mount` triggered fusepy's `fuse.py`, which calls `ctypes.CDLL("libfuse.so.2")` at module load and raises `OSError("Unable to find libfuse")` when the OS-level FUSE library isn't installed. The original `try / except ImportError` only caught the wrong failure shape. v0.5.62 catches `OSError` too in three sites (`_operations_base()`, `_load_fuse()`, `_import_fuse()`), with two regression tests proving `_mount` imports cleanly when libfuse is absent. PyPI's burn-once policy means the v0.5.61 number stays unpublished; v0.5.62 ships the same MOUNT content with the import fix folded in.

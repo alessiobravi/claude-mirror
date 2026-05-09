@@ -76,6 +76,7 @@ claude-mirror migrate-snapshots --to {blobs|full} [--dry-run] [--keep-source] [-
 claude-mirror log               [--limit N] [--config PATH]
 claude-mirror inbox       [--config PATH]
 claude-mirror find-config [PATH]
+claude-mirror tree        [PATH] [--depth N] [--remote BACKEND] [--show-size/--no-show-size] [--show-mtime/--no-show-mtime] [--ascii] [--config PATH]
 claude-mirror prompt      [--config PATH] [--format text|ascii|symbols|json] [--quiet-when-clean] [--prefix STR] [--suffix STR]   # network-free shell-prompt status snippet (PS1 / PROMPT / fish_prompt / starship)
 claude-mirror mount       MOUNTPOINT
                           [--tag NAME | --snapshot TIMESTAMP | --live | --as-of DATE | --all-snapshots]
@@ -808,6 +809,49 @@ Sample one-liner for cron — fire a notification on any non-zero exit so monito
 ### `find-config`
 
 Print the config file path that matches the current working directory (or `PATH` if given). Searches all `~/.config/claude_mirror/*.yaml` files for one whose `project_path` matches, falling back to `default.yaml` if none match. The Claude Code skill uses this internally to detect the active project.
+
+### `tree`
+
+Print a `tree(1)`-style view of remote files (sizes by default, optional modification timestamps). Inspired by `rclone tree`. Reuses the same `list_files_recursive` path that `status` / `push` / `pull` already exercise — the listing fetch is shown as a dual-line phase Progress (`Listing  explored N folder(s), M file(s) ... done. (K files)`) and the local rendering is synchronous. Read-only: never writes to local disk, the manifest, or any backend.
+
+```
+claude-mirror tree [PATH]
+                   [--depth N]
+                   [--remote BACKEND]
+                   [--show-size/--no-show-size]
+                   [--show-mtime/--no-show-mtime]
+                   [--ascii]
+                   [--config PATH]
+```
+
+Flags:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `[PATH]` | whole project | Restrict the rendering to the subtree rooted at this relative path. Missing PATH errors out cleanly with `path not found in remote listing: <PATH>` and exit 1. |
+| `--depth N` | unlimited | Maximum depth to descend; `N=1` shows only top-level entries. Hidden subtrees are summarised as a single `... (K more files in subtrees)` line. |
+| `--remote BACKEND` | primary | Tier 2: render the named mirror's listing instead of the primary. Pass the `backend_name` (e.g. `dropbox`, `sftp`). Unknown names exit 1 with the list of configured backends. |
+| `--show-size` / `--no-show-size` | `--show-size` | Append a humanised size column (`1.2 KB`) to each file row. Directories never carry a size column; sizes aggregate into the footer. With `--no-show-size`, the footer also drops its `(TOTAL total)` segment. |
+| `--show-mtime` / `--no-show-mtime` | `--no-show-mtime` | Append the backend-reported modification timestamp to each file row, when the backend exposes one. Backends that don't surface mtime simply omit the column. |
+| `--ascii` | off | Render with ASCII connectors (`+--`, `\\--`, `\|`) instead of the default Unicode box-drawing characters. Useful for terminals or log pipelines that mangle UTF-8. |
+| `--config PATH` | auto-detected from cwd | Path to a specific config YAML when more than one project lives under `~/.config/claude_mirror/`. |
+
+Sample rendering:
+
+```
+.
+├── docs/
+│   ├── architecture.md  3.3 KB
+│   └── notes.md  12 B
+├── memory/
+│   ├── feedback_X.md  890 B
+│   └── reference_Y.md  2.1 KB
+└── CLAUDE.md  1.2 KB
+
+2 directories, 5 files (7.5 KB total)
+```
+
+Sort order is `tree(1)` default: directories first, then files; alphabetical within each group. Footer counts cover the rendered subtree only (so `claude-mirror tree memory` reports just the `memory/` totals).
 
 ### `prompt`
 

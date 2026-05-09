@@ -309,6 +309,7 @@ claude-mirror pull                      # download remote-ahead files
 claude-mirror pull --output DIR         # preview to DIR without touching local files
 claude-mirror pull --dry-run            # preview the download plan; no network reads, no local writes
 claude-mirror diff path/to/file.md      # colourised unified diff (remote → local)
+claude-mirror tree                      # tree(1)-style remote file listing with sizes
 claude-mirror delete file.md --dry-run  # preview what a real delete would remove; no writes
 claude-mirror delete file.md --local    # remove from remote AND local disk
 claude-mirror sync                      # full bidirectional with conflict prompts

@@ -6629,6 +6629,159 @@ def find_config(path: str) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# `claude-mirror tree` — `tree(1)`-style remote-listing visualization (TREE)
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Inspired by `rclone tree`. Reuses `StorageBackend.list_files_recursive`
+# (the same path used by status / push / pull) so the rendering matches
+# what every other read command sees on the wire. Pure local rendering
+# happens in `claude_mirror._tree.render_tree(...)` — this Click handler
+# is just dispatch + the listing-phase progress line.
+@cli.command()
+@click.argument("path", default="", required=False)
+@click.option("--depth", "depth", type=click.IntRange(min=1), default=None,
+              help="Maximum depth to descend (1 = top-level entries only). "
+                   "Hidden subtrees are summarised as a "
+                   "'... (N more files in subtrees)' line. Default: unlimited.")
+@click.option("--remote", "remote_name", default="",
+              shell_complete=_backend_value_completer,
+              help="Tier 2: render the named mirror's listing instead of "
+                   "the primary backend. Pass the backend_name (e.g. "
+                   "'dropbox', 'sftp'); unknown names exit 1 with the "
+                   "list of configured backends.")
+@click.option("--show-size/--no-show-size", "show_size", default=True,
+              show_default=True,
+              help="Append a humanised size column ('1.2 KB') to each file "
+                   "row. Directories never carry a size column — sizes "
+                   "aggregate into the footer.")
+@click.option("--show-mtime/--no-show-mtime", "show_mtime", default=False,
+              show_default=True,
+              help="Append the backend-reported modification timestamp to "
+                   "each file row, when the backend exposes one. Backends "
+                   "that don't surface mtime simply omit the column.")
+@click.option("--ascii", "ascii_only", is_flag=True, default=False,
+              help="Render with ASCII connectors (+--, \\--, |) instead of "
+                   "the default Unicode box-drawing characters. Useful for "
+                   "terminals or log pipelines that mangle Unicode.")
+@click.option("--config", "config_path", default="",
+              help="Config file path. Auto-detected from cwd if omitted.")
+def tree(
+    path: str,
+    depth: Optional[int],
+    remote_name: str,
+    show_size: bool,
+    show_mtime: bool,
+    ascii_only: bool,
+    config_path: str,
+) -> None:
+    """Print a tree-shaped view of remote files (sizes, optional mtime).
+
+    Optional PATH restricts the rendering to the subtree rooted at that
+    relative path — a missing PATH errors out cleanly the way `tree(1)`
+    does on a non-existent directory.
+
+    Tier 2: with `--remote NAME`, renders the named mirror's view
+    instead of the primary backend. Without it, the primary is used.
+
+    Read-only: never writes to local disk, the manifest, or any
+    backend.
+    """
+    from ._progress import make_phase_progress
+    from ._tree import render_tree
+    from .snapshots import SNAPSHOTS_FOLDER, BLOBS_FOLDER
+
+    config = Config.load(_resolve_config(config_path))
+    storage, mirrors = _create_storage_set(config)
+
+    target_backend: StorageBackend
+    target_root_folder: str
+    if remote_name:
+        all_backends: list[StorageBackend] = [storage] + list(mirrors)
+        match: Optional[StorageBackend] = None
+        for b in all_backends:
+            if (getattr(b, "backend_name", "") or "") == remote_name:
+                match = b
+                break
+        if match is None:
+            available = sorted({
+                (getattr(b, "backend_name", "") or "") for b in all_backends
+                if (getattr(b, "backend_name", "") or "")
+            })
+            console.print(
+                f"[red]Unknown --remote {remote_name!r}.[/] "
+                f"Configured backends: {', '.join(available) or '(none)'}"
+            )
+            sys.exit(1)
+        target_backend = match
+        target_root_folder = (
+            getattr(match, "config", None) and match.config.root_folder  # type: ignore[attr-defined]
+        ) or config.root_folder
+    else:
+        target_backend = storage
+        target_root_folder = config.root_folder
+
+    entries: list[dict[str, Any]] = []
+
+    with make_phase_progress(console) as progress:
+        task = progress.add_task(
+            "Listing", total=None, detail="connecting", show_time=True,
+        )
+
+        def _cb(folders_done: int, files_seen: int) -> None:
+            progress.update(
+                task,
+                detail=f"explored {folders_done} folder(s), "
+                       f"{files_seen} file(s)",
+            )
+
+        try:
+            raw = target_backend.list_files_recursive(
+                target_root_folder,
+                progress_cb=_cb,
+                exclude_folder_names={SNAPSHOTS_FOLDER, BLOBS_FOLDER, LOGS_FOLDER},
+            )
+        except Exception as e:
+            progress.update(task, detail=f"[red]error: {redact_error(str(e))}[/]")
+            console.print(f"[red]listing failed: {redact_error(str(e))}[/]")
+            sys.exit(1)
+
+        # Filter out infrastructure folders the backend may have surfaced
+        # despite the prune set (some backends do server-side recursive
+        # listings and only post-filter; see DropboxBackend / WebDAV).
+        for f in raw:
+            rel = f.get("relative_path", "") or ""
+            if not rel:
+                continue
+            if (
+                f.get("name", "").startswith("_")
+                or rel.startswith(f"{SNAPSHOTS_FOLDER}/")
+                or rel.startswith(f"{BLOBS_FOLDER}/")
+                or rel.startswith(f"{LOGS_FOLDER}/")
+            ):
+                continue
+            entries.append(f)
+
+        progress.update(task, detail=f"done. ({len(entries)} files)")
+
+    root_label = path if path else "."
+    try:
+        rendered = render_tree(
+            entries,
+            sub_path=path,
+            depth=depth,
+            show_size=show_size,
+            show_mtime=show_mtime,
+            ascii_only=ascii_only,
+            root_label=root_label,
+        )
+    except FileNotFoundError as e:
+        console.print(f"[red]{e}[/]")
+        sys.exit(1)
+
+    console.print(rendered, highlight=False, markup=False)
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # `claude-mirror prompt` — shell-prompt status segment (SHELL-PROMPT)
 # ──────────────────────────────────────────────────────────────────────────
 #

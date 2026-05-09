@@ -600,8 +600,10 @@ claude-mirror can post sync events to Slack, Discord, Microsoft Teams, and any g
 |---|---|---|---|
 | `discord_enabled` | bool | `false` | Master switch for Discord webhook posts. |
 | `discord_webhook_url` | str | `""` | Discord incoming-webhook URL — `https://discord.com/api/webhooks/{id}/{token}`. |
+| `discord_template_format` | dict[str,str] / null | `null` | Per-action `str.format`-style templates that override the Discord embed title for the listed actions; built-in format for any action not listed. See [admin.md — Per-event message templating](admin.md#per-event-message-templating). |
 | `teams_enabled` | bool | `false` | Master switch for Microsoft Teams webhook posts. |
 | `teams_webhook_url` | str | `""` | Teams incoming-webhook URL — legacy `outlook.office.com/webhook/...` form OR the modern `{tenant}.webhook.office.com/...` form. |
+| `teams_template_format` | dict[str,str] / null | `null` | Per-action `str.format`-style templates that override the Teams MessageCard activity-subtitle line for the listed actions. |
 | `webhook_enabled` | bool | `false` | Master switch for the generic JSON webhook (n8n / Make / Zapier / custom endpoints). |
 | `webhook_url` | str | `""` | Arbitrary URL that receives the schema-stable v1 JSON envelope on every event. |
 | `webhook_extra_headers` | dict[str,str] / null | `null` | Extra HTTP headers attached to every generic-webhook request — typically auth tokens (`Authorization: Bearer ...`) or routing headers (`X-Tenant-ID: ...`). |
@@ -609,8 +611,9 @@ claude-mirror can post sync events to Slack, Discord, Microsoft Teams, and any g
 | `discord_routes` | list[dict] / null | `null` | Multi-channel Discord routing list (v0.5.50+). Same shape as `slack_routes`. Wins over `discord_webhook_url` when both are set. |
 | `teams_routes` | list[dict] / null | `null` | Multi-channel Microsoft Teams routing list (v0.5.50+). Same shape as `slack_routes`. Wins over `teams_webhook_url` when both are set. |
 | `webhook_routes` | list[dict] / null | `null` | Multi-channel generic-webhook routing list (v0.5.50+). Same shape as `slack_routes`, plus an optional per-route `extra_headers` key for auth tokens. Wins over `webhook_url` when both are set. |
+| `webhook_template_format` | dict[str,dict] / null | `null` | Per-action **structured** templates for the generic webhook — each value is a dict of `str.format`-style strings whose rendered values are merged on top of the v1 envelope (template fields override same-name envelope keys). |
 
-Slack-specific fields (`slack_enabled`, `slack_webhook_url`, `slack_channel`) are covered in [README — Slack notifications](../README.md#slack-notifications).
+Slack-specific fields (`slack_enabled`, `slack_webhook_url`, `slack_channel`, and the per-action `slack_template_format`) are covered in [README — Slack notifications](../README.md#slack-notifications) and [admin.md — Per-event message templating](admin.md#per-event-message-templating).
 
 ---
 

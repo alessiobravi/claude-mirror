@@ -63,6 +63,26 @@ def _sanitise_slack(s: str) -> str:
     )
 
 
+def _slack_template_for_action(
+    config: Config, action: str,
+) -> Optional[str]:
+    """Return the Slack template configured for ``action``, or ``None``.
+
+    Reads ``config.slack_template_format`` (a per-action dict added in
+    v0.5.50). ``None`` when the user didn't configure templates at all,
+    OR when they configured templates but not for this specific action
+    (e.g. only ``push`` is templated and a ``sync`` event fires). Both
+    cases route the caller to the built-in Slack format.
+    """
+    templates = getattr(config, "slack_template_format", None)
+    if not templates:
+        return None
+    value = templates.get(action)
+    if not isinstance(value, str):
+        return None
+    return value
+
+
 def _sanitise_action_text(s: str) -> str:
     """Sanitise the `action` field of a failure_alert.
 
@@ -145,11 +165,46 @@ def post_sync_event(
 
     # Plain-text fallback used both as the `text` field (for desktop /
     # mobile push notification previews + non-blocks clients) and as the
-    # body when there's no enrichment to show.
-    fallback_text = (
-        f"{emoji} {user}@{machine} {action}ed "
-        f"{file_count} {file_word} in {project}"
-    )
+    # body when there's no enrichment to show. When a per-action
+    # template is configured (`slack_template_format` in project YAML),
+    # the rendered template REPLACES the fallback line and the header
+    # block's text — every other surface (file list, per-backend status,
+    # snapshot context line) keeps its built-in structure.
+    rendered_template_text: Optional[str] = None
+    template_for_action = _slack_template_for_action(config, event.action)
+    if template_for_action is not None and template_for_action != "":
+        try:
+            from .notifications.webhooks import (
+                event_template_vars,
+                _log_template_fallback,
+            )
+            try:
+                # Sanitise EACH placeholder value individually so a
+                # collaborator-controlled `event.user = "*haxx*"`
+                # can't break out of the user's template formatting,
+                # while preserving any mrkdwn the user themselves
+                # wrote into the template (e.g. `*{user}*`).
+                vars_ = event_template_vars(event)
+                safe_vars = {
+                    k: (_sanitise_slack(v) if isinstance(v, str) else v)
+                    for k, v in vars_.items()
+                }
+                rendered_template_text = template_for_action.format(**safe_vars)
+            except (KeyError, ValueError, IndexError) as e:
+                _log_template_fallback("Slack", event.action, e)
+                rendered_template_text = None
+        except Exception:
+            # Defensive — if the webhooks module fails to import for
+            # any reason, we silently fall back to the built-in format.
+            rendered_template_text = None
+
+    if rendered_template_text:
+        fallback_text = rendered_template_text
+    else:
+        fallback_text = (
+            f"{emoji} {user}@{machine} {action}ed "
+            f"{file_count} {file_word} in {project}"
+        )
 
     blocks: list[dict] = []
 
@@ -165,11 +220,20 @@ def post_sync_event(
         # instead of the routine "user pushed N files" line.
         fallback_text = alert_text
 
-    # Header — always present.
-    header_md = (
-        f"{emoji} *{user}@{machine}* {action}ed "
-        f"*{file_count} {file_word}* in *{project}*"
-    )
+    # Header — always present. When a template is in play, the rendered
+    # plain text replaces the bolded mrkdwn default; the user picks the
+    # wording, including any emoji / formatting they want. Mrkdwn
+    # metacharacters that came from the user's OWN template string are
+    # preserved (the template is THEIR config, not a remote-controlled
+    # field), but interpolated event values were sanitised at template
+    # render time.
+    if rendered_template_text:
+        header_md = rendered_template_text
+    else:
+        header_md = (
+            f"{emoji} *{user}@{machine}* {action}ed "
+            f"*{file_count} {file_word}* in *{project}*"
+        )
     blocks.append(
         {"type": "section", "text": {"type": "mrkdwn", "text": header_md}}
     )

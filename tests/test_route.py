@@ -305,7 +305,7 @@ class TestEngineDispatch:
             "claude_mirror.notifications.webhooks.DiscordWebhookNotifier"
         ) as MockDiscord:
             stub._dispatch_extra_webhooks(_make_event(action="push"))
-        MockDiscord.assert_called_once_with("https://discord.example/legacy")
+        MockDiscord.assert_called_once_with("https://discord.example/legacy", templates=None)
         MockDiscord.return_value.notify.assert_called_once()
 
     def test_three_slack_routes_one_event_triggers_two(
@@ -382,8 +382,8 @@ class TestEngineDispatch:
             "claude_mirror.notifications.webhooks.GenericWebhookNotifier"
         ) as MockGeneric:
             stub._dispatch_extra_webhooks(_make_event(action="push"))
-        MockDiscord.assert_called_once_with("https://discord.example/r1")
-        MockTeams.assert_called_once_with("https://teams.example/r1")
+        MockDiscord.assert_called_once_with("https://discord.example/r1", templates=None)
+        MockTeams.assert_called_once_with("https://teams.example/r1", templates=None)
         MockGeneric.assert_not_called()
 
     def test_per_route_paths_scopes_event_at_dispatch(

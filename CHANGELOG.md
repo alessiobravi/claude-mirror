@@ -4,6 +4,61 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.50] — 2026-05-09
+
+Four independent additions across distribution, docs, and notifications. ROUTE and TMPL share the notifier surface but partition cleanly: ROUTE owns dispatch (which webhook fires, with which event/path filter), TMPL owns format (the message body inside `_format_event`).
+
+### Added — Dynamic `--backend` shell completion (DYN-COMP)
+- New hidden `claude-mirror _list-backends` subcommand prints the valid backend names one per line. Source-of-truth is a single module-level `_AVAILABLE_BACKENDS` constant referenced by `_create_storage`'s dispatch, `profile_create`'s `click.Choice`, and 7 existing `--backend` Click options across init/restore/retry/seed-mirror/gc/inspect/doctor.
+- The completion scripts emitted by `claude-mirror completion {zsh,bash,fish,powershell}` are runtime-callback-based and now wire through `_list-backends` for the `--backend` value list, so future backend additions automatically surface in tab-completion without re-sourcing.
+- 12 new tests in `tests/test_dyn_comp.py`.
+
+### Added — Comprehensive FAQ doc (DOC-FAQ)
+- New `docs/faq.md` (666 lines) covering the most-asked-and-most-fixable issues: getting started / auth and credentials / sync workflow / multi-machine and multi-user / snapshots and recovery / notifications / performance and reliability / common gotchas / migration and upgrade. 41 Q/A entries with concrete commands and "See also" depth-doc links. TOC at the top, top-of-section tl;dr lines, back-links to README at top and bottom.
+- Cross-linked from `README.md`, `docs/README.md`, `docs/admin.md`, `docs/cli-reference.md`, `docs/conflict-resolution.md`, `docs/scenarios.md`.
+
+### Added — Multi-channel notification routing per project (ROUTE)
+- New optional list-form per backend: `slack_routes`, `discord_routes`, `teams_routes`, `webhook_routes`. Each entry: `{webhook_url: str, on: list[str], paths: list[str]}` filters by event type (`push / pull / sync / delete`) and path glob.
+- **Precedence**: when both the legacy single-channel form (`slack_webhook_url`) and the list-form (`slack_routes`) are set, the list-form wins with a yellow info line at engine startup. Empty list (`slack_routes: []`) collapses to None so legacy keeps working during transitions.
+- **fnmatch quirk**: default `paths=["**/*"]` matches paths WITH at least one separator (`docs/notes.md`) but does NOT match top-level files (`CLAUDE.md` at project root). Use `*.md` or explicit listings for top-level catches. Documented.
+- **Heartbeat events** with empty `files` bypass the path filter so subscribing to `sync` events still fires for nothing-to-do heartbeats.
+- New `Config.iter_routes(backend)` helper yields the resolved route list (legacy form returns one pseudo-route with default on/paths). New `_normalise_routes()` validation runs in `__post_init__`.
+- Slack dispatch uses per-route `dataclasses.replace(self.config, slack_webhook_url=route["webhook_url"], slack_routes=None)` for a clean single-channel Config view. Notifier classes' external API unchanged.
+- 24 new tests in `tests/test_route.py`.
+
+### Added — Per-event webhook templating (TMPL)
+- New optional dicts per backend: `slack_template_format`, `discord_template_format`, `teams_template_format`, `webhook_template_format`. Each maps action (`push / pull / sync / delete`) to a `str.format`-style template string (Slack/Discord/Teams) or a structured dict template (Generic).
+- **Placeholder vocabulary**: `{user}`, `{machine}`, `{project}`, `{action}`, `{n_files}`, `{file_list}` (capped at 10 with "and N more"), `{first_file}`, `{timestamp}`, `{snapshot_timestamp}`.
+- **Per-backend body shape**:
+  - Discord: rendered template REPLACES `embeds[0].title`; color/fields preserved.
+  - Teams: populates BOTH `summary` (mobile preview) AND `sections[0].activitySubtitle`; `activityTitle` keeps the structured default.
+  - Generic: template values merged on top of v1 envelope (template wins on key conflict; `version`/`event`/`timestamp` still overridable so users can pin downstream schemas).
+  - Slack: sanitisation on placeholder VALUES (defeats mrkdwn injection from `event.user` / `event.machine` if a collaborator renames themselves to `*haxx*`); user-authored mrkdwn in their own template string is preserved.
+- **Unknown placeholder** → yellow info line "template uses unknown variable {x} — falling back to default format" + builds the built-in format. Never crashes a sync.
+- Stdlib `str.format` only — no Jinja2 / Mustache. New `_validate_template_dict` helper runs in `Config.__post_init__`.
+- 32 new tests in `tests/test_tmpl.py`.
+
+### Documented
+- `docs/admin.md` — new "Multi-channel routing per project" subsection (ROUTE) + new "Per-event message templating" subsection (TMPL) with placeholder vocabulary and 4 worked examples; tab-completion subsection notes the dynamic-completion change.
+- `docs/cli-reference.md` — extended notification-fields table with 4 `*_routes` rows + 4 `*_template_format` rows; `completion` entry notes dynamic `--backend` enumeration.
+- `docs/faq.md` (NEW) — comprehensive 41-Q FAQ.
+- `README.md` — Quality gates count `763 → 831` and four new coverage labels named explicitly.
+
+### Updated docs/files
+- `claude_mirror/cli.py` (`_AVAILABLE_BACKENDS` constant, hidden `_list-backends` subcommand, per-shell DYN-COMP shims).
+- `claude_mirror/config.py` (4 `*_routes` fields + 4 `*_template_format` fields + `_normalise_routes` + `_validate_template_dict` + `iter_routes` helper).
+- `claude_mirror/sync.py` (`_dispatch_extra_webhooks` rewritten for per-route iteration with `templates=` kwarg threaded through).
+- `claude_mirror/notifications/webhooks.py` (templates= constructor kwarg + `_format_event` template branch with safe fallback).
+- `claude_mirror/slack.py` (per-action template branch with placeholder-value sanitisation).
+- `tests/test_dyn_comp.py`, `tests/test_route.py`, `tests/test_tmpl.py` (NEW, 68 tests total).
+- `docs/faq.md` (NEW), `docs/admin.md`, `docs/cli-reference.md`, `docs/conflict-resolution.md`, `docs/scenarios.md`, `docs/README.md`, `README.md`.
+- `pyproject.toml` (version 0.5.49 → 0.5.50).
+
+### Tests
+- `pytest tests/` — **831 passed in ~3s** (= 763 baseline + 12 DYN-COMP + 0 DOC-FAQ + 24 ROUTE + 32 TMPL). All offline.
+
+---
+
 ## [0.5.49] — 2026-05-08
 
 Four independent additions integrated together. None depends on the others; each is shippable on the 0.5.x line as patch-level work.

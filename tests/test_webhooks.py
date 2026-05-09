@@ -483,7 +483,12 @@ class TestEngineDispatch:
             "claude_mirror.notifications.webhooks.GenericWebhookNotifier"
         ) as MockGeneric:
             stub._dispatch_extra_webhooks(_make_event())
-        MockDiscord.assert_called_once_with("https://discord.com/api/webhooks/x/y")
+        # Templates kwarg is passed through unconditionally (None when
+        # the user hasn't configured templates) so the dispatch site
+        # never has to special-case the unset state.
+        MockDiscord.assert_called_once_with(
+            "https://discord.com/api/webhooks/x/y", templates=None,
+        )
         MockDiscord.return_value.notify.assert_called_once()
         MockTeams.assert_not_called()
         MockGeneric.assert_not_called()
@@ -547,4 +552,5 @@ class TestEngineDispatch:
         MockGeneric.assert_called_once_with(
             "https://n8n.example/hook",
             extra_headers={"Authorization": "Bearer abc"},
+            templates=None,
         )

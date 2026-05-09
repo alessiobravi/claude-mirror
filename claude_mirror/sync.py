@@ -2418,28 +2418,38 @@ class SyncEngine:
         except Exception:
             return  # best-effort — never let an import error break sync
 
-        # Discord — one notifier per route.
+        # Discord — one notifier per route. Templates (when configured)
+        # apply across all routes for the backend.
+        discord_templates = getattr(cfg, "discord_template_format", None)
         for route in cfg.iter_routes("discord"):
             scoped = self._scope_event_for_route(event, route)
             if scoped is None:
                 continue
             try:
-                DiscordWebhookNotifier(route["webhook_url"]).notify(scoped)
+                DiscordWebhookNotifier(
+                    route["webhook_url"],
+                    templates=discord_templates,
+                ).notify(scoped)
             except Exception:
                 pass  # best-effort
 
         # Microsoft Teams — same shape, different notifier.
+        teams_templates = getattr(cfg, "teams_template_format", None)
         for route in cfg.iter_routes("teams"):
             scoped = self._scope_event_for_route(event, route)
             if scoped is None:
                 continue
             try:
-                TeamsWebhookNotifier(route["webhook_url"]).notify(scoped)
+                TeamsWebhookNotifier(
+                    route["webhook_url"],
+                    templates=teams_templates,
+                ).notify(scoped)
             except Exception:
                 pass  # best-effort
 
         # Generic webhook — also carries optional per-route extra_headers
         # (or the legacy `webhook_extra_headers` surfaced by iter_routes).
+        webhook_templates = getattr(cfg, "webhook_template_format", None)
         for route in cfg.iter_routes("webhook"):
             scoped = self._scope_event_for_route(event, route)
             if scoped is None:
@@ -2447,7 +2457,8 @@ class SyncEngine:
             try:
                 GenericWebhookNotifier(
                     route["webhook_url"],
-                    extra_headers=route.get("extra_headers"),
+                    extra_headers=route.get("extra_headers", cfg.webhook_extra_headers),
+                    templates=webhook_templates,
                 ).notify(scoped)
             except Exception:
                 pass  # best-effort

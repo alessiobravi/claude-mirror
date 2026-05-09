@@ -135,6 +135,49 @@ def _normalise_routes(
                 normalised[k] = v
         out.append(normalised)
     return out
+# Whitelist of sync-action names that may key a notification template
+# dict. A typo here would otherwise mean "your `delet:` template is
+# silently skipped" — surfacing it at config-load time is the cheapest
+# place to catch the mistake. Order matches the action ordering used
+# elsewhere (push / pull / sync / delete); the set form is what
+# validation actually checks.
+_VALID_TEMPLATE_ACTIONS: frozenset[str] = frozenset({
+    "push", "pull", "sync", "delete",
+})
+
+
+def _validate_template_dict(
+    value: object, field_name: str, value_type: type,
+) -> None:
+    """Validate a per-backend × per-action template dict at config load.
+
+    Skips entirely when ``value`` is ``None`` (the unset default — the
+    backend will use its built-in format). When set, every key MUST be
+    one of ``_VALID_TEMPLATE_ACTIONS`` and every value MUST be an
+    instance of ``value_type`` (``str`` for Slack/Discord/Teams,
+    ``dict`` for the Generic webhook). A bad config raises
+    :class:`ValueError` with a message naming the offending field +
+    key + expected type so the user can fix the YAML quickly.
+    """
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"{field_name} must be a dict mapping action name -> "
+            f"{value_type.__name__}, got {type(value).__name__}"
+        )
+    for action, template in value.items():
+        if action not in _VALID_TEMPLATE_ACTIONS:
+            valid = ", ".join(sorted(_VALID_TEMPLATE_ACTIONS))
+            raise ValueError(
+                f"{field_name}: unknown action key {action!r} "
+                f"(valid: {valid})"
+            )
+        if not isinstance(template, value_type):
+            raise ValueError(
+                f"{field_name}[{action!r}] must be a "
+                f"{value_type.__name__}, got {type(template).__name__}"
+            )
 
 
 @dataclass
@@ -244,6 +287,39 @@ class Config:
     teams_routes: Optional[list[dict]] = None
     webhook_routes: Optional[list[dict]] = None
 
+    # Per-event message templating (v0.5.50+).
+    #
+    # All four fields are optional and default to None. When unset (the
+    # historical case), each backend uses its built-in payload format —
+    # so every existing project YAML keeps working with zero changes.
+    #
+    # When set, the dict's keys are sync action names ("push", "pull",
+    # "sync", "delete") and the values are `str.format`-style template
+    # strings (Slack / Discord / Teams) or nested dicts of format strings
+    # (Generic — see below). Only the listed actions get templated; other
+    # actions still use the built-in format. An action's template overrides
+    # ONLY the message summary line; the rest of the rich-blocks / embed /
+    # MessageCard structure (file list, context, facts) is preserved.
+    #
+    # Available placeholders (documented in docs/admin.md):
+    #   {user} {machine} {project} {action}
+    #   {n_files}  — len(event.files)
+    #   {file_list} — comma-joined, capped at 10 with "and N more"
+    #   {first_file} — event.files[0] if any, else empty string
+    #   {timestamp} {snapshot_timestamp}
+    #
+    # If a template references an unknown placeholder, claude-mirror logs
+    # a yellow info line and falls back to the built-in format for that
+    # one event — a bad template never crashes a sync.
+    #
+    # Generic webhook templates are STRUCTURED: each value is itself a
+    # dict mapping output-key to format-string. The rendered dict is
+    # merged on top of the v1 envelope, so template fields override the
+    # same-name envelope keys (use this to add `custom_field_1`, etc.).
+    slack_template_format: Optional[dict[str, str]] = None
+    discord_template_format: Optional[dict[str, str]] = None
+    teams_template_format: Optional[dict[str, str]] = None
+    webhook_template_format: Optional[dict[str, dict]] = None
     # Snapshot format:
     #   "full"  — every snapshot is a full server-side copy of the project tree
     #             into _claude_mirror_snapshots/{ts}/ (legacy default for existing
@@ -416,6 +492,23 @@ class Config:
                 self.max_throttle_wait_seconds = 86400.0
         except (TypeError, ValueError):
             self.max_throttle_wait_seconds = 600.0
+        # Validate per-backend × per-action template dicts. Each dict's
+        # keys MUST be sync-action names; for str-template backends the
+        # values MUST be strings, for the Generic webhook the values MUST
+        # be dicts of format strings. A typo'd action key surfaces here
+        # with a clean error rather than silently being ignored later.
+        _validate_template_dict(
+            self.slack_template_format, "slack_template_format", str,
+        )
+        _validate_template_dict(
+            self.discord_template_format, "discord_template_format", str,
+        )
+        _validate_template_dict(
+            self.teams_template_format, "teams_template_format", str,
+        )
+        _validate_template_dict(
+            self.webhook_template_format, "webhook_template_format", dict,
+        )
 
         # Normalise + validate each *_routes field. Done up-front rather
         # than at first-event-fire so a typo in the YAML surfaces the

@@ -829,13 +829,17 @@ Every header in `webhook_extra_headers` is set on the outgoing request, so this 
 | `slack_enabled` | bool | `false` | Master switch for Slack posts. |
 | `slack_webhook_url` | str | `""` | Slack incoming-webhook URL. |
 | `slack_channel` | str | `""` | Optional Slack channel override. |
+| `slack_template_format` | dict[str,str] / null | `null` | Per-action message templates for Slack (see [Per-event message templating](#per-event-message-templating)). |
 | `discord_enabled` | bool | `false` | Master switch for Discord posts. |
 | `discord_webhook_url` | str | `""` | Discord incoming-webhook URL. |
+| `discord_template_format` | dict[str,str] / null | `null` | Per-action message templates for Discord. |
 | `teams_enabled` | bool | `false` | Master switch for Teams posts. |
 | `teams_webhook_url` | str | `""` | Teams incoming-webhook URL (legacy connector or Workflows). |
+| `teams_template_format` | dict[str,str] / null | `null` | Per-action message templates for Teams. |
 | `webhook_enabled` | bool | `false` | Master switch for the generic JSON webhook. |
 | `webhook_url` | str | `""` | Arbitrary `POST` target for the generic envelope. |
 | `webhook_extra_headers` | dict / null | `null` | Extra HTTP headers for the generic webhook (auth tokens, tenant IDs). |
+| `webhook_template_format` | dict[str,dict] / null | `null` | Per-action **structured** templates for the generic webhook — values merged on top of the v1 envelope (see [Per-event message templating](#per-event-message-templating)). |
 
 All four are independent — enable Slack and Discord and Generic together if you want; each runs on every event.
 
@@ -928,6 +932,103 @@ discord_routes:
 | `webhook_routes` | list[dict] / null | `null` | Multi-channel generic-webhook routing. Wins over `webhook_url` when both set. Per-route `extra_headers` is supported as an additive key. |
 
 Each list element shape: `{webhook_url: str, on: list[str], paths: list[str]}`.
+### Per-event message templating
+
+Every backend has a built-in payload format (Slack rich blocks, Discord embed, Teams MessageCard, Generic v1 JSON envelope). When the defaults don't match your team's wording — locale-specific phrasing, internal jargon, custom emoji conventions, per-tenant routing fields — you can override the **summary line** of each backend on a **per-action** basis without forking claude-mirror.
+
+Add one or more of these fields to your project YAML:
+
+```yaml
+slack_template_format:
+  push:   ":up: {user}@{machine} pushed {n_files} file(s) to {project}"
+  sync:   ":arrows_counterclockwise: {user}@{machine} synced {project}"
+  delete: ":wastebasket: {user}@{machine} deleted {n_files} file(s) from {project}"
+
+discord_template_format:
+  push:   "**{user}** pushed {n_files} files to **{project}**"
+  delete: "{user} deleted: {file_list}"
+
+teams_template_format:
+  push:   "{user}@{machine} pushed {n_files} file(s)"
+
+# Generic webhook templates are STRUCTURED — each value is a dict of
+# format strings, merged on top of the v1 envelope.
+webhook_template_format:
+  push:
+    custom_field_1: "{user}@{machine}"
+    project_alias:  "{project}"
+    file_count:     "{n_files}"
+```
+
+All four fields are **optional**, **per-action**, and **opt-in**. Every existing project YAML keeps working with zero changes — only actions you list in the dict get templated; everything else uses the built-in format. The rendered template overrides only the prominent summary line; the file list, per-backend status block, snapshot context, and metadata fields all stay built-in so users keep the structured detail.
+
+#### Available placeholder variables
+
+claude-mirror uses Python's `str.format` (no Jinja2 / Mako / Mustache dependency — the standard library covers 95% of use cases). The following placeholders are available in every template:
+
+| Placeholder | Source | Example |
+|---|---|---|
+| `{user}` | `event.user` | `alice` |
+| `{machine}` | `event.machine` | `laptop` |
+| `{project}` | `event.project` | `my-product-docs` |
+| `{action}` | `event.action` | `push` / `pull` / `sync` / `delete` |
+| `{n_files}` | `len(event.files)` | `3` |
+| `{file_list}` | comma-separated, capped at 10 with `and N more` | `notes.md, CLAUDE.md, README.md` |
+| `{first_file}` | `event.files[0]` if any, else empty string | `notes.md` |
+| `{timestamp}` | `event.timestamp` (ISO 8601 UTC) | `2026-05-09T12:00:00+00:00` |
+| `{snapshot_timestamp}` | snapshot ID if known, else literal `"unknown"` | `2026-05-09T11-58-31Z` |
+
+#### Worked examples
+
+**Per-team channel naming.** Two teams share one Slack workspace; they want the team initials in front of every message:
+
+```yaml
+slack_template_format:
+  push: "[DOCS] :up: {user} pushed {n_files} files to {project}"
+  sync: "[DOCS] :arrows_counterclockwise: {user} synced {project}"
+```
+
+**Locale-aware wording.** A Spanish-speaking team prefers Spanish notifications:
+
+```yaml
+slack_template_format:
+  push:   ":up: {user} subió {n_files} archivos a {project}"
+  pull:   ":down: {user} descargó {n_files} archivos de {project}"
+  sync:   ":arrows_counterclockwise: {user} sincronizó {project}"
+  delete: ":wastebasket: {user} eliminó {n_files} archivos de {project}"
+```
+
+**Internal jargon — first-file emphasis.** A team where most pushes touch a single doc wants that file front-and-centre:
+
+```yaml
+discord_template_format:
+  push: "{user} updated **{first_file}** ({n_files} total)"
+```
+
+**Generic webhook with per-tenant routing key.** An n8n workflow demultiplexes incoming events by a custom `tenant_id` field that the v1 envelope doesn't ship:
+
+```yaml
+webhook_template_format:
+  push:
+    tenant_id:    "tenant-acme"
+    pushed_by:    "{user}@{machine}"
+    project_path: "{project}"
+    file_count:   "{n_files}"
+```
+
+The rendered template values are merged on top of the v1 envelope — `pushed_by` becomes a new field, `tenant_id` is a new literal, and the schema-stable `version` / `event` / `timestamp` keys keep their default values (your downstream consumer pinned to v1 keeps working).
+
+#### What happens on a bad template
+
+If a template references an unknown placeholder (`{nonexistent}`), or if the format string itself is malformed, claude-mirror **does not crash the sync**. It logs a yellow info line —
+
+```
+warn  Notification template error (Discord, action='push'): 'nonexistent' — falling back to default format.
+```
+
+— and uses the built-in format for that one event. The next event with a valid template renders normally. This matches claude-mirror's broader "notification failures are best-effort, never block sync" contract.
+
+Action keys outside `{push, pull, sync, delete}` are caught at config-load time with a clean `ValueError` — typing `delet:` instead of `delete:` surfaces immediately rather than silently being skipped at notify time.
 
 ## Multi-backend mirroring (Tier 2)
 

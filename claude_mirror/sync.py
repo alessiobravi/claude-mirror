@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import fnmatch
 import re
 import threading
@@ -29,7 +30,11 @@ from ._progress import (
 from ._constants import PARALLEL_WORKERS
 
 from .backends import StorageBackend, redact_error
-from .config import Config
+from .config import (
+    Config,
+    _DEFAULT_ROUTE_ACTIONS,
+    _DEFAULT_ROUTE_PATHS,
+)
 from .events import SyncEvent, SyncLog, SYNC_LOG_NAME, LOGS_FOLDER
 from .hash_cache import HashCache
 from .ignore import IgnoreSet, IGNORE_FILENAME
@@ -167,6 +172,24 @@ class SyncEngine:
         # pauses on the same deadline rather than each retrying
         # independently and compounding the rate-limit pressure.
         self._coordinator: Optional[BackoffCoordinator] = None
+
+        # Multi-channel notification routing precedence info (v0.5.50+).
+        # When BOTH the legacy single-channel form AND the list-form
+        # are configured for the same backend, the list-form wins and
+        # the legacy field is silently dropped from dispatch. Surface
+        # the override exactly once at engine construction so a user
+        # mid-transition notices.
+        for _backend, _legacy_field in (
+            ("slack",   "slack_webhook_url"),
+            ("discord", "discord_webhook_url"),
+            ("teams",   "teams_webhook_url"),
+            ("webhook", "webhook_url"),
+        ):
+            if self.config.has_legacy_routes_conflict(_backend):
+                console.print(
+                    f"[yellow]ignoring {_legacy_field} because "
+                    f"{_backend}_routes is set[/]"
+                )
 
     # ------------------------------------------------------------------
     # File discovery
@@ -2363,17 +2386,28 @@ class SyncEngine:
         cost off code paths that never publish events. Every call is
         wrapped so a notifier raising (which the abstraction tries hard
         not to do) cannot break sync.
+
+        Per-project multi-channel routing (v0.5.50+): each backend's
+        configured routes (``discord_routes`` / ``teams_routes`` /
+        ``webhook_routes``) are walked sequentially. Each route gets
+        its own notifier instance with its own webhook URL, fires only
+        when ``event.action`` is in the route's ``on`` set, and only
+        when at least one of ``event.files`` matches at least one of
+        the route's ``paths`` globs (in which case event.files is
+        trimmed to the matching subset before the notifier sees it).
+        Backwards-compat: the legacy single-channel form is
+        transparently surfaced by ``Config.iter_routes`` as one
+        pseudo-route with default `on` (all four actions) and `paths`
+        (`["**/*"]`).
         """
         cfg = self.config
-        # Lazy import: the webhooks module pulls in urllib.request, which
-        # is cheap, but we still skip the import entirely when no
-        # additional backend is enabled — keeps `claude-mirror inbox`
-        # and other non-publishing commands free of the cost.
-        if not (
-            getattr(cfg, "discord_enabled", False)
-            or getattr(cfg, "teams_enabled", False)
-            or getattr(cfg, "webhook_enabled", False)
-        ):
+        # Cheap pre-check: if no backend has either routes or the
+        # legacy single-channel form, skip the import entirely.
+        has_any_dispatch = any(
+            self._backend_has_routes(b)
+            for b in ("discord", "teams", "webhook")
+        )
+        if not has_any_dispatch:
             return
         try:
             from .notifications.webhooks import (
@@ -2384,24 +2418,109 @@ class SyncEngine:
         except Exception:
             return  # best-effort — never let an import error break sync
 
-        if cfg.discord_enabled and cfg.discord_webhook_url:
+        # Discord — one notifier per route.
+        for route in cfg.iter_routes("discord"):
+            scoped = self._scope_event_for_route(event, route)
+            if scoped is None:
+                continue
             try:
-                DiscordWebhookNotifier(cfg.discord_webhook_url).notify(event)
+                DiscordWebhookNotifier(route["webhook_url"]).notify(scoped)
             except Exception:
                 pass  # best-effort
-        if cfg.teams_enabled and cfg.teams_webhook_url:
+
+        # Microsoft Teams — same shape, different notifier.
+        for route in cfg.iter_routes("teams"):
+            scoped = self._scope_event_for_route(event, route)
+            if scoped is None:
+                continue
             try:
-                TeamsWebhookNotifier(cfg.teams_webhook_url).notify(event)
+                TeamsWebhookNotifier(route["webhook_url"]).notify(scoped)
             except Exception:
                 pass  # best-effort
-        if cfg.webhook_enabled and cfg.webhook_url:
+
+        # Generic webhook — also carries optional per-route extra_headers
+        # (or the legacy `webhook_extra_headers` surfaced by iter_routes).
+        for route in cfg.iter_routes("webhook"):
+            scoped = self._scope_event_for_route(event, route)
+            if scoped is None:
+                continue
             try:
                 GenericWebhookNotifier(
-                    cfg.webhook_url,
-                    extra_headers=cfg.webhook_extra_headers,
-                ).notify(event)
+                    route["webhook_url"],
+                    extra_headers=route.get("extra_headers"),
+                ).notify(scoped)
             except Exception:
                 pass  # best-effort
+
+    def _backend_has_routes(self, backend: str) -> bool:
+        """Return True if ``backend`` would yield at least one route from
+        ``iter_routes``. Used as the cheap-prefilter for the import gate
+        in ``_dispatch_extra_webhooks`` — we don't want to import the
+        webhooks module just to discover there's nothing to do."""
+        cfg = self.config
+        b = backend.lower()
+        if b == "slack":
+            return bool(cfg.slack_routes) or bool(
+                cfg.slack_enabled and cfg.slack_webhook_url
+            )
+        if b == "discord":
+            return bool(cfg.discord_routes) or bool(
+                cfg.discord_enabled and cfg.discord_webhook_url
+            )
+        if b == "teams":
+            return bool(cfg.teams_routes) or bool(
+                cfg.teams_enabled and cfg.teams_webhook_url
+            )
+        if b == "webhook":
+            return bool(cfg.webhook_routes) or bool(
+                cfg.webhook_enabled and cfg.webhook_url
+            )
+        return False
+
+    @staticmethod
+    def _scope_event_for_route(
+        event: SyncEvent, route: dict
+    ) -> Optional[SyncEvent]:
+        """Match ``event`` against a single route's filters.
+
+        Returns ``None`` (skip the route) when:
+          * ``event.action`` is not in the route's ``on`` list, OR
+          * none of ``event.files`` matches any of the route's ``paths``
+            globs (using ``fnmatch.fnmatchcase`` — same engine as
+            ``file_patterns`` and ``exclude_patterns``).
+
+        Returns a scoped copy of ``event`` (via dataclasses.replace) with
+        ``files`` trimmed to the matching subset otherwise. The original
+        event is never mutated — concurrent backends can each derive
+        their own scoped view.
+
+        Special-case: when the original ``event.files`` is empty (no-op
+        sync), the route fires with the empty list so the user still
+        sees the heartbeat. Without this, a `sync` event with nothing
+        to do would never reach Slack, defeating the routing layer for
+        a useful surface.
+        """
+        action = getattr(event, "action", "")
+        on_list = route.get("on") or _DEFAULT_ROUTE_ACTIONS
+        if action not in on_list:
+            return None
+        paths_globs = route.get("paths") or _DEFAULT_ROUTE_PATHS
+        files = list(getattr(event, "files", None) or [])
+        if not files:
+            # Heartbeat / no-files event — let it through. The default
+            # `["**/*"]` glob would skip these on a strict-match reading,
+            # but routing should not silently drop "I synced nothing"
+            # status surfaces.
+            return event
+        matching = [
+            f for f in files
+            if any(fnmatch.fnmatchcase(f, glob) for glob in paths_globs)
+        ]
+        if not matching:
+            return None
+        if len(matching) == len(files):
+            return event  # no narrowing — reuse original
+        return dataclasses.replace(event, files=matching)
 
     def _surface_quarantine(self, files_in_event: list[str]) -> None:
         """Surface permanent-failure backends to desktop + Slack.
@@ -2499,21 +2618,47 @@ class SyncEngine:
                     break
 
         # Optional Slack notification — enriched with snapshot info and
-        # project size when available.
-        if self.config.slack_enabled:
+        # project size when available. v0.5.50+: routes-aware. Each route
+        # gets its own per-Config view (with `slack_webhook_url` swapped
+        # to the route URL) so `slack.post_sync_event` keeps its current
+        # surface unchanged. Legacy single-channel mode falls through
+        # iter_routes as one pseudo-route.
+        if self._backend_has_routes("slack"):
             try:
                 from .slack import post_sync_event
-                post_sync_event(
-                    self.config, event,
-                    snapshot_ts=snapshot_ts,
-                    snapshot_format=(
-                        (self.config.snapshot_format or "full").lower()
-                        if snapshot_ts else None
-                    ),
-                    total_project_files=len(self.manifest.all()),
-                    backend_status=backend_status,
-                    failure_alert=failure_alert,
+                snap_fmt = (
+                    (self.config.snapshot_format or "full").lower()
+                    if snapshot_ts else None
                 )
+                total_files = len(self.manifest.all())
+                for route in self.config.iter_routes("slack"):
+                    scoped = self._scope_event_for_route(event, route)
+                    if scoped is None:
+                        continue
+                    try:
+                        # Build a per-route Config view: same object, but
+                        # with the slack URL swapped. dataclasses.replace
+                        # gives us an isolated copy so concurrent routes
+                        # never observe each other's URL mid-flight.
+                        route_cfg = dataclasses.replace(
+                            self.config,
+                            slack_enabled=True,
+                            slack_webhook_url=route["webhook_url"],
+                            # Drop list-form on the per-route view so
+                            # post_sync_event reads the route URL
+                            # directly without re-routing recursively.
+                            slack_routes=None,
+                        )
+                        post_sync_event(
+                            route_cfg, scoped,
+                            snapshot_ts=snapshot_ts,
+                            snapshot_format=snap_fmt,
+                            total_project_files=total_files,
+                            backend_status=backend_status,
+                            failure_alert=failure_alert,
+                        )
+                    except Exception:
+                        pass  # best-effort, per-route
             except Exception:
                 pass  # best-effort
 

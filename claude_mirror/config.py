@@ -4,8 +4,18 @@ import os
 import socket
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
+from typing import Iterable
 
 import yaml
+
+# Closed set of event-action strings accepted by `*_routes[*].on`. Anything
+# outside this set is a typo or a forward-compat schema drift; we reject at
+# `Config.__post_init__` time rather than waiting for the first event-fire.
+_VALID_ROUTE_ACTIONS: frozenset[str] = frozenset(
+    {"push", "pull", "sync", "delete"}
+)
+_DEFAULT_ROUTE_ACTIONS: tuple[str, ...] = ("push", "pull", "sync", "delete")
+_DEFAULT_ROUTE_PATHS: tuple[str, ...] = ("**/*",)
 
 CONFIG_DIR = Path.home() / ".config" / "claude_mirror"
 
@@ -32,6 +42,99 @@ def set_global_profile_override(name: str) -> None:
 def get_global_profile_override() -> str:
     """Return the current process-wide profile override (or empty string)."""
     return _GLOBAL_PROFILE_OVERRIDE
+
+
+def _normalise_routes(
+    raw: Optional[list[dict]], field_name: str
+) -> Optional[list[dict]]:
+    """Validate + fill defaults on a `*_routes` list.
+
+    Returns ``None`` when ``raw`` is None or empty so the legacy
+    single-channel dispatch path is taken untouched. When ``raw`` is a
+    non-empty list, every entry is normalised to a dict containing
+    ``webhook_url`` (required, non-empty string), ``on`` (default
+    ``["push","pull","sync","delete"]``), and ``paths`` (default
+    ``["**/*"]``).
+
+    Raises ``ValueError`` on:
+      * non-list value
+      * non-dict element
+      * missing / empty / non-string ``webhook_url``
+      * ``on`` entry outside the closed action set
+      * ``paths`` entry that isn't a non-empty string
+
+    The error message names the offending field (`field_name`) and the
+    1-indexed position so a user with a 12-route list can find the
+    typo without binary search.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"{field_name} must be a list of route dicts, got {type(raw).__name__}"
+        )
+    if not raw:
+        # Treat empty list as "not configured" so iter_routes still
+        # falls back to the legacy single-channel form.
+        return None
+    out: list[dict] = []
+    for idx, entry in enumerate(raw, start=1):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"{field_name}[{idx}] must be a dict, got {type(entry).__name__}"
+            )
+        url = entry.get("webhook_url")
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError(
+                f"{field_name}[{idx}] is missing required string field "
+                f"'webhook_url' (got {url!r})"
+            )
+        on_raw = entry.get("on")
+        if on_raw is None:
+            on_list: list[str] = list(_DEFAULT_ROUTE_ACTIONS)
+        else:
+            if not isinstance(on_raw, list) or not on_raw:
+                raise ValueError(
+                    f"{field_name}[{idx}].on must be a non-empty list of "
+                    f"action strings (got {on_raw!r})"
+                )
+            for action in on_raw:
+                if action not in _VALID_ROUTE_ACTIONS:
+                    raise ValueError(
+                        f"{field_name}[{idx}].on contains unknown action "
+                        f"{action!r}; expected any of "
+                        f"{sorted(_VALID_ROUTE_ACTIONS)}"
+                    )
+            on_list = [str(a) for a in on_raw]
+        paths_raw = entry.get("paths")
+        if paths_raw is None:
+            paths_list: list[str] = list(_DEFAULT_ROUTE_PATHS)
+        else:
+            if not isinstance(paths_raw, list) or not paths_raw:
+                raise ValueError(
+                    f"{field_name}[{idx}].paths must be a non-empty list "
+                    f"of glob strings (got {paths_raw!r})"
+                )
+            for p in paths_raw:
+                if not isinstance(p, str) or not p:
+                    raise ValueError(
+                        f"{field_name}[{idx}].paths entry must be a "
+                        f"non-empty string (got {p!r})"
+                    )
+            paths_list = list(paths_raw)
+        normalised: dict = {
+            "webhook_url": url.strip(),
+            "on": on_list,
+            "paths": paths_list,
+        }
+        # Forward any extra keys verbatim (e.g. per-route extra_headers
+        # for the generic webhook). The dispatcher reads what it needs
+        # and ignores the rest.
+        for k, v in entry.items():
+            if k not in ("webhook_url", "on", "paths"):
+                normalised[k] = v
+        out.append(normalised)
+    return out
 
 
 @dataclass
@@ -102,6 +205,45 @@ class Config:
     webhook_enabled: bool = False
     webhook_url: str = ""
     webhook_extra_headers: Optional[dict[str, str]] = None
+
+    # Per-project multi-channel notification routing (v0.5.50+).
+    #
+    # Each backend's existing single-channel field (`slack_webhook_url`,
+    # `discord_webhook_url`, `teams_webhook_url`, `webhook_url`) gains an
+    # optional list-form alternative. Each list entry has shape:
+    #
+    #   {
+    #     "webhook_url": "https://...",         # required, non-empty string
+    #     "on":     ["push", "delete"],         # subset of {push,pull,sync,delete}
+    #     "paths":  ["memory/**", "**/CLAUDE.md"],  # fnmatch globs (Python fnmatch)
+    #   }
+    #
+    # Defaults applied in `__post_init__` when a key is omitted:
+    #   on    -> ["push","pull","sync","delete"]   (every action)
+    #   paths -> ["**/*"]                          (every file)
+    #
+    # Precedence rule: when BOTH the legacy single-channel field
+    # (`slack_webhook_url`) and the list-form (`slack_routes`) are set on
+    # the same Config, the list-form wins. The legacy field is silently
+    # dropped from dispatch and a one-shot info line is emitted at engine
+    # startup ("ignoring slack_webhook_url because slack_routes is set").
+    # We don't fail because the user may be in a transition.
+    #
+    # When a route's `paths` filter matches NO files in an event, the
+    # route is skipped entirely (no payload sent). When SOME files match,
+    # a route-scoped event is constructed with `event.files` trimmed to
+    # the matching subset before the notifier is invoked.
+    #
+    # Each route gets its own notifier instance with its own webhook URL —
+    # different URLs CANNOT share a notifier because each construction
+    # captures the URL. Routes within a single backend fire sequentially.
+    # Cross-backend dispatch is independent (Slack's routes never affect
+    # Discord's), and each backend's list is evaluated on its own.
+    slack_routes: Optional[list[dict]] = None
+    discord_routes: Optional[list[dict]] = None
+    teams_routes: Optional[list[dict]] = None
+    webhook_routes: Optional[list[dict]] = None
+
     # Snapshot format:
     #   "full"  — every snapshot is a full server-side copy of the project tree
     #             into _claude_mirror_snapshots/{ts}/ (legacy default for existing
@@ -274,6 +416,97 @@ class Config:
                 self.max_throttle_wait_seconds = 86400.0
         except (TypeError, ValueError):
             self.max_throttle_wait_seconds = 600.0
+
+        # Normalise + validate each *_routes field. Done up-front rather
+        # than at first-event-fire so a typo in the YAML surfaces the
+        # moment the project is loaded (init / status / push) instead
+        # of silently swallowing every notification at runtime.
+        self.slack_routes = _normalise_routes(self.slack_routes, "slack_routes")
+        self.discord_routes = _normalise_routes(self.discord_routes, "discord_routes")
+        self.teams_routes = _normalise_routes(self.teams_routes, "teams_routes")
+        self.webhook_routes = _normalise_routes(self.webhook_routes, "webhook_routes")
+
+    def iter_routes(self, backend: str) -> Iterable[dict]:
+        """Yield the resolved route list for ``backend``.
+
+        ``backend`` is one of ``"slack" | "discord" | "teams" | "webhook"``.
+
+        Resolution rule:
+          * If the explicit ``{backend}_routes`` list is set, yield each
+            entry verbatim (already normalised to carry ``webhook_url``,
+            ``on``, ``paths``). The legacy single-channel field is then
+            ignored.
+          * Otherwise, if the backend's legacy single-channel form is
+            enabled (``{backend}_enabled`` and the URL non-empty), yield
+            ONE pseudo-route with the default `on` (all four actions)
+            and `paths` (`["**/*"]`). For the generic webhook this
+            single pseudo-route also carries `extra_headers` so the
+            dispatcher can attach them to the request.
+          * Otherwise yield nothing.
+
+        The legacy/list precedence is enforced at *dispatch* time by the
+        caller — this helper just expresses the resolved routing tree.
+        """
+        b = backend.lower()
+        if b == "slack":
+            routes = self.slack_routes
+            enabled = self.slack_enabled
+            url = self.slack_webhook_url
+        elif b == "discord":
+            routes = self.discord_routes
+            enabled = self.discord_enabled
+            url = self.discord_webhook_url
+        elif b == "teams":
+            routes = self.teams_routes
+            enabled = self.teams_enabled
+            url = self.teams_webhook_url
+        elif b == "webhook":
+            routes = self.webhook_routes
+            enabled = self.webhook_enabled
+            url = self.webhook_url
+        else:
+            raise ValueError(f"unknown notification backend: {backend!r}")
+
+        if routes:
+            for r in routes:
+                # Defensive: yield a fresh dict so caller mutation can't
+                # leak back into the Config.
+                yield {
+                    "webhook_url": r["webhook_url"],
+                    "on": list(r.get("on") or _DEFAULT_ROUTE_ACTIONS),
+                    "paths": list(r.get("paths") or _DEFAULT_ROUTE_PATHS),
+                }
+            return
+
+        if enabled and url:
+            pseudo: dict = {
+                "webhook_url": url,
+                "on": list(_DEFAULT_ROUTE_ACTIONS),
+                "paths": list(_DEFAULT_ROUTE_PATHS),
+            }
+            if b == "webhook" and self.webhook_extra_headers:
+                # Generic envelope carries auth headers; preserve via the
+                # pseudo-route so the dispatcher gets to set them on the
+                # outgoing request without a special legacy code path.
+                pseudo["extra_headers"] = dict(self.webhook_extra_headers)
+            yield pseudo
+
+    def has_legacy_routes_conflict(self, backend: str) -> bool:
+        """Return True if BOTH legacy single-channel form AND list-form
+        are configured for ``backend``. Used to emit a one-shot info
+        line at engine startup ("ignoring slack_webhook_url because
+        slack_routes is set") so a user mid-transition sees the override.
+        """
+        b = backend.lower()
+        if b == "slack":
+            return bool(self.slack_routes) and bool(self.slack_enabled and self.slack_webhook_url)
+        if b == "discord":
+            return bool(self.discord_routes) and bool(self.discord_enabled and self.discord_webhook_url)
+        if b == "teams":
+            return bool(self.teams_routes) and bool(self.teams_enabled and self.teams_webhook_url)
+        if b == "webhook":
+            return bool(self.webhook_routes) and bool(self.webhook_enabled and self.webhook_url)
+        return False
 
     def effective_snapshot_on(self) -> str:
         """Resolve snapshot_on with format-aware defaults.

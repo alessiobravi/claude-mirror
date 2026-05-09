@@ -839,6 +839,96 @@ Every header in `webhook_extra_headers` is set on the outgoing request, so this 
 
 All four are independent — enable Slack and Discord and Generic together if you want; each runs on every event.
 
+### Multi-channel routing per project
+
+Since v0.5.50, every backend supports an optional **list-form** that replaces the single-channel `*_webhook_url` field with a list of routes. Each route names its own webhook URL, an event-type filter (`on`), and a path-glob filter (`paths`). Routes within a backend fire sequentially; matched routes get a notifier instance built from their own URL — different routes never share a notifier.
+
+The list-form is optional and additive — every project YAML written before v0.5.50 keeps working with zero changes. The legacy single-channel field stays the easy on-ramp for "send all events to one channel". The list-form is the right tool the moment you want push notifications and delete notifications going to different channels, or want to scope a route to files under a particular subtree.
+
+#### Schema
+
+Each `*_routes` field is a list of dicts with three keys:
+
+```yaml
+slack_routes:
+  - webhook_url: https://hooks.slack.com/services/T1/B1/abcd...   # required, non-empty string
+    on: [push, sync]                                              # default: [push, pull, sync, delete]
+    paths: ["**/CLAUDE.md", "memory/**"]                          # default: ["**/*"]
+```
+
+Same shape applies to `discord_routes`, `teams_routes`, and `webhook_routes`.
+
+- `webhook_url` is required. Missing or empty → `ValueError` at config load (not at first-event-fire — typos surface immediately on `claude-mirror init` / `status` / `push`).
+- `on` is a list of action strings from the closed set `{"push", "pull", "sync", "delete"}`. An unknown action → `ValueError`. Defaults to all four actions.
+- `paths` is a list of glob strings parsed by Python's `fnmatch.fnmatchcase` — the same engine as `file_patterns` and `exclude_patterns`. Defaults to `["**/*"]`. **Note**: `**/*` matches any file with at least one path separator (e.g. `docs/notes.md`) but NOT a top-level file (e.g. `CLAUDE.md`). To catch top-level files, use `*.md` or list `CLAUDE.md` explicitly.
+
+#### Precedence: list-form wins over legacy
+
+If a project sets BOTH `slack_webhook_url` (legacy) AND `slack_routes` (list-form), the list-form wins. The legacy field is silently dropped from dispatch and a yellow info line is printed at engine startup:
+
+```
+ignoring slack_webhook_url because slack_routes is set
+```
+
+This is intentional rather than a hard error — the user may be in a transition. Same precedence rule applies to `discord_*`, `teams_*`, and the generic `webhook_*` pair.
+
+#### Filter semantics
+
+For each route, on every event, claude-mirror does:
+
+1. **Action filter.** If `event.action` is not in the route's `on` list, skip the route.
+2. **Path filter.** Filter `event.files` to those matching at least one of the route's `paths` globs (via `fnmatch.fnmatchcase`). If NO files match, skip the route entirely. If SOME match, construct a route-scoped event (`event.files` trimmed to the matching subset) and fire the notifier.
+3. **Heartbeat events** (no files at all) bypass the path filter and always fire — a `sync` that found nothing to do still surfaces as a status heartbeat for routes that subscribe to `sync`.
+
+The original event is never mutated. Concurrent backends each derive their own scoped view, so a Slack route narrowing files to `secrets/**` does not affect what Discord sees.
+
+#### Worked examples
+
+**Per-event-type routing — push to a busy channel, delete to a quieter one:**
+
+```yaml
+slack_routes:
+  - webhook_url: https://hooks.slack.com/services/T/B/firehose
+    on: [push, sync, pull]
+  - webhook_url: https://hooks.slack.com/services/T/B/deletes
+    on: [delete]
+```
+
+**Per-path routing — send `secrets/**` and `infra/**` events to a security channel, everything else to general:**
+
+```yaml
+slack_routes:
+  - webhook_url: https://hooks.slack.com/services/T/B/security
+    paths: ["secrets/**", "infra/**"]
+  - webhook_url: https://hooks.slack.com/services/T/B/general
+    paths: ["**/*"]
+```
+
+(A push touching files in both subtrees fires both routes — each with its own scoped event listing only the files that matched its filter.)
+
+**Combined — security channel sees only deletes under `secrets/**`, everything else goes to general:**
+
+```yaml
+discord_routes:
+  - webhook_url: https://discord.com/api/webhooks/sec
+    on: [delete]
+    paths: ["secrets/**"]
+  - webhook_url: https://discord.com/api/webhooks/general
+    on: [push, pull, sync, delete]
+    paths: ["**/*"]
+```
+
+#### Config-field summary (multi-channel routing)
+
+| Field | Type | Default | Purpose |
+|---|---|---|---|
+| `slack_routes` | list[dict] / null | `null` | Multi-channel Slack routing. Wins over `slack_webhook_url` when both set. |
+| `discord_routes` | list[dict] / null | `null` | Multi-channel Discord routing. Wins over `discord_webhook_url` when both set. |
+| `teams_routes` | list[dict] / null | `null` | Multi-channel Teams routing. Wins over `teams_webhook_url` when both set. |
+| `webhook_routes` | list[dict] / null | `null` | Multi-channel generic-webhook routing. Wins over `webhook_url` when both set. Per-route `extra_headers` is supported as an additive key. |
+
+Each list element shape: `{webhook_url: str, on: list[str], paths: list[str]}`.
+
 ## Multi-backend mirroring (Tier 2)
 
 A single project can be synced to multiple storage backends at the same time. Push uploads to all of them in parallel, snapshots are mirrored across all of them (configurable), and pull / status read from the primary. If a mirror fails transiently it is retried automatically on the next push; permanent failures are quarantined and surfaced via `claude-mirror status --pending` and the desktop / Slack notifiers.

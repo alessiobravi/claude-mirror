@@ -605,6 +605,10 @@ claude-mirror can post sync events to Slack, Discord, Microsoft Teams, and any g
 | `webhook_enabled` | bool | `false` | Master switch for the generic JSON webhook (n8n / Make / Zapier / custom endpoints). |
 | `webhook_url` | str | `""` | Arbitrary URL that receives the schema-stable v1 JSON envelope on every event. |
 | `webhook_extra_headers` | dict[str,str] / null | `null` | Extra HTTP headers attached to every generic-webhook request — typically auth tokens (`Authorization: Bearer ...`) or routing headers (`X-Tenant-ID: ...`). |
+| `slack_routes` | list[dict] / null | `null` | Multi-channel Slack routing list (v0.5.50+). Each entry: `{webhook_url: str, on: list[str], paths: list[str]}`. Wins over `slack_webhook_url` when both are set. See [admin.md — Multi-channel routing per project](admin.md#multi-channel-routing-per-project). |
+| `discord_routes` | list[dict] / null | `null` | Multi-channel Discord routing list (v0.5.50+). Same shape as `slack_routes`. Wins over `discord_webhook_url` when both are set. |
+| `teams_routes` | list[dict] / null | `null` | Multi-channel Microsoft Teams routing list (v0.5.50+). Same shape as `slack_routes`. Wins over `teams_webhook_url` when both are set. |
+| `webhook_routes` | list[dict] / null | `null` | Multi-channel generic-webhook routing list (v0.5.50+). Same shape as `slack_routes`, plus an optional per-route `extra_headers` key for auth tokens. Wins over `webhook_url` when both are set. |
 
 Slack-specific fields (`slack_enabled`, `slack_webhook_url`, `slack_channel`) are covered in [README — Slack notifications](../README.md#slack-notifications).
 

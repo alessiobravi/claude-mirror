@@ -110,6 +110,14 @@ Plain FTP (legacy shared-hosting market: cPanel / DirectAdmin / old WordPress ho
 - `docs/cli-reference.md` — `--backend` choice list extended to include `ftp` everywhere it appears. New `--ftp-*` flag block on `init` and `clone`. Backend pages list extended.
 - `README.md` — new FTP / FTPS row in the backends table; new row in the prerequisites table.
 
+## [0.5.66] — 2026-05-09
+
+<!-- subsumes: v0.5.65 -->
+
+Same content as v0.5.65 (BACKEND-S3 + BACKEND-SMB) under a fresh PyPI version number. v0.5.65 was tagged on `c93ea6e` and CI Tests went green, but the **Publish to PyPI** workflow run was cancelled mid-flight before the wheel reached PyPI — so the v0.5.65 number is burned (PyPI's never-republish policy) and v0.5.66 ships the same source tree as the publishable artefact. No source-code changes from v0.5.65 → v0.5.66; the only delta is `pyproject.toml` version bump + this changelog block. Tests + mypy unchanged at 1345 / 48-source-files.
+
+---
+
 ## [0.5.65] — 2026-05-09
 
 Two new storage backends ship together — **S3-compatible** (BACKEND-S3) and **SMB/CIFS** (BACKEND-SMB) — extending the supported-backends matrix from six to eight. Both were held back from v0.5.63/v0.5.64 because their parallel additions to shared CLI surfaces (`_AVAILABLE_BACKENDS`, `_create_storage`, init wizard, doctor matrix) collided with FTP. Landing them on a stable post-FTP baseline kept the integration clean. 1345 tests pass on macOS (1251 baseline + 94 new); `mypy --strict` clean across 48 source files.

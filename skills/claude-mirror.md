@@ -202,7 +202,7 @@ claude-mirror watch --config <config-path>
 
 ## Shell tab-completion
 
-`claude-mirror-install` auto-installs shell tab-completion for the user's detected shell (zsh, bash, or fish). Pressing `<TAB>` after `claude-mirror` shows all commands; after a specific command, it shows the relevant flags; for `click.Choice` flags such as `--backend` it shows the valid choices (`googledrive`, `dropbox`, `onedrive`, `webdav`, `sftp`).
+`claude-mirror-install` auto-installs shell tab-completion for the user's detected shell (zsh, bash, or fish). Pressing `<TAB>` after `claude-mirror` shows all commands; after a specific command, it shows the relevant flags; for `click.Choice` flags such as `--backend` it shows the valid choices (`googledrive`, `dropbox`, `onedrive`, `webdav`, `sftp`, `ftp`, `s3`, `smb`).
 
 If the user reports that tab-completion is not working after running `claude-mirror-install`, the most common cause is that the current shell session was started before the rc file was modified by the installer. Two fixes:
 
@@ -280,6 +280,82 @@ claude-mirror push   --config <config-path>
 ```
 
 SFTP has no native push notifications — claude-mirror falls back to polling (see `poll_interval`).
+
+### FTP / FTPS (legacy shared hosting — cPanel / DirectAdmin / NAS)
+
+YAML config (excerpt):
+
+```yaml
+backend: ftp
+ftp_host: ftp.example.com
+ftp_port: 21
+ftp_username: alice
+ftp_password: <stored at chmod 0600>
+ftp_tls_mode: explicit   # plain | explicit | implicit
+ftp_folder: claude-mirror/myproject
+ftp_passive: true
+poll_interval: 30
+```
+
+Bring it up:
+
+```bash
+claude-mirror init --wizard --backend ftp
+claude-mirror push --config <config-path>
+```
+
+Plain FTP transmits credentials in cleartext — prefer `ftp_tls_mode: explicit` (FTPS) or use SFTP. No native push notifications; polling only.
+
+### S3-compatible (AWS S3, Cloudflare R2, Backblaze B2, Wasabi, MinIO, …)
+
+YAML config (excerpt):
+
+```yaml
+backend: s3
+s3_endpoint_url: ""              # blank for AWS; provider host otherwise
+s3_bucket: my-claude-mirror-bucket
+s3_region: us-east-1
+s3_access_key_id: AKIA...        # or blank to use boto3 default credential chain
+s3_secret_access_key: <secret>   # or blank
+s3_prefix: myproject
+s3_use_path_style: false         # true for MinIO / some S3-compat services
+poll_interval: 30
+```
+
+Bring it up:
+
+```bash
+claude-mirror init --wizard --backend s3
+claude-mirror push --config <config-path>
+```
+
+Leaving access key + secret blank tells boto3 to use its default credential chain (env vars, `~/.aws/credentials`, IAM role). For non-AWS providers set `s3_endpoint_url` (e.g. `https://<account>.r2.cloudflarestorage.com` for R2). No native push notifications; polling only.
+
+### SMB / CIFS (Windows file shares, Synology / QNAP / TrueNAS NAS, macOS Sharing, generic Samba)
+
+YAML config (excerpt):
+
+```yaml
+backend: smb
+smb_server: nas.local            # hostname or IP
+smb_port: 445                    # 139 for legacy NetBIOS-over-TCP
+smb_share: claude-mirror
+smb_username: alice
+smb_password: <stored at chmod 0600>
+smb_domain: ""                   # AD / NTLM domain; blank for workgroup
+smb_folder: claude-mirror/myproject
+smb_encryption: true             # SMB3 per-message encryption
+poll_interval: 30
+```
+
+Bring it up:
+
+```bash
+claude-mirror init --wizard --backend smb
+claude-mirror push --config <config-path>
+```
+
+SMB2/3 only — SMBv1 is rejected as a security gate. No native push notifications; polling only.
 
 ## Important rules
 

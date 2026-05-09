@@ -68,6 +68,16 @@ def _load_fuse() -> tuple[type[OSError], type[object]]:
                 "`pipx install --force claude-mirror`. If you installed with "
                 "`--no-deps`, run `pip install fusepy` directly."
             ) from exc
+        except OSError as exc:
+            raise OSError(
+                "The OS-level FUSE library is not installed. Install the "
+                "kernel layer for your platform (one-time, OS-level): "
+                "macOS = `brew install --cask macfuse`, Linux = libfuse "
+                "(usually already kernel-resident on every modern distro), "
+                "Windows = WinFsp from https://winfsp.dev. fusepy is loaded "
+                "at runtime, not at install time, so this error appears the "
+                "first time you run `claude-mirror mount`."
+            ) from exc
         _FuseOSError_cls = FuseOSError
         _Operations_cls = Operations
         _fuse_loaded = True
@@ -84,10 +94,19 @@ class _FallbackOperations:
 
 def _operations_base() -> type[object]:
     """Return the Operations base class — real if fusepy is available,
-    else the in-process fallback. Resolved at class-definition time."""
+    else the in-process fallback. Resolved at class-definition time.
+
+    `OSError` covers the case where fusepy is installed but the OS-level
+    FUSE library isn't (fusepy's `fuse.py` calls `ctypes.CDLL("libfuse")`
+    at import time and raises `OSError` if the library isn't found).
+    That's the dominant failure mode on CI runners and on user machines
+    that haven't installed macFUSE / WinFsp / libfuse yet — the import
+    must NOT crash module-load there. Real mount attempts surface the
+    missing-kernel-layer error at `FUSE()` instantiation time with the
+    install hint."""
     try:
         from fuse import Operations
-    except ImportError:
+    except (ImportError, OSError):
         return _FallbackOperations
     base: type[object] = Operations
     return base

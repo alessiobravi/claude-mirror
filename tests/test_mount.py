@@ -862,3 +862,28 @@ def test_manifest_entry_is_immutable() -> None:
 def test_manifest_entry_default_kind_is_sha256() -> None:
     entry = ManifestEntry(rel_path="foo.md", identifier="abc", size=1, mtime=0.0)
     assert entry.identifier_kind == "sha256"
+
+
+def test_module_imports_when_libfuse_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression guard for the v0.5.61 hotfix: importing
+    ``claude_mirror._mount`` MUST not raise when fusepy is installed but
+    the OS-level FUSE library (libfuse / macFUSE / WinFsp) isn't present
+    — the dominant CI-runner failure mode. Achieved by catching ``OSError``
+    from the eager ``from fuse import Operations`` lookup at module load
+    time and falling back to ``_FallbackOperations``."""
+    import importlib
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _fake_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "fuse":
+            raise OSError("Unable to find libfuse")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+    monkeypatch.delitem(sys.modules, "fuse", raising=False)
+    monkeypatch.delitem(sys.modules, "claude_mirror._mount", raising=False)
+
+    mount_mod = importlib.import_module("claude_mirror._mount")
+    assert mount_mod._OperationsBase is mount_mod._FallbackOperations

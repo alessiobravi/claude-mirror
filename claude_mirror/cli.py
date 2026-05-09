@@ -11084,11 +11084,17 @@ def _import_fuse() -> Any:
 
     Kept as a thin helper so tests can monkeypatch the import without
     needing fusepy actually installed in the test environment.
+
+    Catches `OSError` as well — fusepy's `fuse.py` calls `ctypes.CDLL`
+    at import time and raises `OSError("Unable to find libfuse")` when
+    the OS-level FUSE library isn't installed (the dominant failure
+    mode on CI runners and on user machines that haven't installed
+    macFUSE / WinFsp / libfuse yet).
     """
     try:
         import fuse as _fuse
         return _fuse
-    except ImportError as exc:
+    except (ImportError, OSError) as exc:
         raise click.ClickException(_MOUNT_INSTALL_HINT) from exc
 
 

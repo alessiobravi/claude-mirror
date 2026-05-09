@@ -176,6 +176,33 @@ def test_mount_optional_dep_guard_prints_install_hint(
     assert "WinFsp" in result.output
 
 
+def test_import_fuse_handles_libfuse_missing_oserror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fusepy installed but the OS-level FUSE library missing — fusepy's
+    own `import fuse` raises `OSError("Unable to find libfuse")` at module
+    load time. `_import_fuse` MUST catch that and surface the friendly
+    install hint, not a raw OSError. CI runners hit this; users who
+    haven't installed macFUSE / WinFsp / libfuse hit it too. Regression
+    guard for the v0.5.61 hotfix."""
+    import builtins
+    real_import = builtins.__import__
+
+    def _fake_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "fuse":
+            raise OSError("Unable to find libfuse")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+    monkeypatch.delitem(__import__("sys").modules, "fuse", raising=False)
+
+    with pytest.raises(click.ClickException) as exc_info:
+        cli_mod._import_fuse()
+    msg = exc_info.value.format_message()
+    assert "fusepy" in msg
+    assert "macfuse" in msg or "WinFsp" in msg or "libfuse" in msg.lower()
+
+
 # ---------------------------------------------------------------------------
 # 2. Mutually-exclusive variant flags
 # ---------------------------------------------------------------------------

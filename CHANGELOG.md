@@ -110,27 +110,23 @@ Plain FTP (legacy shared-hosting market: cPanel / DirectAdmin / old WordPress ho
 - `docs/cli-reference.md` — `--backend` choice list extended to include `ftp` everywhere it appears. New `--ftp-*` flag block on `init` and `clone`. Backend pages list extended.
 - `README.md` — new FTP / FTPS row in the backends table; new row in the prerequisites table.
 
-## [Unreleased]
+## [0.5.65] — 2026-05-09
+
+Two new storage backends ship together — **S3-compatible** (BACKEND-S3) and **SMB/CIFS** (BACKEND-SMB) — extending the supported-backends matrix from six to eight. Both were held back from v0.5.63/v0.5.64 because their parallel additions to shared CLI surfaces (`_AVAILABLE_BACKENDS`, `_create_storage`, init wizard, doctor matrix) collided with FTP. Landing them on a stable post-FTP baseline kept the integration clean. 1345 tests pass on macOS (1251 baseline + 94 new); `mypy --strict` clean across 48 source files.
 
 ### Added — S3-compatible storage backend (BACKEND-S3)
 
 One implementation transparently supports AWS S3, Cloudflare R2, Backblaze B2 (S3 API), Wasabi, MinIO, Tigris, IDrive E2, Linode Object Storage, DigitalOcean Spaces, Storj, Hetzner Storage Box, and every other S3-compatible service via configurable `s3_endpoint_url`. Adds `boto3>=1.34` to base install (lazy-imported, zero startup cost for users who don't use S3).
 
 - New module `claude_mirror/backends/s3.py` (~470 lines) — full `StorageBackend` implementation: `authenticate` via `head_bucket`, single-PUT or multipart `upload_file` (5 MiB threshold matching S3's smallest legal multipart-part size), `get_object` streaming download with the project-wide `MAX_DOWNLOAD_BYTES` cap, paginated `list_objects_v2` recursive listing with client-side `exclude_folder_names` filtering, server-side `copy_object`, ETag-based `get_file_hash` (with the documented multipart `-N` suffix caveat), `classify_error` mapping for `NoCredentialsError` / `InvalidAccessKeyId` / `SignatureDoesNotMatch` / `AccessDenied` / `NoSuchBucket` / `NoSuchKey` / `SlowDown` / 429 / 5xx / 413 / `EndpointConnectionError`. Boto3 lazy-imported function-locally per the v0.5.61 fusepy precedent.
-- `claude_mirror/cli.py::_AVAILABLE_BACKENDS` — append `"s3"` (last entry, append-only). New `_create_storage` dispatch case. New `_run_s3_deep_checks` doctor function (six checks: credentials shape, endpoint URL well-formedness, bucket reachable via `head_bucket`, list permissions via `list_objects_v2 MaxKeys=1`, write permissions via `put_object` + `delete_object` of a 1-byte sentinel, region consistency between `s3_region` and the bucket's actual region) wired into `_run_doctor_checks`. Init wizard + flag-mode validation extended with the s3 branch; `init` and `clone` Click commands gain the seven new `--s3-*` flags. Wizard summary block + token-file derivation cover s3.
+- `claude_mirror/cli.py::_AVAILABLE_BACKENDS` — append `"s3"` (append-only). New `_create_storage` dispatch case. New `_run_s3_deep_checks` doctor function (six checks: credentials shape, endpoint URL well-formedness, bucket reachable via `head_bucket`, list permissions via `list_objects_v2 MaxKeys=1`, write permissions via `put_object` + `delete_object` of a 1-byte sentinel, region consistency between `s3_region` and the bucket's actual region) wired into `_run_doctor_checks`. Init wizard + flag-mode validation extended with the s3 branch; `init` and `clone` Click commands gain the seven new `--s3-*` flags. Wizard summary block + token-file derivation cover s3.
 - `claude_mirror/config.py::Config` — new fields `s3_endpoint_url`, `s3_bucket`, `s3_region`, `s3_access_key_id`, `s3_secret_access_key`, `s3_prefix`, `s3_use_path_style`. `root_folder` property returns the resolved prefix for s3.
 - `pyproject.toml` — `boto3>=1.34` added to base `[project] dependencies` (matches the v0.5.10 every-backend-in-base policy). `boto3.*` + `botocore.*` added to the `[[tool.mypy.overrides]] ignore_missing_imports` list. Empty `[project.optional-dependencies] s3 = []` for back-compat aliases.
-- `tests/test_s3_backend.py` — **38 tests** using a hand-written `FakeS3` mock (no `moto`, no network): authenticate happy/sad paths, all upload/download/list/copy/delete/get_hash methods, classify_error mapping for every ErrorClass entry, path-style vs virtual-hosted-style URL construction, multipart threshold passes through `TransferConfig`, multi-page pagination, empty bucket, sentinel write+delete. Multipart code path exercised at `_MULTIPART_THRESHOLD + 1024` bytes.
-- `tests/test_doctor_s3_deep.py` — **11 tests** covering each of the six deep checks (happy path + failure variants), plus auth-bucket short-circuit assertion (one auth failure, remaining checks skipped). All boto3 calls mocked at the `S3Backend._get_client` seam.
+- `tests/test_s3_backend.py` — **38 tests** using a hand-written `FakeS3` mock (no `moto`, no network): authenticate happy/sad paths, all upload/download/list/copy/delete/get_hash methods, classify_error mapping for every ErrorClass entry, path-style vs virtual-hosted-style URL construction, multipart threshold passes through `TransferConfig`, multi-page pagination, empty bucket, sentinel write+delete.
+- `tests/test_doctor_s3_deep.py` — **11 tests** covering each of the six deep checks (happy path + failure variants), plus auth-bucket short-circuit assertion. All boto3 calls mocked at the `S3Backend._get_client` seam.
 - `tests/test_init_wizard.py` — extended with `test_run_wizard_s3_walks_through_prompts`.
-- `tests/test_dyn_comp.py` — updated `test_list_backends_prints_five_expected_names_one_per_line` to include `"s3"` (the test is renamed semantically but the contract remains: every entry of `_AVAILABLE_BACKENDS` is emitted, in declaration order, one per line).
-- `docs/backends/s3.md` — new (~250 lines): per-provider quick-starts (AWS / Cloudflare R2 / Backblaze B2 / MinIO), full config field reference, minimum IAM policy with `s3:ListBucket` + `s3:GetObject` / `s3:PutObject` / `s3:DeleteObject` / `s3:CopyObject` examples, doctor deep-check walkthrough, troubleshooting (auth errors, bucket-not-found, region mismatches, MinIO TLS, path-style vs virtual-hosted, multipart ETag caveat).
-- `README.md` — backends table extended with the S3 row; `**Supported backends**` summary line, `## How it works` polling latency line, `### Prerequisites` table, install description, and the documentation index all updated.
-
-### Tests
-
-- `pytest tests/` — **1151 passed, 3 skipped** locally on macOS (was 1101 + 50 new S3 tests + 1 init-wizard regression update).
-## [Unreleased]
+- `tests/test_dyn_comp.py` — `_list-backends` expectation includes `"s3"`.
+- `docs/backends/s3.md` — NEW (~250 lines): per-provider quick-starts (AWS / Cloudflare R2 / Backblaze B2 / MinIO), full config-field reference, minimum IAM policy with `s3:ListBucket` + `s3:GetObject` / `s3:PutObject` / `s3:DeleteObject` / `s3:CopyObject` examples, doctor deep-check walkthrough, troubleshooting matrix.
 
 ### Added — SMB/CIFS storage backend (BACKEND-SMB)
 
@@ -140,20 +136,23 @@ Sync directly to Windows file shares, Synology / QNAP / TrueNAS NAS devices, mac
 - New SMB-specific config fields on `Config`: `smb_server`, `smb_port` (default 445), `smb_share`, `smb_username`, `smb_password` (stored at chmod 0600 same posture as `sftp_password`), `smb_domain` (folded into the canonical NTLM `DOMAIN\\user` form by the backend), `smb_folder`, `smb_encryption` (default true). `Config.root_folder` returns `smb_folder` for the SMB backend.
 - New CLI surfaces: `claude-mirror init --backend smb` + `claude-mirror init --wizard --backend smb` with the eight SMB-specific flags (`--smb-server`, `--smb-port`, `--smb-share`, `--smb-username`, `--smb-password`, `--smb-domain`, `--smb-folder`, `--smb-encryption/--no-smb-encryption`). The `clone` command grew the same flag set. Wizard validators reject empty server / share / username; port range-checked 1..65535.
 - New doctor deep checks (`_run_smb_deep_checks`): six-step probe — server reachable (TCP), SMB2/3 protocol negotiation (SMBv1 rejected as a SECURITY GATE — refuses to connect, fix-hint points at the server's protocol settings rather than `claude-mirror auth`), authentication via `register_session`, share access via `scandir`, folder write via a 1-byte sentinel, and an info-only encryption-status line that warns when SMB3 was requested but the server downgraded to plaintext. Auth-class failures bucket into ONE failure line so the user doesn't see five copies of the same root cause.
-- `tests/test_smb_backend.py` — 32 tests covering the full backend surface (auth, upload/download/list/copy/delete/hash, classify_error matrix, encryption flag wiring, UNC path translation, server-side-copy fallback). All offline via an in-memory `FakeShare` mock of the smbclient module surface.
-- `tests/test_doctor_smb_deep.py` — 11 tests covering each of the six deep checks (happy path + failure paths). Includes the SMBv1 security-gate regression: a v1-only server fails the run loudly and short-circuits the rest of the chain.
+- `tests/test_smb_backend.py` — **32 tests** covering the full backend surface (auth, upload/download/list/copy/delete/hash, classify_error matrix, encryption flag wiring, UNC path translation, server-side-copy fallback). All offline via an in-memory `FakeShare` mock of the smbclient module surface.
+- `tests/test_doctor_smb_deep.py` — **11 tests** covering each of the six deep checks (happy path + failure paths). Includes the SMBv1 security-gate regression: a v1-only server fails the run loudly and short-circuits the rest of the chain.
 - `tests/test_init_wizard.py` — extended with `test_run_wizard_smb_walks_through_prompts` reaching the SMB-specific server / share / username prompts.
-- `tests/test_dyn_comp.py` — updated `_list-backends` expectation to include `smb`.
+- `tests/test_dyn_comp.py` — `_list-backends` expectation includes `"smb"`.
 - `pyproject.toml` — new base dependency `smbprotocol>=1.13`. New mypy `ignore_missing_imports` overrides for `smbprotocol.*` and `smbclient.*` so `mypy --strict` stays clean.
 - `docs/backends/smb.md` — NEW. Quick-start recipes for Synology, QNAP, TrueNAS, Windows file share, macOS Sharing, and generic Samba. Config-field reference. Permission-model walkthrough (share-level vs file-level — common gotcha on Synology). Deep-check reference. Troubleshooting matrix.
-- `README.md` — backends table grew the SMB row; prerequisites table extended with the SMB row.
-- `docs/README.md` — backends index extended.
-- `docs/admin.md` — generic-doctor matrix extended with the SMB credential row, new `### SMB deep checks` section with the six-check matrix + auth-bucketing + lazy-import notes, `Where to go next` cross-link extended.
-- `docs/cli-reference.md` — top-level `--backend` choices and the SMB-specific flags appended to both `init` and `clone` flag tables.
+
+### Cross-cutting (S3 + SMB)
+
+- `README.md` — backends table grew the S3 and SMB rows; **Supported backends** summary line, `## How it works` polling-latency line, `### Prerequisites` table, install description, and the documentation index all updated.
+- `docs/README.md` — backends index extended with both new pages.
+- `docs/admin.md` — generic-doctor matrix extended with the S3 + SMB credential rows; new `### S3 deep checks` and `### SMB deep checks` sections (six-check matrix each, auth-bucketing + lazy-import notes); `Where to go next` cross-links extended.
+- `docs/cli-reference.md` — top-level `--backend` choices and the per-backend flag blocks appended to both `init` and `clone` flag tables.
 
 ### Tests
-- `pytest tests/` — **1145 passed, 3 skipped** on macOS (1101 prior + 43 new SMB tests + 1 new init-wizard SMB test, less the renamed `_list-backends` regression test).
-- `mypy --strict claude_mirror/` — clean across 42 source files.
+- `pytest tests/` — **1345 passed, 3 skipped** locally on macOS (was 1251 + 49 new S3 tests + 43 new SMB tests + 2 init-wizard regression tests).
+- `mypy --strict claude_mirror/` — clean across 48 source files.
 
 ---
 

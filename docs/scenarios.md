@@ -17,6 +17,7 @@ For backend-specific setup details (OAuth flow, app registration, NAS configurat
 - [G. Multi-user + multi-backend (production-realistic)](#g-multi-user--multi-backend-production-realistic)
 - [H. Multi-project enterprise](#h-multi-project-enterprise)
 - [I. Cross-tool AGENTS.md sync](#i-cross-tool-agentsmd-sync)
+- [J. Browse / grep / diff snapshots without restoring](#j-browse--grep--diff-snapshots-without-restoring)
 
 ---
 
@@ -1072,6 +1073,117 @@ For multi-machine (typical for this scenario — one user, laptop + desktop), th
 - [`docs/profiles/agents-md.yaml`](./profiles/agents-md.yaml) — the maintained sample profile YAML.
 - [Scenario B. Personal multi-machine sync](#b-personal-multi-machine-sync) — the typical topology this scenario layers on top of.
 - [Scenario F. Selective sync](#f-selective-sync) — full reference for `file_patterns` / `exclude_patterns` semantics, the `.claude_mirror_ignore` file, and how exclusions interact with previously-synced remote leftovers.
+
+---
+
+## J. Browse / grep / diff snapshots without restoring
+
+### Purpose
+
+You want to look at a past snapshot — `grep -r` for a string, `diff` against the current project, open the file in your editor — without committing to a full `restore` and without downloading the whole snapshot to local disk first. Or you want to browse the live current state of a remote backend (a colleague's freshly-pushed file you haven't pulled yet) without running `pull --output`. The read-only FUSE mount package gives you a real filesystem path you can point any UNIX tool at; bytes are fetched from the backend on demand and cached forever (content-addressed).
+
+This is the right scenario when:
+
+- You want to compare two recovery candidates before deciding which to restore — `diff /tmp/april/CLAUDE.md /tmp/may/CLAUDE.md` works directly, no `restore --output` to two separate trees first.
+- You want to `grep -r 'something'` across every snapshot at once to find when a specific line first appeared.
+- You want to inspect what a colleague pushed without pulling it onto your working tree.
+- You want a stable, human-browseable way to look at any past version of any file from your file manager / editor without polluting the project directory.
+
+If you actually want to overwrite the project with a snapshot's contents, use `claude-mirror restore` instead — `mount` is read-only by design. If you want to compare two specific snapshots side-by-side, `claude-mirror snapshot-diff TS1 TS2` runs entirely on the manifests without any FUSE setup; reach for `--all-snapshots` mount when you want ad-hoc shell-tool composition rather than a structured diff table.
+
+### How to implement
+
+The mount surface is an optional extra. Install it once per machine:
+
+```bash
+pipx install 'claude-mirror[mount]'
+```
+
+Then install the kernel layer for your platform (one-time per machine):
+
+| Platform | Install |
+|---|---|
+| macOS | `brew install --cask macfuse` |
+| Linux | already kernel-resident on every modern distro (in-tree libfuse) |
+| Windows | install [WinFsp](https://winfsp.dev) |
+
+If fusepy is missing, the `mount` command exits non-zero and prints the right install hint per platform — no separate doctor command needed.
+
+Five variants share a single read-only engine. Pick the one that matches what you want to inspect:
+
+```bash
+# 1. One frozen snapshot (by tag).
+mkdir /tmp/snap
+claude-mirror mount --tag pre-refactor /tmp/snap
+grep -r 'TODO' /tmp/snap
+diff /tmp/snap/CLAUDE.md ~/projects/myproject/CLAUDE.md
+claude-mirror umount /tmp/snap
+
+# 2. One frozen snapshot (by timestamp — for snapshots without a tag).
+mkdir /tmp/snap
+claude-mirror mount --snapshot 2026-04-15T10-30-00Z /tmp/snap
+
+# 3. Every snapshot stacked under per-timestamp subdirectories.
+mkdir /tmp/all-history
+claude-mirror mount --all-snapshots /tmp/all-history
+ls /tmp/all-history/                       # one directory per snapshot
+diff /tmp/all-history/2026-04-01.../CLAUDE.md /tmp/all-history/2026-05-01.../CLAUDE.md
+grep -r 'old function name' /tmp/all-history/   # find when a string first disappeared
+
+# 4. Time-travel: last snapshot on or before a date.
+mkdir /tmp/april15
+claude-mirror mount --as-of 2026-04-15 /tmp/april15
+
+# 5. Live current state of the primary backend.
+mkdir /tmp/drive-now
+claude-mirror mount --live /tmp/drive-now
+
+# 6. Live current state of a specific Tier 2 mirror.
+mkdir /tmp/dropbox
+claude-mirror mount --live --backend dropbox /tmp/dropbox
+```
+
+The mount runs in the foreground by default — Ctrl+C cleanly unmounts and exits. Pass `--background` to daemonise on POSIX (Windows always runs foreground; the foreground Ctrl+C is the documented stop signal there). Pair `--cache-mb N` with any variant to size the on-disk blob cache (default 500MB, backed by `$XDG_CACHE_HOME/claude-mirror/blobs/`); pair `--ttl N` with `--live` to set how long directory listings are cached before being re-fetched (default 30 seconds — snapshot variants are immutable, so `--ttl` is rejected for them).
+
+To unmount cleanly from any platform, use the bundled wrapper:
+
+```bash
+claude-mirror umount /tmp/snap
+```
+
+`umount` shells out to the right platform tool (`umount` on macOS, `fusermount -u` on Linux); on Windows it prints a hint pointing at Ctrl+C on the foreground mount process.
+
+### Daily ops behaviour
+
+| Event | What happens |
+|---|---|
+| First read of a file | The blob's sha256 is fetched from the backend, written to `$XDG_CACHE_HOME/claude-mirror/blobs/`, then served. Cold-cache latency is one network round-trip per file. |
+| Second read of the same file | Served from the local cache — no network. Same latency as a regular disk read. |
+| `grep -r 'X' /tmp/snap` | Walks the snapshot's manifest (cheap), then fetches each matching blob on first access (cached forever after). For a 500-file snapshot, the first run costs ~500 network round-trips amortised; subsequent runs are local-disk speed. |
+| `--live` mount, file added on the backend | Within `--ttl` seconds (default 30), the new file appears in the next directory listing. The blob is fetched on first read. |
+| Concurrent `claude-mirror push` from another machine | The `--live` mount surfaces the new state on the next listing refresh. The mount is not transactional — see the atomicity caveat below. |
+| Editor saves a file inside the mount | Write fails with `EROFS`. Mount is read-only by design. To modify a snapshot's contents, `restore --output ~/tmp/somewhere` and edit there. |
+| Ctrl+C on a foreground mount | Cleanly unmounts via the FUSE engine's `cleanup()` hook. Cache files persist (content-addressed; safe to reuse on the next mount). |
+| `claude-mirror gc --delete` runs on the backend after the mount started | Affected files surface as I/O errors on read (the underlying blob is gone). The mount keeps serving every other file. |
+| Reboot with the mount still active | The OS tears down the FUSE process; the next mount starts cleanly. The blob cache is reused. |
+
+### Pitfalls and tips
+
+- **Cold-cache latency is real.** The first read of any file pays a network round-trip to the backend. For a tight `grep -r` loop across a large snapshot you may want to warm the cache up front by tarring through the mount: `tar -cf /dev/null /tmp/snap/` reads every file once, populating the cache; subsequent operations are local-disk speed. Size the cache budget with `--cache-mb` accordingly — the default 500MB holds roughly 500MB of unique blob content (deduplicated; identical files across snapshots share one cache entry).
+- **Kernel layer install is per-machine, one-time.** macFUSE on macOS requires a system extension approval after `brew install --cask macfuse` — a System Settings reboot is needed once. Linux's in-tree libfuse needs no install. Windows's WinFsp installs from https://winfsp.dev with a standard installer. The `mount` command's optional-dep guard prints the right hint for the host platform when fusepy isn't installed; once both fusepy and the kernel layer are present, mounts work immediately.
+- **Read-only contract is absolute.** Every write syscall returns `EROFS`. `vim` will save to a `.swp` and then fail; an editor that prompts for force-write won't be able to. The push/pull/sync flow stays the canonical writeback path — to round-trip changes back into the project, `restore --output ~/tmp/edit-here`, edit there, then `cp` back into the project and `claude-mirror push`.
+- **Atomicity contract: FUSE syscalls are not atomic against concurrent backend operations.** A `--live` mount served by claude-mirror is a snapshot-of-listings within `--ttl` and snapshot-of-bytes for already-fetched blobs, but a `claude-mirror push` from another machine can change the backend state mid-grep. If you need a perfectly consistent view, use a snapshot mount (`--tag` / `--snapshot` / `--as-of` / `--all-snapshots`) — those are content-addressed against an immutable manifest and never see writeback drift.
+- **`--all-snapshots` is browseable but heavy on the inode count.** Each snapshot becomes its own tree; a project with 200 snapshots × 500 files exposes 100 000 paths to the kernel. Most filesystems and editors handle that fine; `find /tmp/all-history` will be noticeably slower than a regular tree though, and Spotlight/macOS metadata indexing can keep the FUSE process pegged for a while if it tries to walk the mount. On macOS, exclude the mount from Spotlight via System Settings → Siri & Spotlight → Spotlight Privacy.
+- **`--ttl 0` is not "always fresh".** It still resolves through the cache layer; setting it absurdly low just means every listing pays a network round-trip. For an interactive `--live` mount, the default 30 seconds is a good balance — bump it to 300+ for a slow-changing remote where freshness doesn't matter, drop it to 5 for a high-collaboration scenario where you want minute-fresh state.
+- **Cache survives unmount.** `$XDG_CACHE_HOME/claude-mirror/blobs/` keeps blobs forever (sha256 == identity), so unmounting and remounting the same snapshot is free for files you've already read. To wipe the cache (disk pressure, or you suspect corruption), delete the directory between mounts — the next read repopulates it.
+- **Don't mount inside the project directory.** Pick a mountpoint outside the synced tree (e.g. `/tmp/snap`, `~/.cache/claude-mirror-mounts/snap`) — mounting inside the project tree creates surprising re-entrancy issues if `claude-mirror push` walks the project and follows the FUSE mount as a normal subdirectory.
+
+### Cross-links
+
+- [`docs/cli-reference.md` — `mount`](./cli-reference.md#mount) — full flag table, exit codes, install pointers per platform.
+- [`docs/cli-reference.md` — `umount`](./cli-reference.md#umount) — cross-platform unmount wrapper.
+- [`docs/admin.md` — Snapshots and disaster recovery](./admin.md#snapshots-and-disaster-recovery) — the full snapshot lifecycle (create / list / inspect / restore / forget / prune / gc); mount is one read-only consumer of that store.
+- [`docs/admin.md` — Comparing snapshots](./admin.md#comparing-snapshots) — `claude-mirror snapshot-diff` for structured per-file diffs without FUSE setup.
 
 ---
 

@@ -11038,3 +11038,405 @@ def _render_health_table(report: Any) -> None:
     console.print(
         f"\nOverall: [{overall_style} bold]{report.overall.upper()}[/]"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# MOUNT — read-only FUSE filesystem variants
+#
+# Five variant classes, one CLI surface. The engine lives in
+# `claude_mirror._mount`; this section owns flag handling, dispatch into
+# the right variant, the optional-dep guard, and the cross-platform
+# umount wrapper.
+#
+# Variants:
+#   --tag / --snapshot   → SnapshotFS    (one frozen snapshot)
+#   --live               → LiveFS        (current state of primary backend)
+#   --live --backend N   → PerMirrorFS   (current state of one Tier 2 mirror)
+#   --all-snapshots      → AllSnapshotsFS (every snapshot under <ts>/ dirs)
+#   --as-of DATE         → AsOfDateFS    (last snapshot ≤ DATE)
+#
+# Read-only by design — writes return EROFS. The push/pull/sync flow
+# stays the canonical writeback path. See docs/scenarios.md (Scenario J)
+# for the user-facing recipe.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+_MOUNT_INSTALL_HINT = (
+    "Mount support is optional. Install with:\n"
+    "\n"
+    "  pipx install 'claude-mirror[mount]'\n"
+    "\n"
+    "Plus the kernel layer for your platform:\n"
+    "\n"
+    "  macOS:   brew install --cask macfuse\n"
+    "  Linux:   already kernel-resident on every modern distro\n"
+    "  Windows: install WinFsp from https://winfsp.dev"
+)
+
+
+def _import_fuse() -> Any:
+    """Import `fuse` (fusepy) lazily, with a friendly error if missing.
+
+    Kept as a thin helper so tests can monkeypatch the import without
+    needing fusepy actually installed in the test environment.
+    """
+    try:
+        import fuse as _fuse
+        return _fuse
+    except ImportError as exc:
+        raise click.ClickException(_MOUNT_INSTALL_HINT) from exc
+
+
+def _import_mount_engine() -> Any:
+    """Import `claude_mirror._mount` lazily.
+
+    The module is shipped in the same package and is always present in
+    the wheel; the import is wrapped only so tests can monkeypatch a
+    stand-in module without fusepy installed at the system layer. The
+    `importlib` indirection silences mypy's "unknown attribute" check on
+    the engine module (which is owned by the parallel engine track and
+    not yet on disk in this worktree's snapshot).
+    """
+    import importlib
+    return importlib.import_module("claude_mirror._mount")
+
+
+def _parse_as_of_date(value: str) -> Any:
+    """Parse --as-of DATE.
+
+    Accepts ISO date (`2026-04-15`) or ISO datetime
+    (`2026-04-15T10:00:00`, `2026-04-15T10:00:00Z`,
+    `2026-04-15T10:00:00+02:00`). Z is normalised to +00:00 for
+    `datetime.fromisoformat` on Python 3.11 (which doesn't accept Z
+    natively until 3.12+).
+    """
+    from datetime import datetime
+    raw = value.strip()
+    if not raw:
+        raise click.BadParameter("--as-of value is empty")
+    candidate = raw.replace("Z", "+00:00") if raw.endswith("Z") else raw
+    try:
+        return datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise click.BadParameter(
+            f"--as-of: cannot parse {value!r} as ISO date or datetime "
+            "(expected e.g. 2026-04-15 or 2026-04-15T10:00:00Z)"
+        ) from exc
+
+
+def _build_mount_fs(
+    *,
+    mount_engine: Any,
+    config: "Config",
+    primary: "StorageBackend",
+    snap_manager: Any,
+    blob_cache: Any,
+    tag: str,
+    snapshot_ts: str,
+    live: bool,
+    as_of: str,
+    all_snapshots: bool,
+    backend_name: str,
+    ttl: int,
+) -> Any:
+    """Resolve flags to a constructed FS instance.
+
+    Pure dispatcher — no I/O outside the (already-loaded) snapshot manager
+    when --tag has to resolve to a timestamp. Kept in its own helper so
+    tests can drive each branch directly without spinning up a CliRunner.
+    """
+    if tag:
+        try:
+            ts = snap_manager.resolve_tag_to_timestamp(tag)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+        return mount_engine.SnapshotFS(snap_manager, ts, blob_cache, primary)
+    if snapshot_ts:
+        return mount_engine.SnapshotFS(
+            snap_manager, snapshot_ts, blob_cache, primary
+        )
+    if live:
+        if backend_name:
+            return mount_engine.PerMirrorFS(
+                config, blob_cache, backend_name, ttl_seconds=ttl,
+            )
+        return mount_engine.LiveFS(
+            config, blob_cache, primary, ttl_seconds=ttl,
+        )
+    if all_snapshots:
+        return mount_engine.AllSnapshotsFS(snap_manager, blob_cache, primary)
+    if as_of:
+        target_dt = _parse_as_of_date(as_of)
+        return mount_engine.AsOfDateFS(
+            snap_manager, target_dt, blob_cache, primary,
+        )
+    # Should never reach here — the upstream mutual-exclusion check
+    # rejects the no-flag case before we get this far.
+    raise click.ClickException(
+        "Internal error: no mount variant selected (this is a bug)"
+    )
+
+
+def _default_blob_cache_dir() -> Path:
+    """Return $XDG_CACHE_HOME/claude-mirror/blobs/, defaulting to
+    ~/.cache/claude-mirror/blobs/ on POSIX. The directory is created
+    lazily by BlobCache itself; we only resolve the path here so the
+    --cache-mb flag has somewhere to spend its budget."""
+    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+    base = Path(xdg) if xdg else Path.home() / ".cache"
+    return base / "claude-mirror" / "blobs"
+
+
+@cli.command()
+@click.argument("mountpoint")
+@click.option("--tag", "tag", default="",
+              help="Mount the snapshot tagged NAME (read-only). "
+                   "Mutually exclusive with --snapshot / --live / "
+                   "--as-of / --all-snapshots.")
+@click.option("--snapshot", "snapshot_ts", default="",
+              help="Mount the snapshot with timestamp TIMESTAMP "
+                   "(e.g. 2026-04-15T10-30-00Z). Mutually exclusive "
+                   "with the other variant flags.")
+@click.option("--live", is_flag=True, default=False,
+              help="Mount the live current state of the primary backend "
+                   "(or, with --backend NAME, of one Tier 2 mirror). "
+                   "Directory listings are cached for --ttl seconds; "
+                   "blob bodies are content-addressed and cached forever.")
+@click.option("--as-of", "as_of", default="",
+              help="Mount the last snapshot taken on or before DATE "
+                   "(ISO date or datetime). E.g. '2026-04-15' or "
+                   "'2026-04-15T10:00:00Z'.")
+@click.option("--all-snapshots", "all_snapshots", is_flag=True, default=False,
+              help="Mount every snapshot under per-timestamp "
+                   "subdirectories (one tree per snapshot, all "
+                   "browsable at once).")
+@click.option("--backend", "backend_name", default="",
+              shell_complete=_backend_value_completer,
+              help="Tier 2: with --live, mount the named mirror's "
+                   "current state instead of the primary. Rejected when "
+                   "passed alongside any non-live variant.")
+@click.option("--cache-mb", "cache_mb", type=int, default=500, show_default=True,
+              help="On-disk content-addressed blob cache budget in MB. "
+                   "Backed by $XDG_CACHE_HOME/claude-mirror/blobs/. "
+                   "Survives unmount/remount.")
+@click.option("--ttl", "ttl", type=int, default=30, show_default=True,
+              help="With --live: how long (seconds) directory listings "
+                   "are cached before being re-fetched. Rejected for "
+                   "snapshot variants — those are immutable.")
+@click.option("--foreground/--background", "foreground", default=True,
+              help="--foreground (default) keeps the process attached "
+                   "to the terminal; Ctrl+C cleanly unmounts. "
+                   "--background daemonises on POSIX. Windows always "
+                   "runs foreground (--background exits with a hint).")
+@click.option("--config", "config_path", default="",
+              help="Config file path. Auto-detected from cwd if omitted.")
+def mount(
+    mountpoint: str,
+    tag: str,
+    snapshot_ts: str,
+    live: bool,
+    as_of: str,
+    all_snapshots: bool,
+    backend_name: str,
+    cache_mb: int,
+    ttl: int,
+    foreground: bool,
+    config_path: str,
+) -> None:
+    """
+    Mount snapshots or live remote state as a read-only FUSE filesystem.
+
+    \b
+    Examples:
+      claude-mirror mount --tag pre-refactor /tmp/snap
+      claude-mirror mount --snapshot 2026-04-15T10-30-00Z /tmp/snap
+      claude-mirror mount --live /tmp/drive-now
+      claude-mirror mount --live --backend dropbox /tmp/dbx
+      claude-mirror mount --all-snapshots /tmp/all-history
+      claude-mirror mount --as-of 2026-04-15 /tmp/april15
+
+    Read-only by design: writes return EROFS. The push/pull/sync flow
+    stays the canonical writeback path. Useful for `grep -r`, `diff`,
+    or opening a snapshot in your editor without committing to a full
+    `restore`.
+
+    Optional dependency. Install with `pipx install
+    'claude-mirror[mount]'` plus the kernel layer for your platform:
+    macOS uses macFUSE (`brew install --cask macfuse`), Linux uses the
+    in-tree kernel libfuse (already present on every modern distro),
+    Windows uses WinFsp (https://winfsp.dev).
+
+    For background, see docs/scenarios.md "Scenario J. Browse / grep /
+    diff snapshots without restoring" and docs/cli-reference.md.
+    """
+    selected = [
+        name for name, value in (
+            ("--tag", bool(tag)),
+            ("--snapshot", bool(snapshot_ts)),
+            ("--live", live),
+            ("--as-of", bool(as_of)),
+            ("--all-snapshots", all_snapshots),
+        ) if value
+    ]
+    if len(selected) == 0:
+        raise click.ClickException(
+            "Specify exactly one of --tag, --snapshot, --live, --as-of, "
+            "or --all-snapshots."
+        )
+    if len(selected) > 1:
+        raise click.ClickException(
+            "Specify exactly one of --tag, --snapshot, --live, --as-of, "
+            f"or --all-snapshots (got: {', '.join(selected)})."
+        )
+
+    if backend_name and not live:
+        raise click.ClickException(
+            "--backend NAME is only meaningful with --live (selects "
+            "which Tier 2 mirror to mount). Drop it or pair it with "
+            "--live."
+        )
+    # Use Click's parameter-source machinery to distinguish "user passed
+    # --ttl with the default value" from "Click filled in the default" —
+    # otherwise a user explicitly running `mount --tag x --ttl 30` would
+    # silently sneak past while `--ttl 60` would error, which is
+    # surprising. The COMMANDLINE source means an explicit pass at any
+    # value (including 30) is rejected with a non-live variant.
+    ctx = click.get_current_context()
+    ttl_explicit = (
+        ctx.get_parameter_source("ttl") == click.core.ParameterSource.COMMANDLINE
+    )
+    if ttl_explicit and not live:
+        raise click.ClickException(
+            "--ttl SECONDS is only meaningful with --live (snapshots "
+            "are immutable; their listings don't expire). Drop it or "
+            "pair it with --live."
+        )
+
+    if cache_mb <= 0:
+        raise click.ClickException(
+            f"--cache-mb must be a positive integer (got {cache_mb})."
+        )
+
+    if not foreground and sys.platform == "win32":
+        raise click.ClickException(
+            "--background is not supported on Windows. Run "
+            "`claude-mirror mount` with --foreground in a separate "
+            "console window instead."
+        )
+
+    fuse_mod = _import_fuse()
+    mount_engine = _import_mount_engine()
+
+    config = Config.load(_resolve_config(config_path))
+    primary, mirrors = _create_storage_set(config)
+    snap_manager = SnapshotManager(config, primary, mirrors=mirrors)
+
+    cache_bytes = cache_mb * 1024 * 1024
+    blob_cache = mount_engine.BlobCache(
+        _default_blob_cache_dir(), max_bytes=cache_bytes,
+    )
+
+    fs_instance = _build_mount_fs(
+        mount_engine=mount_engine,
+        config=config,
+        primary=primary,
+        snap_manager=snap_manager,
+        blob_cache=blob_cache,
+        tag=tag,
+        snapshot_ts=snapshot_ts,
+        live=live,
+        as_of=as_of,
+        all_snapshots=all_snapshots,
+        backend_name=backend_name,
+        ttl=ttl,
+    )
+
+    mount_path = Path(mountpoint)
+    if not mount_path.exists():
+        raise click.ClickException(
+            f"Mount point {mountpoint} does not exist. Create it first "
+            "(e.g. `mkdir -p {mountpoint}`) and rerun."
+        )
+    if not mount_path.is_dir():
+        raise click.ClickException(
+            f"Mount point {mountpoint} is not a directory."
+        )
+
+    console.print(
+        f"[green]Mounting[/] {' '.join(selected)} [green]at[/] "
+        f"[bold]{mountpoint}[/] [dim](read-only, cache "
+        f"{cache_mb}MB)[/]"
+    )
+    if foreground:
+        console.print(
+            "[dim]Press Ctrl+C to unmount and exit.[/]"
+        )
+
+    try:
+        fuse_mod.FUSE(
+            fs_instance,
+            mountpoint,
+            foreground=foreground,
+            ro=True,
+            allow_other=False,
+            nothreads=True,
+        )
+    except KeyboardInterrupt:
+        # FUSE may surface Ctrl+C either as KeyboardInterrupt directly
+        # or by returning normally; either way we want to call cleanup
+        # so cached state flushes deterministically.
+        pass
+    finally:
+        cleanup = getattr(fs_instance, "cleanup", None)
+        if callable(cleanup):
+            try:
+                cleanup()
+            except Exception:
+                # Cleanup is best-effort; never mask the original exit.
+                pass
+
+
+@cli.command()
+@click.argument("mountpoint")
+@click.option("--config", "config_path", default="",
+              help="Config file path. Reserved for future "
+                   "config-aware unmount logic; today the unmount tool "
+                   "is selected by host platform alone.")
+def umount(mountpoint: str, config_path: str) -> None:
+    """
+    Unmount a claude-mirror FUSE mount.
+
+    \b
+    Cross-platform wrapper:
+      macOS:   `umount MOUNTPOINT`
+      Linux:   `fusermount -u MOUNTPOINT`
+      Windows: prints a hint pointing at the foreground mount process
+               (WinFsp processes respond to a clean Ctrl+C).
+    """
+    import subprocess
+
+    if sys.platform == "darwin":
+        result = subprocess.run(
+            ["umount", mountpoint], capture_output=True, text=True,
+        )
+    elif sys.platform.startswith("linux"):
+        result = subprocess.run(
+            ["fusermount", "-u", mountpoint], capture_output=True, text=True,
+        )
+    elif sys.platform == "win32":
+        click.echo(
+            f"On Windows, stop the mount by sending Ctrl+C to the "
+            f"foreground 'claude-mirror mount' process holding "
+            f"{mountpoint}."
+        )
+        return
+    else:
+        raise click.ClickException(
+            f"Unsupported platform for umount: {sys.platform}"
+        )
+
+    if result.returncode != 0:
+        raise click.ClickException(
+            f"umount failed: {result.stderr.strip()}"
+        )
+    click.echo(f"Unmounted {mountpoint}")

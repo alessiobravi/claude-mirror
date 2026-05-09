@@ -77,6 +77,14 @@ claude-mirror log               [--limit N] [--config PATH]
 claude-mirror inbox       [--config PATH]
 claude-mirror find-config [PATH]
 claude-mirror prompt      [--config PATH] [--format text|ascii|symbols|json] [--quiet-when-clean] [--prefix STR] [--suffix STR]   # network-free shell-prompt status snippet (PS1 / PROMPT / fish_prompt / starship)
+claude-mirror mount       MOUNTPOINT
+                          [--tag NAME | --snapshot TIMESTAMP | --live | --as-of DATE | --all-snapshots]
+                          [--backend NAME]                  # only with --live (Tier 2: pin to one specific mirror)
+                          [--cache-mb N]                    # default 500
+                          [--ttl N]                         # only with --live; default 30 seconds
+                          [--foreground/--background]       # default --foreground
+                          [--config PATH]
+claude-mirror umount      MOUNTPOINT [--config PATH]   # macOS: umount; Linux: fusermount -u; Windows: prints Ctrl+C hint
 claude-mirror profile list
 claude-mirror profile show       NAME
 claude-mirror profile create     NAME --backend BACKEND [--description TEXT] [--force]
@@ -592,6 +600,77 @@ Tagged snapshots are shielded from retention pruning by default. Pass `--include
 Convert every snapshot in-place to/from the `blobs` or `full` format. `--to blobs` or `--to full` is required. Idempotent and atomic per snapshot. By default the YAML is updated to the new format on success; pass `--no-update-config` to leave it untouched. Pass `--keep-source` to keep originals.
 
 See [admin.md — Snapshots and disaster recovery](admin.md#snapshots-and-disaster-recovery) for the full snapshot lifecycle.
+
+### `mount`
+
+Mount snapshots or live remote state as a read-only FUSE filesystem at MOUNTPOINT. Five variants share one engine. Read-only by design — writes return `EROFS`. The push/pull/sync flow stays the canonical writeback path. See [Scenario J. Browse / grep / diff snapshots without restoring](scenarios.md#j-browse--grep--diff-snapshots-without-restoring) and [admin.md — Browsing without restoring](admin.md#browsing-without-restoring).
+
+**Optional dependency.** Activates with `pipx install 'claude-mirror[mount]'`. Plus the kernel layer for your platform:
+
+| Platform | Install |
+|---|---|
+| macOS | `brew install --cask macfuse` |
+| Linux | already kernel-resident on every modern distro (in-tree libfuse) |
+| Windows | install [WinFsp](https://winfsp.dev) |
+
+When fusepy isn't installed, the `mount` command exits non-zero and prints the install hint above. The kernel-layer install is a one-time per-machine setup; subsequent mounts pay no install cost.
+
+Flags:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--tag NAME` | unset | Mount the snapshot tagged NAME (read-only, frozen). Resolved against `claude-mirror snapshots` tags. Mutually exclusive with the other variant flags. |
+| `--snapshot TIMESTAMP` | unset | Mount the snapshot with timestamp TIMESTAMP (`2026-04-15T10-30-00Z` shape). Mutually exclusive with the other variant flags. |
+| `--live` | off | Mount the live current state of the primary backend. Listings cached for `--ttl` seconds; blob bodies cached forever (content-addressed). |
+| `--as-of DATE` | unset | Mount the last snapshot taken on or before DATE — accepts ISO date (`2026-04-15`) or ISO datetime (`2026-04-15T10:00:00Z`). |
+| `--all-snapshots` | off | Mount every snapshot under per-timestamp subdirectories — one tree per snapshot, all browsable side-by-side. |
+| `--backend NAME` | unset | Tier 2: with `--live`, pin the mount to one specific Tier 2 mirror's view rather than the primary. Rejected when paired with any non-live variant. |
+| `--cache-mb N` | 500 | On-disk content-addressed blob-cache budget (MB). Backed by `$XDG_CACHE_HOME/claude-mirror/blobs/`. Survives unmount/remount. Must be a positive integer — `0` and negative values are rejected at command entry. |
+| `--ttl N` | 30 | With `--live`: how long (seconds) directory listings are cached before being re-fetched. Rejected for snapshot variants — those are immutable, listings never expire. |
+| `--foreground / --background` | `--foreground` | Foreground keeps the process attached to the terminal; Ctrl+C cleanly unmounts via a `try/finally` calling the FS instance's `cleanup()` hook. `--background` daemonises on POSIX. Windows always runs foreground (passing `--background` exits with a hint pointing at a separate console). |
+| `--config PATH` | auto-detected from cwd | Path to a specific config YAML when more than one project lives under `~/.config/claude_mirror/`. |
+
+Variant rules:
+
+- **Exactly one** of `--tag`, `--snapshot`, `--live`, `--as-of`, `--all-snapshots` must be set. Zero or two-or-more selected → exit non-zero with a clear error naming all five flags.
+- `--backend NAME` and `--ttl N` are only meaningful with `--live`. Pairing them with any other variant exits non-zero with a clean error.
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| 0 | Mount succeeded and cleanly unmounted (the foreground process exited via Ctrl+C, or `--background` daemonised successfully). |
+| 1 | Flag-combination error, fusepy missing, mount point missing/non-directory, kernel-layer error from `fuse.FUSE()`, or any other `click.ClickException` raised by the dispatcher. |
+| 2 | Click usage error (unknown flag, malformed value). |
+
+Examples:
+
+```bash
+claude-mirror mount --tag pre-refactor /tmp/snap
+claude-mirror mount --snapshot 2026-04-15T10-30-00Z /tmp/snap
+claude-mirror mount --live /tmp/drive-now
+claude-mirror mount --live --backend dropbox --ttl 60 /tmp/dbx
+claude-mirror mount --all-snapshots /tmp/all-history
+claude-mirror mount --as-of 2026-04-15 /tmp/april15
+claude-mirror mount --tag v1.0 --cache-mb 1000 /tmp/v1
+```
+
+### `umount`
+
+Unmount a claude-mirror FUSE mount. Cross-platform wrapper:
+
+| Platform | Behaviour |
+|---|---|
+| macOS | shells out to `umount MOUNTPOINT` |
+| Linux | shells out to `fusermount -u MOUNTPOINT` (the canonical FUSE unmount tool) |
+| Windows | best-effort: prints a hint pointing at Ctrl+C on the foreground `claude-mirror mount` process (WinFsp foreground processes respond to a clean signal). Exit 0. |
+
+Non-zero return from the underlying tool surfaces its stderr and exits 1. The `--config PATH` flag is reserved for future config-aware unmount logic; today the unmount tool is selected by host platform alone.
+
+```bash
+claude-mirror umount /tmp/snap
+claude-mirror umount /tmp/drive-now
+```
 
 ---
 

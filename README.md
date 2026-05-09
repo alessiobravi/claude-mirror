@@ -136,6 +136,26 @@ pipx upgrade claude-mirror              # PyPI installs
 claude-mirror update --apply            # auto-detects PyPI vs editable; uses pipx upgrade or git pull + pipx install -e . --force
 ```
 
+### Optional: read-only FUSE mount support
+
+`claude-mirror mount` exposes any snapshot — or the live current state of any backend — as a real read-only filesystem path. Useful for `grep -r`, `diff`, or opening a snapshot in your editor without committing to a full `restore`. See the [Browsing snapshots without downloading](#browsing-snapshots-without-downloading) cheatsheet below and the full reference in [docs/scenarios.md — Scenario J](https://github.com/alessiobravi/claude-mirror/blob/main/docs/scenarios.md#j-browse--grep--diff-snapshots-without-restoring).
+
+Activate the optional dependency:
+
+```bash
+pipx install 'claude-mirror[mount]'
+```
+
+Plus the platform's kernel layer (one-time per machine):
+
+| Platform | Install |
+|---|---|
+| macOS | `brew install --cask macfuse` |
+| Linux | already kernel-resident on every modern distro (in-tree libfuse) |
+| Windows | install [WinFsp](https://winfsp.dev) |
+
+When fusepy is missing, `claude-mirror mount` exits non-zero and prints the install hint above for the host platform.
+
 ---
 
 ## Documentation index
@@ -315,6 +335,25 @@ Per-project gitignore-style exclusions: drop a `.claude_mirror_ignore` at the pr
 Snapshot, restore, and admin commands (`history`, `snapshots`, `restore`, `prune`, `gc`, `forget`, `doctor`, `seed-mirror`, `migrate-state`) live in [docs/cli-reference.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/cli-reference.md), with operational guidance in [docs/admin.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/admin.md).
 
 Conflict resolution flow (interactive `keep local / keep remote / merge / skip` prompt) is documented in [docs/conflict-resolution.md](https://github.com/alessiobravi/claude-mirror/blob/main/docs/conflict-resolution.md).
+
+### Browsing snapshots without downloading
+
+Optional read-only FUSE mount surface — `grep -r`, `diff`, or open a snapshot in your editor without running `restore`. Requires `pipx install 'claude-mirror[mount]'` plus the platform's kernel layer (see [the Mount install section above](#optional-read-only-fuse-mount-support)).
+
+```bash
+mkdir /tmp/snap
+claude-mirror mount --tag pre-refactor /tmp/snap          # one frozen snapshot
+claude-mirror mount --snapshot 2026-04-15T10-30-00Z /tmp/snap   # one snapshot by timestamp
+claude-mirror mount --as-of 2026-04-15 /tmp/april15       # last snapshot on or before DATE
+claude-mirror mount --all-snapshots /tmp/all-history      # every snapshot under per-timestamp dirs
+claude-mirror mount --live /tmp/drive-now                 # current state of primary backend
+claude-mirror mount --live --backend dropbox /tmp/dbx     # current state of one Tier 2 mirror
+grep -r 'TODO' /tmp/snap                                   # works like any read-only filesystem
+diff /tmp/snap/CLAUDE.md ~/projects/myproject/CLAUDE.md
+claude-mirror umount /tmp/snap                             # cross-platform unmount wrapper
+```
+
+Read-only by design — writes return `EROFS`. Blob bodies are content-addressed and cached forever at `$XDG_CACHE_HOME/claude-mirror/blobs/`; the cache survives unmount/remount. Default cache cap 500MB, configurable via `--cache-mb N`. Full recipe with pitfalls in [docs/scenarios.md — Scenario J](https://github.com/alessiobravi/claude-mirror/blob/main/docs/scenarios.md#j-browse--grep--diff-snapshots-without-restoring).
 
 ---
 

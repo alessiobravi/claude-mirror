@@ -376,6 +376,22 @@ claude-mirror snapshot-diff 2026-04-01T10-00-00Z latest --unified memory/notes.m
 
 Both `blobs` and `full` snapshots are accepted, and the two snapshots may even be in different formats (the older one was `full`, the newer one is `blobs` after a `migrate-snapshots` run). For full-format snapshots, identical files between the two snapshots may show as `modified` (the per-snapshot file_id differs even when bytes match) — convert to `blobs` with `migrate-snapshots --to blobs` for content-equality classification.
 
+### Browsing without restoring
+
+When you only want to inspect a snapshot — `grep -r`, `diff`, open a file in your editor — and not actually overwrite the project, `claude-mirror mount` is the lighter-weight alternative to `restore --output`:
+
+```bash
+mkdir /tmp/snap
+claude-mirror mount --tag pre-refactor /tmp/snap
+grep -r 'TODO' /tmp/snap
+diff /tmp/snap/CLAUDE.md /your/project/CLAUDE.md
+claude-mirror umount /tmp/snap
+```
+
+Five variants share one engine: a single tagged or timestamped snapshot (`--tag` / `--snapshot`), the live current state of the primary backend or a Tier 2 mirror (`--live` / `--live --backend NAME`), every snapshot stacked under per-timestamp subdirectories (`--all-snapshots`), or the last snapshot taken on or before a date (`--as-of DATE`). All variants are read-only — writes return `EROFS`. Blob bodies are content-addressed and cached forever; the first read pays a network round-trip, subsequent reads serve from `$XDG_CACHE_HOME/claude-mirror/blobs/`.
+
+Mount support is an optional extra: `pipx install 'claude-mirror[mount]'` plus the platform's kernel layer (macFUSE / WinFsp / libfuse). Full reference: [`docs/cli-reference.md` — `mount`](cli-reference.md#mount). End-to-end recipe with pitfalls: [Scenario J. Browse / grep / diff snapshots without restoring](scenarios.md#j-browse--grep--diff-snapshots-without-restoring).
+
 ---
 
 ## Performance and bandwidth control

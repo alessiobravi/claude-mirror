@@ -72,8 +72,11 @@ Issues        = "https://github.com/alessiobravi/claude-mirror/issues"
 [project.optional-dependencies]
 dropbox = []
 onedrive = []
-# Read-only FUSE mount engine — opt-in, since fusepy needs a working
-# FUSE / OSXFUSE / WinFsp install and most users will never mount.
+# Read-only FUSE mount support (optional). Activates `claude-mirror mount`
+# / `claude-mirror umount`. Pulls in fusepy as the userspace bridge; the
+# kernel layer is platform-specific (macFUSE / WinFsp / Linux libfuse) and
+# must be installed separately — the `mount` command prints the right
+# install hint per platform when the import fails.
 mount = ["fusepy>=3.0"]
 all = ["fusepy>=3.0"]
 # Development extras — pytest + helpers for the test suite.

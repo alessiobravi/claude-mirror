@@ -4,6 +4,38 @@ All notable changes to claude-mirror.
 
 ---
 
+## [Unreleased]
+
+### Added — read-only FUSE mount package (MOUNT)
+
+Five mount variants share a single read-only FUSE engine, all driven through one new CLI surface (`claude-mirror mount` + `claude-mirror umount`). Browse, `grep`, `diff`, or open any snapshot — or the current state of any backend — as a real filesystem path, without ever running `restore` or pulling files to local disk.
+
+- **Snapshot mount** — `claude-mirror mount --tag pre-refactor /tmp/snap` (or `--snapshot 2026-04-15T10-30-00Z`). One frozen snapshot, accessible at any path under the mountpoint.
+- **Live remote mount** — `claude-mirror mount --live /tmp/drive-now`. The current state of the configured primary backend, with directory listings cached for `--ttl` seconds (default 30) and blob bodies cached forever (content-addressed).
+- **Per-mirror mount** — `claude-mirror mount --live --backend dropbox /tmp/dbx`. Tier 2: pin the mount to one specific Tier 2 mirror's view rather than the primary.
+- **All-snapshots stacked** — `claude-mirror mount --all-snapshots /tmp/all-history`. Every snapshot side-by-side under per-timestamp subdirectories — `diff /tmp/all-history/2026-04-01.../CLAUDE.md /tmp/all-history/2026-05-01.../CLAUDE.md` works directly.
+- **Time-travel** — `claude-mirror mount --as-of 2026-04-15 /tmp/april15`. The last snapshot taken on or before DATE, picked automatically.
+
+Read-only by design: writes return `EROFS`. The push/pull/sync flow stays the canonical writeback path. Useful for `grep -r`, `diff`, `git log -p` against a specific past state, or opening a snapshot in your editor without committing to a full `restore`.
+
+- **Optional dependency.** Activates with `pipx install 'claude-mirror[mount]'`. Plus the kernel layer for your platform: macOS uses macFUSE (`brew install --cask macfuse`), Linux uses the in-tree libfuse (already kernel-resident on every modern distro), Windows uses WinFsp (https://winfsp.dev). The `mount` command prints the right install hint per platform when fusepy isn't installed.
+- **Content-addressed BlobCache.** Backed by `$XDG_CACHE_HOME/claude-mirror/blobs/`. Once a blob is fetched, it stays valid forever (sha256 == identity) — survives unmount/remount cycles. Default 500MB cap, configurable via `--cache-mb N`. Cold-cache reads pay a network round-trip to the backend; warm-cache reads serve straight from disk.
+- **Cross-platform `umount` wrapper.** `claude-mirror umount /tmp/snap` picks the right unmount tool per platform: `umount` on macOS, `fusermount -u` on Linux. Windows prints a hint pointing the user at Ctrl+C on the foreground mount process (WinFsp processes respond to a clean signal).
+- **Foreground / background.** `--foreground` (default) keeps the process attached to the terminal; Ctrl+C cleanly unmounts via a `try/finally` that calls the FS instance's `cleanup()` hook. `--background` daemonises on POSIX; on Windows it exits with a hint pointing at `--foreground` in a separate console.
+- New module `claude_mirror/_mount.py` (engine — five FS classes + content-addressed BlobCache), CLI `mount` + `umount` commands in `claude_mirror/cli.py`, `[mount]` optional-dependency block in `pyproject.toml` (with a parallel entry under `[all]`), `fuse.*` in the mypy `ignore_missing_imports` overrides so `mypy --strict` stays clean even on machines without fusepy installed.
+- `README.md` — new "Browsing snapshots without downloading" subsection under Daily usage cheatsheet, plus per-platform install pointers under the existing Install section.
+- `docs/scenarios.md` — new **Scenario J. Browse / grep / diff snapshots without restoring**. Same shape as Scenarios A–I (Purpose / How to implement / Daily ops behaviour / Pitfalls and tips). Worked examples for all five variants; pitfalls cover cold-cache latency, kernel-layer install requirement, the read-only contract, and the atomicity contract (FUSE syscalls are not atomic against concurrent push/pull operations on the backend).
+- `docs/cli-reference.md` — top-level command list grows `claude-mirror mount …` and `claude-mirror umount …`. New `### mount` subsection with the full flag table, optional-dep notice, cross-platform install pointers, and exit-code table. New `### umount` subsection describing the per-platform behaviour.
+- `docs/admin.md` — new "Browsing without restoring" subsection under Snapshots and disaster recovery, pointing at the new `mount` cli-reference entry and Scenario J as the lighter-weight alternative to `restore --output`.
+
+### Tests
+- `tests/test_mount_cli.py` — **21 tests** for the CLI surface (offline, <100ms each), driven against a mocked `claude_mirror._mount` module + a mocked `fuse` module so the suite runs without fusepy installed. Coverage: optional-dep guard prints the install hint; mutually-exclusive variant flags (0 / 2 / exactly-1); `--backend NAME` rejected without `--live`; `--ttl N` rejected without `--live` (both at a non-default value AND at the default value passed explicitly — guards against a future refactor swapping Click's `ParameterSource` machinery for a `value != default` check); `--cache-mb 0` and `--cache-mb -5` rejected; dispatch into each of the five variant classes (`SnapshotFS` from `--tag` and from `--snapshot`, `LiveFS` from `--live`, `PerMirrorFS` from `--live --backend`, `AllSnapshotsFS` from `--all-snapshots`, `AsOfDateFS` from `--as-of`); `--as-of` ISO-date parsing happy + sad path; KeyboardInterrupt cleanup hook fires; `umount` shells out to `umount` on darwin / `fusermount -u` on linux / prints a hint on win32; `umount` failure surfaces stderr.
+- The engine track ships its own filesystem-class tests in a separate file (`tests/test_mount_engine.py`); run together they cover the variant classes' behaviour at the FS-syscall level (readdir, getattr, open, read, write-rejection) plus the BlobCache eviction and stats contract.
+- `pytest tests/` — **1033 passed, 3 skipped** locally on macOS in 4.77s (was 1012 + 21 new mount-CLI tests; the 3 skips are the pre-existing `test_mypy_smoke.py` "mypy not installed" guards).
+- `mypy --strict claude_mirror/` — **clean across 40 source files** (39 pre-existing + the engine track's new `_mount.py`).
+
+---
+
 ## [0.5.60] — 2026-05-09
 
 Three independent additions land together: snapshots become git-commit-shaped (named + messaged + tag-protected from auto-pruning), `AGENTS.md` cross-tool sync gets a first-class scenario page + sample profile, and a new `claude-mirror prompt` subcommand emits a fast network-free status snippet for embedding in shell prompts (PS1 / starship / fish / zsh).

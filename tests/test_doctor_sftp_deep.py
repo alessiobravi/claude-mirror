@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import re
 import stat as stat_mod
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
@@ -33,6 +34,21 @@ import yaml
 from click.testing import CliRunner
 
 paramiko = pytest.importorskip("paramiko")
+
+# The deep SFTP doctor checks rely on POSIX file-permission semantics
+# (`os.chmod(path, 0o600)` actually setting the mode bits, then reading
+# them back via `os.stat(path).st_mode & 0o777`). Windows ignores all
+# but the read-only bit on chmod and reports its own mode shape, so the
+# "permissions exactly 0600" assertions can't hold there. Skip the
+# entire module on Windows — SFTP itself is rare on Windows clients
+# and the runtime check in `cli.py` falls through harmlessly.
+if sys.platform == "win32":
+    pytest.skip(
+        "POSIX file-permission semantics required: os.chmod(path, 0o600) "
+        "is a no-op on Windows for non-readonly bits, so 'Key file "
+        "permissions: 0600' assertions cannot hold.",
+        allow_module_level=True,
+    )
 
 import claude_mirror.cli as cli_mod
 from claude_mirror.cli import cli

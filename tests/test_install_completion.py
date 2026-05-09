@@ -15,6 +15,7 @@ These tests cover:
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -57,6 +58,12 @@ def test_detect_shell_unsupported_returns_none(monkeypatch):
         assert _detect_shell() is None, f"expected None for {shell_path}"
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows-default fallback is 'powershell', covered by "
+    "test_detect_shell_windows_default_to_powershell in "
+    "test_completion_powershell.py.",
+)
 def test_detect_shell_empty_falls_back_to_platform_default(monkeypatch):
     """If SHELL is unset, fall back to platform default (zsh on Mac, bash on Linux)."""
     monkeypatch.delenv("SHELL", raising=False)

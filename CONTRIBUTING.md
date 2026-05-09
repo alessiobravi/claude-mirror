@@ -65,7 +65,9 @@ pytest tests/ --collect-only                    # list tests without running
 
 ## CI
 
-Every push and pull request triggers `.github/workflows/test.yml`, which runs the full suite on Python 3.11, 3.12, 3.13, and 3.14 in parallel. Your PR is unmergeable until it's green.
+Every push and pull request triggers `.github/workflows/test.yml`, which runs the full suite on **Linux and Windows** on Python 3.11, 3.12, 3.13, and 3.14 in parallel — 8 jobs total. A PR must be green on every job before it can merge. `pytest tests/ -v` locally on whichever platform you develop on is the right pre-flight check; CI is the gate that catches platform-specific regressions.
+
+A small number of tests are POSIX-only (mainly the `watch-all` SIGHUP hot-reload smoke tests in `test_watcher.py` and the deep-doctor SFTP permission checks in `test_doctor_sftp_deep.py`). They are guarded by `@pytest.mark.skipif(sys.platform == "win32", reason="...")` with explicit reasons so the Windows CI run skips them cleanly rather than failing.
 
 ## Release flow (maintainer)
 

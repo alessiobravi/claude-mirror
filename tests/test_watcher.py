@@ -13,24 +13,35 @@ care about glue, not loop bodies.
 """
 from __future__ import annotations
 
-import signal
-import subprocess
+import sys
 import threading
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
-from click.testing import CliRunner
 
-from claude_mirror import cli as cli_mod
+# `signal.SIGHUP` does not exist on Windows — `signal` only defines the
+# POSIX signal set on POSIX platforms. The whole watch-all daemon design
+# centres on SIGHUP for hot-reload of newly-added configs, so the entire
+# module is POSIX-only. Skip wholesale on Windows; the source-code path
+# in `cli.py` that registers SIGHUP would itself raise AttributeError on
+# Windows today (a known limitation, not a target of this change).
+pytestmark = [
+    pytest.mark.filterwarnings("ignore::DeprecationWarning:click"),
+    pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="watch-all uses signal.SIGHUP for hot-reload, which is a "
+        "POSIX-only signal. Windows users cannot run watch-all today.",
+    ),
+]
 
-# Click 8.3 emits a DeprecationWarning about `protected_args` from inside
-# CliRunner.invoke; pyproject's `filterwarnings = ["error"]` would turn
-# that into a test failure. Suppress at the module level — tests in this
-# file only use CliRunner for smoke coverage of the CLI plumbing.
-pytestmark = pytest.mark.filterwarnings(
-    "ignore::DeprecationWarning:click",
-)
+# `signal` is imported below the skipif so tests that DO run can still
+# reference signal.SIGHUP — but the module itself imports cleanly on
+# Windows because the import is unconditional and `signal` is part of
+# the stdlib on every platform.
+import signal  # noqa: E402
+
+from claude_mirror import cli as cli_mod  # noqa: E402
 
 
 def _patch_watcher_internals(monkeypatch: pytest.MonkeyPatch) -> dict:

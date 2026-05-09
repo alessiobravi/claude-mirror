@@ -8,12 +8,21 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Matrix expands to 2 OS × 4 Python = 8 parallel jobs. `fail-fast: false`
+    # is mandatory so a Windows-only flake can't mask Linux's results: we
+    # want to see every cell of the matrix on every run.
+    #
+    # Cost note: `windows-latest` minutes are billed at 2× `ubuntu-latest`
+    # in GitHub Actions, but at 8 jobs total (vs. 4 ubuntu-only before)
+    # the bill change is small enough not to perceive. macOS would
+    # double again — deliberately deferred for now.
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.11", "3.12", "3.13", "3.14"]
-    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    name: pytest (${{ matrix.os }}, Python ${{ matrix.python-version }})
     steps:
       - uses: actions/checkout@v5
 

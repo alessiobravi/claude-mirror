@@ -1,0 +1,10 @@
+# Pin line-ending normalisation across platforms.
+#
+# Without this, a contributor on Windows whose `core.autocrlf=true` is the
+# system default will silently commit CRLF-terminated files. Linux-side
+# tests that compare file bytes / count lines / parse JSON-line files
+# then fail in CI because they see `\r\n` where they expect `\n`.
+#
+# `text=auto eol=lf` tells git: detect text files automatically, and
+# always store + check out with LF endings. Binary files are left alone.
+* text=auto eol=lf

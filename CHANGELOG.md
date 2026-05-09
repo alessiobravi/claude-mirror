@@ -4,6 +4,18 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.51] — 2026-05-09
+
+Hotfix for v0.5.50 — same banner-leak pattern that bit `--json` mode in v0.5.39 hit the new `_list-backends` hidden subcommand.
+
+### Fixed — Watcher banner leak into `_list-backends` output
+- v0.5.50's `_list-backends` is invoked by the dynamic shell-completion scripts on every tab-press. Its output MUST be exactly the backend names, one per line, or completion shows ANSI gunk + `claude-mirror watch-all` as a candidate. The CI Linux matrix flagged this on the dyn-comp tests (`Left contains 4 more items, first extra item: 'dropbox'` — the watcher banner pushed the real output to lines 5-9).
+- Root cause: same as v0.5.44's banner-on-`--json` failure. `_CLIGroup.invoke()` runs `_check_watcher_running()` before any subcommand handler, and `_list-backends` wasn't in `_NO_WATCHER_CHECK_CMDS`. v0.5.44 added a `--json` argv check; v0.5.51 adds `_list-backends` to the per-command set.
+- Fix: one-line addition to `_NO_WATCHER_CHECK_CMDS` so the banner is suppressed for `_list-backends`. Same set entry already covers `watch`/`watch-all`/`reload`/`init`/`auth`/`find-config`/`test-notify`/`inbox`/`doctor`/`prune`/`diff`/`seed-mirror`/`profile`.
+- v0.5.50 was pushed to `origin/main` but never tagged or published to PyPI, so no end users received broken tab-completion.
+
+---
+
 ## [0.5.50] — 2026-05-09
 
 Four independent additions across distribution, docs, and notifications. ROUTE and TMPL share the notifier surface but partition cleanly: ROUTE owns dispatch (which webhook fires, with which event/path filter), TMPL owns format (the message body inside `_format_event`).

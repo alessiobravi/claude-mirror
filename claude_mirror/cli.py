@@ -289,6 +289,12 @@ _NO_WATCHER_CHECK_CMDS = {
     # group — list/show/create/delete operate on profile YAMLs, never
     # on a project, so the watcher hint is unrelated noise.
     "profile",
+    # `_list-backends` (since v0.5.50) is a hidden helper invoked by
+    # the dynamic shell-completion scripts on every tab-press — its
+    # output MUST be exactly the backend names one per line so a banner
+    # would corrupt completion. The same banner-leak failure mode that
+    # broke `--json` mode in v0.5.39 → v0.5.44 applies here.
+    "_list-backends",
 }
 
 

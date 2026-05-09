@@ -410,7 +410,7 @@ slack_channel: "#claude-mirror"      # optional override
 
 Then trigger any push / pull / sync — the message arrives within seconds.
 
-**See also:** [README — Slack notifications](../README.md#slack-notifications) for the step-by-step Slack-app-creation walkthrough.
+**See also:** [admin.md — Slack](admin.md#slack) for the step-by-step Slack-app-creation walkthrough.
 
 ### ...in Discord, Teams, or a custom webhook
 

@@ -4,6 +4,33 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.62] — 2026-05-09
+
+Hotfix on top of v0.5.61's MOUNT release. v0.5.61 commits were pushed to origin but not tagged because Linux + Windows CI failed at test collection: importing `claude_mirror/_mount` triggered fusepy's `fuse.py`, which calls `ctypes.CDLL("libfuse.so.2")` at module load and raises `OSError("Unable to find libfuse")` when the OS-level FUSE library isn't installed. The original `try / except ImportError` only caught the wrong failure shape. v0.5.62 catches `OSError` too in three sites (`_operations_base()`, `_load_fuse()`, `_import_fuse()`), with two regression tests proving `_mount` imports cleanly when libfuse is absent. PyPI's burn-once policy means the v0.5.61 number stays unpublished; v0.5.62 ships the same MOUNT content with the import fix folded in.
+
+### Fixed — libfuse-missing case no longer crashes module import (CI hotfix)
+- `claude_mirror/_mount.py::_operations_base()` — also catches `OSError` from `from fuse import Operations`, falls back to `_FallbackOperations` so the module imports cleanly on machines without the OS-level FUSE library (CI runners, fresh dev installs that haven't run `brew install --cask macfuse` yet).
+- `claude_mirror/_mount.py::_load_fuse()` — now distinguishes `ImportError` (fusepy missing) from `OSError` (fusepy installed but kernel layer missing) and raises with the right install hint per case.
+- `claude_mirror/cli.py::_import_fuse()` — same dual handling; converts both error shapes to a `click.ClickException` with the kernel-layer install hint.
+- `tests/test_mount.py::test_module_imports_when_libfuse_missing` — regression guard: monkeypatch `__import__` to raise `OSError` on `fuse`, re-import `_mount`, assert `_OperationsBase is _FallbackOperations`.
+- `tests/test_mount_cli.py::test_import_fuse_handles_libfuse_missing_oserror` — same shape against the CLI helper.
+
+### Tests
+- `pytest tests/` — **1101 passed, 3 skipped** on macOS (1099 + 2 new regression guards).
+- `mypy --strict claude_mirror/` — clean across 41 source files.
+
+### Documentation — Slack walkthrough moved out of README into a consolidated `## Messaging and communication` index
+
+Replaced the top-level `## Slack notifications` and `## Desktop notifications` blocks in `README.md` (~110 lines of step-by-step Slack-app-creation walkthrough, macOS launchd notification quirks, and platform-specific desktop-banner setup) with a single concise `## Messaging and communication` section that names every supported channel — Slack, Discord, Microsoft Teams, generic webhook, and desktop banners — and links each one to the canonical setup walkthrough in `docs/admin.md`. The README stays focused on getting users running quickly; messaging-channel-specific settings (webhook URLs, Slack-app creation steps, macOS notification permission, libnotify install on Linux, etc.) live in the dedicated docs page.
+
+- `README.md` — new `## Messaging and communication` table covering all five channels with one-line descriptions and direct deep-links to `docs/admin.md` per channel. Quick `claude-mirror test-notify` verification command. Pointer to the routing / templating / config-field reference.
+- `docs/admin.md → ### Slack` — was a stub linking back to the README walkthrough; now self-contained with the full Steps 1 / 2 / 3 (create the webhook, enable it in claude-mirror, verify) plus the config-field table that used to live in `README.md`.
+- `docs/admin.md → ### Desktop notifications` — new subsection (was README-only). Same content as the old `## Desktop notifications` block: macOS permission + launchd workaround, Linux libnotify install + systemd display-session env vars, Windows note on `plyer`-based toasts.
+- `docs/admin.md → ## Notifications` intro and table — extended to include desktop banners as a fifth channel ("All five are per-project, opt-in, best-effort").
+- `docs/cli-reference.md` and `docs/faq.md` — three stale `README#slack-notifications` cross-links repointed at `docs/admin.md#slack`. The `### See also` block in `cli-reference.md` now links the new `## Messaging and communication` README section instead of the removed Slack section.
+
+---
+
 ## [0.5.61] — 2026-05-09
 
 The MOUNT release — every read-shaped FUSE view shipped at once. Five mount variants share one engine: snapshot mount, live remote mount, per-mirror mount (Tier 2), all-snapshots-stacked mount, and time-travel mount. Read-only across all five. **fusepy ships in the base install** — `pipx install claude-mirror` is enough on the Python side, matching the v0.5.10 every-backend-in-base policy. The kernel layer (macFUSE / WinFsp / libfuse) is platform-specific and installed separately, only needed at mount time.

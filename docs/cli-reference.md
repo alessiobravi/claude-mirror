@@ -956,7 +956,7 @@ claude-mirror can post sync events to Slack, Discord, Microsoft Teams, and any g
 | `webhook_routes` | list[dict] / null | `null` | Multi-channel generic-webhook routing list (v0.5.50+). Same shape as `slack_routes`, plus an optional per-route `extra_headers` key for auth tokens. Wins over `webhook_url` when both are set. |
 | `webhook_template_format` | dict[str,dict] / null | `null` | Per-action **structured** templates for the generic webhook — each value is a dict of `str.format`-style strings whose rendered values are merged on top of the v1 envelope (template fields override same-name envelope keys). |
 
-Slack-specific fields (`slack_enabled`, `slack_webhook_url`, `slack_channel`, and the per-action `slack_template_format`) are covered in [README — Slack notifications](../README.md#slack-notifications) and [admin.md — Per-event message templating](admin.md#per-event-message-templating).
+Slack-specific fields (`slack_enabled`, `slack_webhook_url`, `slack_channel`, and the per-action `slack_template_format`) are covered in [admin.md — Slack](admin.md#slack) and [admin.md — Per-event message templating](admin.md#per-event-message-templating).
 
 ---
 
@@ -967,5 +967,5 @@ Slack-specific fields (`slack_enabled`, `slack_webhook_url`, `slack_channel`, an
 - [profiles.md](profiles.md) — credentials profiles in depth: sample profile YAMLs per backend, precedence rule, common multi-project workflows.
 - [conflict-resolution.md](conflict-resolution.md) — what `sync` does when both sides changed.
 - [README — Daily usage cheatsheet](../README.md#daily-usage-cheatsheet) — narrative walkthrough of the daily commands.
-- [README — Slack notifications](../README.md#slack-notifications) — Slack-specific config and webhook setup.
-- [admin.md — Notifications](admin.md#notifications) — Discord, Teams, and Generic webhook setup.
+- [README — Messaging and communication](../README.md#messaging-and-communication) — high-level overview of every notification channel claude-mirror supports.
+- [admin.md — Notifications](admin.md#notifications) — Slack, Discord, Teams, Generic webhook, and desktop-banner setup walkthroughs + the full config-field reference.

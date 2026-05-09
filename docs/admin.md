@@ -838,16 +838,58 @@ For broader selective-sync guidance — picking what to mirror in the first plac
 
 ## Notifications
 
-claude-mirror can post every sync event (push / pull / sync / delete) to one or more team chat / automation backends. All four are **per-project**, **opt-in**, and **best-effort**: a notification failure (network error, bad URL, 4xx, 5xx) never blocks or fails a sync. The Slack integration is the most feature-rich (rich blocks, per-backend status, ACTION REQUIRED alerts on permanent failures); the others are simpler one-shot webhooks.
+claude-mirror posts every sync event (push / pull / sync / delete) to one or more **chat / automation backends** AND surfaces native **desktop banners** on the running watcher's machine. All channels are **per-project**, **opt-in**, and **best-effort**: a notification failure (network error, bad URL, 4xx, 5xx, missing notification daemon) never blocks or fails a sync. The Slack integration is the most feature-rich (rich blocks, per-backend Tier 2 status, ACTION REQUIRED alerts on permanent failures); the other webhooks are simpler one-shot posts.
 
-Multiple backends can be enabled simultaneously on the same project — every enabled webhook fires on every event, in sequence. One backend's failure does not stop the others.
+Multiple channels can be enabled simultaneously on the same project — every enabled channel fires on every event, in sequence. One channel's failure does not stop the others.
 
-| Backend | When to pick it | URL form |
+| Channel | When to pick it | URL / setup |
 |---|---|---|
 | **Slack** | Team chat in Slack; want rich-block formatting + per-mirror status + permanent-failure alerts | `https://hooks.slack.com/services/T.../B.../...` |
 | **Discord** | Team chat in Discord; want a coloured embed card per event | `https://discord.com/api/webhooks/{id}/{token}` |
 | **Microsoft Teams** | Team chat in Teams; legacy connector or modern Workflows webhook | `https://outlook.office.com/webhook/...` or `https://{tenant}.webhook.office.com/...` |
-| **Generic** | Wiring claude-mirror into n8n / Make / Zapier / a custom dashboard / an internal Slack-replacement | Any URL — claude-mirror POSTs a schema-stable JSON envelope and lets you add custom auth headers |
+| **Generic webhook** | Wiring claude-mirror into n8n / Make / Zapier / a custom dashboard / an internal Slack-replacement | Any URL — claude-mirror POSTs a schema-stable JSON envelope and lets you add custom auth headers |
+| **Desktop banners** | Native macOS / Linux / Windows notifications on the local machine that runs `claude-mirror watch-all` | No URL — `claude-mirror test-notify` verifies; setup details below |
+
+### Desktop notifications
+
+Run the built-in test command to verify the channel and see platform-specific setup instructions:
+
+```bash
+claude-mirror test-notify
+```
+
+#### macOS
+
+Notifications use `osascript display notification`. macOS requires the calling application to have notification permission granted explicitly.
+
+**Steps:** run `claude-mirror test-notify` from Terminal (or iTerm2) → open **System Settings → Notifications** → find **Terminal** → enable **Allow Notifications** → set alert style to **Alerts** or **Banners**.
+
+**Running as a launchd service:** when the watcher runs as a launchd agent it has no app bundle, so the system cannot create a notification permission entry for it. Workaround: run `claude-mirror watch` once from a regular Terminal window, grant permission to Terminal, then switch back to the launchd service.
+
+#### Linux
+
+Notifications use `notify-send` (libnotify). Install if missing:
+
+```bash
+sudo apt install libnotify-bin   # Debian / Ubuntu
+sudo dnf install libnotify       # Fedora
+```
+
+A notification daemon must be running — most desktop environments (GNOME, KDE, XFCE) include one automatically.
+
+**Running as a systemd service:** if the service has no access to the display session, add to the unit:
+
+```ini
+[Service]
+Environment=DISPLAY=:0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+```
+
+Replace `1000` with your user ID (`id -u`).
+
+#### Windows
+
+Notifications use the platform's native toast API via `plyer`. No additional setup is usually needed; if `claude-mirror test-notify` reports a missing module on Python 3.11+, reinstall claude-mirror with `pipx install --force claude-mirror`.
 
 ### Filtering which events fire
 
@@ -866,7 +908,55 @@ The legacy single-channel form (`slack_webhook_url` / `discord_webhook_url` / et
 
 ### Slack
 
-See [README — Slack notifications](../README.md#slack-notifications) for the full webhook setup. Slack's payload includes the per-backend status block (Tier 2 multi-backend) and the `ACTION REQUIRED` header on permanent failures — the other three backends do not (yet). Config fields: `slack_enabled`, `slack_webhook_url`, `slack_channel`.
+Slack notifications are **per-project** and **opt-in**. They fire on claude-mirror sync events (push / pull / sync / delete) — independent of any git/GitHub commit notifications you may have set up. Slack's payload is the richest of the four webhook backends: it includes the per-backend status block (Tier 2 multi-backend) and an `ACTION REQUIRED` header on permanent failures.
+
+#### Step 1 — Create the Slack incoming webhook
+
+You need an **Incoming Webhook URL** that points at a specific Slack channel. Each webhook is bound to one channel at creation time; if you want to post to two channels, generate two webhooks.
+
+1. **Open the Slack API page** at [api.slack.com/apps](https://api.slack.com/apps) → click **Create New App** → **From scratch**. Name it `claude-mirror` (or anything; it appears as the message author in Slack), pick the workspace, click **Create App**.
+2. **Enable Incoming Webhooks** — left sidebar → **Incoming Webhooks** → toggle **Activate Incoming Webhooks** to **On**.
+3. **Add a webhook to a specific channel** — scroll to the bottom → **Add New Webhook to Workspace** → pick the channel → **Allow**. For a private channel: invite the app first (`/invite @claude-mirror`).
+4. **Copy the webhook URL.** It looks like `https://hooks.slack.com/services/T01ABCDEF/B01GHIJKL/xxxxxxxxxxxxxxxxxxxxxxxx`. Treat it as a secret.
+
+#### Step 2 — Enable Slack in claude-mirror
+
+The `init --wizard` flow offers to enable Slack and asks for the webhook. Or pass the flags non-interactively:
+
+```bash
+claude-mirror init \
+  --project /path/to/project \
+  --backend googledrive \
+  --slack \
+  --slack-webhook-url 'https://hooks.slack.com/services/T01ABCDEF/B01GHIJKL/xxxxxxxxxxxxxxxxxxxxxxxx' \
+  --slack-channel '#claude-mirror'
+```
+
+Quote the webhook URL in single quotes — the `&` / `/` characters in the URL must not be interpreted by your shell.
+
+To enable Slack on an already-initialized project, edit the project YAML directly:
+
+```yaml
+slack_enabled: true
+slack_webhook_url: https://hooks.slack.com/services/T01ABCDEF/B01GHIJKL/xxxxxxxxxxxxxxxxxxxxxxxx
+slack_channel: "#claude-mirror"      # optional override
+```
+
+#### Step 3 — Verify
+
+Trigger any sync event from the project directory (`echo test >> CLAUDE.md && claude-mirror push CLAUDE.md`). You should see a Rich-formatted message in the channel within seconds, naming who pushed what, the snapshot timestamp + format, and the file count for the project. The file list is capped at 10 entries; longer pushes show `… and N more` after the cap. If a push or sync touched files but no snapshot was created (rare), the context line shows a no-snapshot warning so the recovery-point gap is visible.
+
+Slack failures (network error, 4xx, 5xx, malformed webhook) are logged and silently swallowed — they will **never** block or fail a sync.
+
+#### Slack config fields
+
+| Field | Type | Purpose |
+|---|---|---|
+| `slack_enabled` | bool | Master switch. `false` (default) disables all Slack posts. |
+| `slack_webhook_url` | str | Incoming-webhook URL from Slack's Apps directory. |
+| `slack_channel` | str (optional) | Override the channel the webhook posts to. Honoured only if your workspace allows webhook channel-overrides (per-workspace setting, off by default since 2018). |
+
+Two channels for the same project? Generate two webhooks under the same app and configure two project YAMLs that point at the same `project_path`. Two projects on the same machine post to different channels naturally — each YAML carries its own `slack_webhook_url`. For richer multi-channel routing (per-event-type, per-path globs), see [Multi-channel routing per project](#multi-channel-routing-per-project).
 
 ### Discord
 

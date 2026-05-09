@@ -4,7 +4,9 @@ All notable changes to claude-mirror.
 
 ---
 
-## [Unreleased]
+## [0.5.58] — 2026-05-09
+
+Symmetry release: `delete` joins the `--dry-run` family. Plus a small CHANGELOG cosmetic fix carried over from the v0.5.56 → v0.5.57 renumber.
 
 ### Added — `delete --dry-run` preview mode
 

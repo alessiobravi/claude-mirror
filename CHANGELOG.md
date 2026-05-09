@@ -4,7 +4,11 @@ All notable changes to claude-mirror.
 
 ---
 
-## [Unreleased]
+## [0.5.63] — 2026-05-09
+
+Five new user-facing surfaces ship together: `claude-mirror tree` (remote-listing visualization), `claude-mirror ncdu` (interactive disk-usage TUI), `claude-mirror stats` (usage summary aggregation), `claude-mirror verify` (end-to-end integrity audit), and the new **FTP / FTPS storage backend** (legacy shared-hosting market — cPanel / DirectAdmin / NAS — via Python's stdlib `ftplib`, no new dependencies). 1251 tests pass on macOS (1101 baseline + 150 new); mypy `--strict` clean across 46 source files.
+
+S3 and SMB backends are still in flight as a separate batch — the parallel-additions to shared CLI surfaces (`_AVAILABLE_BACKENDS` tuple, `_create_storage` dispatch, init wizard, doctor matrix) collided too aggressively with FTP's parallel additions. Splitting their integration into a follow-up release on a stable baseline is the cleaner path.
 
 ### Added — `claude-mirror tree` for remote-listing visualization (TREE)
 

@@ -423,7 +423,19 @@ Print pending notifications from collaborators (received by the background watch
 
 ### `log`
 
-Show the cross-machine sync activity log: who pushed/pulled/synced/deleted what and when. Stored on the remote and shared with all collaborators. `--limit N` caps the number of entries.
+Show the cross-machine sync activity log: who pushed/pulled/synced/deleted what and when. Stored on the remote and shared with all collaborators. `--limit N` caps the number of entries. Pass `--follow` (alias `-f`) to enter `tail -f`-style live streaming: prints the recent tail first, then re-pulls the remote log every `--interval` seconds and prints only new entries as they arrive. Press Ctrl+C to stop.
+
+Flags:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--config PATH` | auto-detected from cwd | Path to a specific config YAML when more than one project lives under `~/.config/claude_mirror/`. |
+| `--limit N` | 20 | Number of recent entries to show in the initial tail. |
+| `--json` | off | Emit a single flat JSON document to stdout instead of the Rich table. With `--follow`, switches to newline-delimited JSON: one entry per line as it arrives. |
+| `--follow`, `-f` | off | Poll the remote log and stream new entries as they arrive. Press Ctrl+C to stop. Dedup key is `(timestamp, user, machine, action)` so co-timestamped events from different sources are both surfaced. |
+| `--interval N` | 5 | Polling interval in seconds when `--follow` is set. Must be a positive integer. Rejected when passed without `--follow`. |
+
+Transient backend errors during a follow loop (network blip, 5xx, rate-limit) print one yellow `[poll error: ...] retrying in <N>s` line and continue — the loop only exits non-zero on permanent auth-class failures (token revoked, permission removed) or a real Ctrl+C.
 
 ---
 

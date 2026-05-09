@@ -6050,6 +6050,165 @@ def test_notify() -> None:
         console.print(f"[red]✗ Notification failed:[/] {e}")
 
 
+def _log_follow_sleep(interval: float) -> None:
+    """Indirection over time.sleep for the `log --follow` poll loop only.
+
+    Tests monkeypatch THIS function to advance the loop or raise
+    KeyboardInterrupt without patching the global time.sleep — same
+    pattern as `_status_watch_sleep`. See feedback_no_global_time_sleep_patch.md.
+    """
+    time.sleep(interval)
+
+
+def _log_event_key(event: SyncEvent) -> tuple[str, str, str, str]:
+    """Stable identity tuple for a SyncEvent in the follow-mode dedup set.
+
+    The sync log is append-only, but two events can share a timestamp
+    (clock granularity, parallel pushes from different machines). The
+    dedup key includes user + machine + action so co-timestamped events
+    from different sources are both surfaced rather than collapsed.
+    """
+    return (event.timestamp, event.user, event.machine, event.action)
+
+
+def _log_event_to_json_dict(event: SyncEvent) -> dict[str, Any]:
+    """Shape one SyncEvent into the v1 `log --json` per-entry dict."""
+    return {
+        "timestamp": event.timestamp,
+        "user": event.user,
+        "machine": event.machine,
+        "action": event.action,
+        "files": list(event.files),
+        "project": event.project,
+        "snapshot_timestamp": None,
+    }
+
+
+def _log_render_event_table_row(event: SyncEvent) -> tuple[str, str, str, str]:
+    """Shape one SyncEvent into the cells of the Rich table renderer."""
+    action_cell = (
+        f"[cyan]{event.action}[/]" if event.action == "push"
+        else f"[red]{event.action}[/]" if event.action == "delete"
+        else f"[blue]{event.action}[/]"
+    )
+    return (
+        event.timestamp[:19].replace("T", " "),
+        f"{event.user}@{event.machine}",
+        action_cell,
+        ", ".join(event.files),
+    )
+
+
+def _log_fetch_remote(storage: StorageBackend, root_folder: str) -> Optional[SyncLog]:
+    """Pull `_sync_log.json` from the configured backend and parse it.
+
+    Returns None when the log file does not exist yet (fresh project, no
+    pushes have happened). Raises whatever the backend raises on real
+    failures — the caller decides whether to treat them as transient.
+    """
+    logs_folder_id = storage.get_file_id(LOGS_FOLDER, root_folder)
+    log_file_id = (
+        storage.get_file_id(SYNC_LOG_NAME, logs_folder_id)
+        if logs_folder_id else None
+    )
+    if not log_file_id:
+        return None
+    raw = storage.download_file(log_file_id)
+    return SyncLog.from_bytes(raw)
+
+
+def _log_is_permanent_error(storage: StorageBackend, exc: BaseException) -> bool:
+    """Decide whether a poll-loop exception should kill the loop.
+
+    AUTH / PERMISSION class errors mean the user must intervene before
+    polling can succeed (token revoked, share link broken). Everything
+    else — transient network blips, 5xx, rate limits — should bubble back
+    into the poll loop as a retry.
+    """
+    try:
+        from .backends import ErrorClass
+        cls = storage.classify_error(exc)
+        return cls in (ErrorClass.AUTH, ErrorClass.PERMISSION)
+    except BaseException:
+        return False
+
+
+def _log_print_table(events: list[SyncEvent]) -> None:
+    """Render a Sync Log table for one batch of events (newest-first)."""
+    if not events:
+        return
+    table = Table(title="Sync Log", show_header=True)
+    table.add_column("Time", style="dim")
+    table.add_column("User@Machine")
+    table.add_column("Action")
+    table.add_column("Files")
+    for event in reversed(events):
+        table.add_row(*_log_render_event_table_row(event))
+    console.print(table)
+
+
+def _log_follow_loop(
+    storage: StorageBackend,
+    root_folder: str,
+    seen_keys: set[tuple[str, str, str, str]],
+    interval: int,
+    json_output: bool,
+) -> None:
+    """The polling loop body for `log --follow`.
+
+    Re-pulls the remote log every `interval` seconds, prints any entries
+    whose dedup key is not yet in `seen_keys`, and tolerates transient
+    backend errors by yellow-printing the reason and continuing. Permanent
+    auth-class errors re-raise so the outer command exits non-zero.
+    """
+    if json_output:
+        console.print(
+            f"[dim]Polling backend every {interval}s... "
+            "(Ctrl+C to stop)[/]",
+            highlight=False,
+        )
+    else:
+        console.print(
+            f"[dim]Following sync log — polling every {interval}s. "
+            "Press Ctrl+C to stop.[/]"
+        )
+    while True:
+        _log_follow_sleep(interval)
+        try:
+            sync_log = _log_fetch_remote(storage, root_folder)
+        except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            if _log_is_permanent_error(storage, exc):
+                raise
+            console.print(
+                f"[yellow]\\[poll error: {exc}] "
+                f"retrying in {interval}s[/]",
+                highlight=False,
+            )
+            continue
+        if sync_log is None:
+            continue
+        new_events = [
+            ev for ev in sync_log.events
+            if _log_event_key(ev) not in seen_keys
+        ]
+        if not new_events:
+            continue
+        if json_output:
+            for ev in new_events:
+                click.echo(_json.dumps(
+                    _log_event_to_json_dict(ev),
+                    sort_keys=False,
+                    ensure_ascii=False,
+                ))
+                seen_keys.add(_log_event_key(ev))
+        else:
+            _log_print_table(new_events)
+            for ev in new_events:
+                seen_keys.add(_log_event_key(ev))
+
+
 @cli.command()
 @click.option("--config", "config_path", default="", help="Config file path. Auto-detected from cwd if omitted.")
 @click.option("--limit", default=20, show_default=True, help="Number of events to show.")
@@ -6057,41 +6216,47 @@ def test_notify() -> None:
               help="Emit a single flat JSON document to stdout instead of "
                    "the Rich table. result is a list of activity-log "
                    "entries newest-first; empty list when the log is empty "
-                   "or absent. Schema: v1.")
-def log(config_path: str, limit: int, json_output: bool) -> None:
+                   "or absent. Schema: v1. With --follow, switches to "
+                   "newline-delimited JSON: one entry per line as it arrives.")
+@click.option("--follow", "-f", "follow", is_flag=True, default=False,
+              help="Poll the remote log and stream new entries as they "
+                   "arrive. Press Ctrl+C to stop.")
+@click.option("--interval", "interval", type=int, default=5, show_default=True,
+              help="Polling interval in seconds when --follow is set. "
+                   "Default: 5.")
+@click.pass_context
+def log(
+    ctx: click.Context,
+    config_path: str,
+    limit: int,
+    json_output: bool,
+    follow: bool,
+    interval: int,
+) -> None:
     """Show recent sync activity from collaborators."""
-    if json_output:
+    interval_source = ctx.get_parameter_source("interval")
+    interval_was_explicit = (
+        interval_source is not None
+        and interval_source.name != "DEFAULT"
+    )
+    if interval_was_explicit and not follow:
+        ctx.fail("--interval requires --follow.")
+    if follow and interval <= 0:
+        ctx.fail("--interval must be a positive integer (seconds).")
+
+    if json_output and not follow:
         try:
             with _JsonMode():
                 config = Config.load(_resolve_config(config_path))
                 storage = _create_storage(config)
-                logs_folder_id = storage.get_file_id(LOGS_FOLDER, config.root_folder)
-                log_file_id = (
-                    storage.get_file_id(SYNC_LOG_NAME, logs_folder_id)
-                    if logs_folder_id else None
-                )
-                if not log_file_id:
+                sync_log = _log_fetch_remote(storage, config.root_folder)
+                if sync_log is None:
                     _emit_json_success("log", [])
                     return
-                raw = storage.download_file(log_file_id)
-                sync_log = SyncLog.from_bytes(raw)
             events = sync_log.events[-limit:]
-            payload: list[dict[str, Any]] = []
-            # Newest-first to match the Rich render.
-            for event in reversed(events):
-                payload.append({
-                    "timestamp": event.timestamp,
-                    "user": event.user,
-                    "machine": event.machine,
-                    "action": event.action,
-                    "files": list(event.files),
-                    "project": event.project,
-                    # snapshot_timestamp is reserved by the v1 schema;
-                    # SyncEvent does not record one today, so we always
-                    # emit null. Future versions that thread snapshot
-                    # timestamps through to the log will populate this.
-                    "snapshot_timestamp": None,
-                })
+            payload: list[dict[str, Any]] = [
+                _log_event_to_json_dict(ev) for ev in reversed(events)
+            ]
             _emit_json_success("log", payload)
             return
         except SystemExit:
@@ -6102,50 +6267,70 @@ def log(config_path: str, limit: int, json_output: bool) -> None:
     config = Config.load(_resolve_config(config_path))
     storage = _create_storage(config)
 
+    if follow and json_output:
+        try:
+            sync_log = _log_fetch_remote(storage, config.root_folder)
+        except BaseException as e:
+            _emit_json_error("log", e)
+            return
+        seen_keys: set[tuple[str, str, str, str]] = set()
+        if sync_log is not None:
+            initial = sync_log.events[-limit:]
+            for ev in initial:
+                click.echo(_json.dumps(
+                    _log_event_to_json_dict(ev),
+                    sort_keys=False,
+                    ensure_ascii=False,
+                ))
+                seen_keys.add(_log_event_key(ev))
+        try:
+            _log_follow_loop(
+                storage, config.root_folder, seen_keys, interval,
+                json_output=True,
+            )
+        except KeyboardInterrupt:
+            console.print("\nStopped following.")
+            return
+        return
+
     from ._progress import make_phase_progress
     with make_phase_progress(console) as progress:
         load_task = progress.add_task(
             "Log", total=None, detail="locating sync log…", show_time=True,
         )
-        logs_folder_id = storage.get_file_id(LOGS_FOLDER, config.root_folder)
-        log_file_id = (
-            storage.get_file_id(SYNC_LOG_NAME, logs_folder_id)
-            if logs_folder_id else None
-        )
-        if not log_file_id:
+        try:
+            sync_log = _log_fetch_remote(storage, config.root_folder)
+        except BaseException:
+            progress.remove_task(load_task)
+            raise
+        if sync_log is None:
             progress.remove_task(load_task)
             console.print("[dim]No sync log found. Push some files first.[/]")
-            return
-        progress.update(load_task, detail="downloading sync log…")
-        raw = storage.download_file(log_file_id)
-        progress.update(load_task, detail=f"parsing {len(raw)} byte(s)…")
-        sync_log = SyncLog.from_bytes(raw)
-        progress.update(load_task, detail="completed")
+            if not follow:
+                return
+            sync_log = SyncLog()
+        else:
+            progress.update(load_task, detail="completed")
 
     events = sync_log.events[-limit:]
-    if not events:
+    if not follow and not events:
         console.print("[dim]No events yet.[/]")
         return
 
-    table = Table(title="Sync Log", show_header=True)
-    table.add_column("Time", style="dim")
-    table.add_column("User@Machine")
-    table.add_column("Action")
-    table.add_column("Files")
+    _log_print_table(events)
 
-    for event in reversed(events):
-        table.add_row(
-            event.timestamp[:19].replace("T", " "),
-            f"{event.user}@{event.machine}",
-            (
-                f"[cyan]{event.action}[/]" if event.action == "push"
-                else f"[red]{event.action}[/]" if event.action == "delete"
-                else f"[blue]{event.action}[/]"
-            ),
-            ", ".join(event.files),
+    if not follow:
+        return
+
+    seen_keys = {_log_event_key(ev) for ev in sync_log.events}
+    try:
+        _log_follow_loop(
+            storage, config.root_folder, seen_keys, interval,
+            json_output=False,
         )
-
-    console.print(table)
+    except KeyboardInterrupt:
+        console.print("\nStopped following.")
+        return
 
 
 

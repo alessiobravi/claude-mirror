@@ -280,6 +280,7 @@ claude-mirror watch                     # foreground watcher; system notificatio
 claude-mirror watch --once --quiet      # single polling cycle (cron-friendly: */5 * * * * ...)
 claude-mirror watch-all                 # watch every config in ~/.config/claude_mirror/
 claude-mirror log                       # who pushed what, when, across machines
+claude-mirror log --follow              # live tail -f: stream new entries as they arrive
 claude-mirror inbox                     # show + clear pending notifications
 claude-mirror status --json | jq '.result.summary'   # script-friendly output
 ```

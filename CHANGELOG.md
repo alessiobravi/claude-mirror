@@ -19,7 +19,26 @@ A cron-paranoid operator can now preview exactly what a scheduled `claude-mirror
 
 ### Tests
 - `pytest tests/test_push_dry_run.py tests/test_pull_dry_run.py` — **36 passed locally** on macOS (under 0.5s total; every test under 20ms).
-- `pytest tests/` — **867 passed, 3 skipped locally** on macOS (skips are the existing `mypy not installed` ones, unchanged).
+- `pytest tests/test_push_dry_run.py tests/test_pull_dry_run.py` — **36 passed locally** on macOS (under 0.5s total; every test under 20ms).
+
+### Added — log --follow for live log streaming
+- `claude-mirror log --follow` (alias `-f`) is the `tail -f` of the cross-machine sync activity log. Prints the recent tail first (so the user has context), then enters a poll loop that re-pulls `_sync_log.json` from the configured backend on a configurable cadence and prints only the new entries as they arrive. Closes the long-standing wart that "live" follow mode required cron-wrapping `claude-mirror log` from a shell loop.
+- Polling cadence is set with `--interval N` (positive integer, seconds, default 5). `--interval` is rejected when passed without `--follow` — passing it alone exits non-zero with a message naming both flags rather than silently ignoring the value. Non-positive intervals (`--interval 0`, `--interval -5`) are rejected up-front.
+- Dedup is by full identity tuple, not timestamp alone: the per-event key is `(timestamp, user, machine, action)`. The sync log is append-only, but two events can share a timestamp under clock-granularity ties or parallel pushes from different machines — keying on the identity tuple means co-timestamped events from different sources are both surfaced rather than collapsed into one.
+- Transient-error resilience: a network blip / 5xx / rate-limit during a poll prints one yellow `[poll error: <reason>] retrying in <N>s` line and continues. The loop only exits non-zero on permanent auth-class failures (token revoked, permission removed) or a real Ctrl+C — defeating the purpose of follow mode by exiting on every transient error was the explicit non-goal.
+- Ctrl+C path: prints a tidy `Stopped following.` line on a fresh row and exits 0. Implementation uses a module-local `_log_follow_sleep` indirection over `time.sleep` (mirroring the `_status_watch_sleep` pattern from v0.5.31) so tests can drive the loop without globally patching `time.sleep` — per the project's `feedback_no_global_time_sleep_patch.md` rule.
+- `--json` composes with `--follow`: in streaming mode the per-entry payload is emitted as newline-delimited JSON (one object per line) so consumers like `jq -c` work without rebuilding the v1 envelope shape on every poll.
+
+### Updated docs/files
+- `claude_mirror/cli.py` — `log` command grows `--follow` / `-f` and `--interval N`; new module-level helpers `_log_follow_sleep`, `_log_event_key`, `_log_event_to_json_dict`, `_log_render_event_table_row`, `_log_fetch_remote`, `_log_is_permanent_error`, `_log_print_table`, `_log_follow_loop`. Existing one-shot path is unchanged. Net diff: roughly +180 lines / -40 lines on the `log` block.
+- `tests/test_log_follow.py` — **new module, 7 tests:** happy-path streaming, dedup correctness on co-timestamped events with differing identity tuples, KeyboardInterrupt clean exit, transient-error resilience across a single poll, three `--interval` validation tests (zero, negative, without-`--follow`).
+- `docs/cli-reference.md` — `### log` subsection grows a Flags table documenting `--follow` / `--interval` / dedup semantics / transient-error behaviour, matching the table style already used for `sync`.
+- `README.md` — Daily-usage cheatsheet gains one line: `claude-mirror log --follow              # live tail -f: stream new entries as they arrive`.
+- `CHANGELOG.md` — this entry.
+
+### Tests
+- `pytest tests/test_log_follow.py` — **7 passed locally** on macOS, all under 25ms each.
+- `pytest tests/test_log_follow.py` — **7 passed locally** on macOS, all under 25ms each.
 
 ---
 

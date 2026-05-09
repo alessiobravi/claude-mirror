@@ -1030,6 +1030,22 @@ warn  Notification template error (Discord, action='push'): 'nonexistent' — fa
 
 Action keys outside `{push, pull, sync, delete}` are caught at config-load time with a clean `ValueError` — typing `delet:` instead of `delete:` surfaces immediately rather than silently being skipped at notify time.
 
+### Who else is editing this project?
+
+When more than one collaborator is actively syncing the same project, you often want a quick read on who has touched it recently — without piping `claude-mirror log` through `awk`. Run:
+
+```bash
+claude-mirror status --presence
+```
+
+This appends a `Recent collaborator activity (last 24h)` table below the usual sync-status output. The table aggregates the shared `_sync_log.json` on the backend into one row per `(user, machine)` tuple — newest first — with columns for the user, the machine, the last action (`push` / `pull` / `sync` / `delete`), a humanised "When" delta (`3m ago`, `2h ago`, `5d ago`), and up to five of the most recently-touched files for that pair.
+
+Your own machine's entries are filtered by default; the section answers "who else is here?", not "what have I done?". When nobody else has been active in the last 24 hours, the table is replaced by a dim `No other collaborators active in the last 24 hours.` line.
+
+`--presence` composes with `--watch N`: every refresh tick re-fetches the sync log and rebuilds the presence table along with the rest of the status renderable, so a long-running `status --watch 10 --presence` shows live "they just pushed" updates inline. It also composes with `--json`: the v1 envelope grows an additive `presence: [...]` key under `result` (schema v1.1; see [cli-reference.md — `status --presence --json`](cli-reference.md#status---presence---json-schema-v11-additive)). Existing `--json` consumers that don't ask for `--presence` see the unchanged v1 shape.
+
+For the full chronological audit log (every push from every collaborator over the lifetime of the project, not just the last 24h), use [`claude-mirror log`](cli-reference.md#log).
+
 ## Multi-backend mirroring (Tier 2)
 
 A single project can be synced to multiple storage backends at the same time. Push uploads to all of them in parallel, snapshots are mirrored across all of them (configurable), and pull / status read from the primary. If a mirror fails transiently it is retried automatically on the next push; permanent failures are quarantined and surfaced via `claude-mirror status --pending` and the desktop / Slack notifiers.

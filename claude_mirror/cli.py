@@ -30,6 +30,7 @@ from ._diff import render_diff
 from .events import SyncEvent, SyncLog, SYNC_LOG_NAME, LOGS_FOLDER
 from .manifest import Manifest
 from .merge import MergeHandler
+from ._presence import PresenceEntry, aggregate_presence, humanize_age
 from .notifications import NotificationBackend
 from .notifications.pubsub import PubSubNotifier
 from .notifier import Notifier, read_and_clear_inbox
@@ -2502,9 +2503,18 @@ def _auth_check(config: Config) -> None:
               help="Emit a single flat JSON document to stdout instead of "
                    "the Rich table. All Rich output is suppressed; on error, "
                    "a JSON error envelope is written to stderr and the "
-                   "process exits 1. Schema: v1.")
+                   "process exits 1. Schema: v1 (v1.1 when --presence adds "
+                   "the additive `presence` key).")
+@click.option("--presence/--no-presence", "presence", default=False,
+              help="Render a 'Recent collaborator activity (last 24h)' table "
+                   "below the sync-status output, aggregated from the shared "
+                   "_sync_log.json on the backend. Filters out the calling "
+                   "machine's own entries by default. Composes with --watch "
+                   "(refreshes every tick) and with --json (adds an "
+                   "additive `presence: [...]` key to the v1.1 envelope).")
 def status(config_path: str, short: bool, pending: bool, by_backend: bool,
-           watch_interval: Optional[int], json_output: bool) -> None:
+           watch_interval: Optional[int], json_output: bool,
+           presence: bool) -> None:
     """Show sync status of all configured project files.
 
     By default, prints a single snapshot of sync state and exits. With
@@ -2541,9 +2551,18 @@ def status(config_path: str, short: bool, pending: bool, by_backend: bool,
         try:
             with _JsonMode():
                 resolved = _resolve_config(config_path)
-                engine, _, _ = _load_engine(resolved, with_pubsub=False)
+                engine, cfg, storage = _load_engine(resolved, with_pubsub=False)
                 states = engine.get_status()
+                presence_entries: list[PresenceEntry] = []
+                if presence:
+                    presence_entries = _fetch_presence(
+                        cfg, storage, on_progress=None,
+                    )
             result = _status_result_dict(resolved, engine, states)
+            if presence:
+                result["presence"] = [
+                    _presence_entry_to_dict(p) for p in presence_entries
+                ]
             _emit_json_success("status", result)
             return
         except SystemExit:
@@ -2551,7 +2570,7 @@ def status(config_path: str, short: bool, pending: bool, by_backend: bool,
         except BaseException as e:
             _emit_json_error("status", e)
 
-    engine, _, _ = _load_engine(_resolve_config(config_path), with_pubsub=False)
+    engine, cfg, storage = _load_engine(_resolve_config(config_path), with_pubsub=False)
 
     if watch_interval is None:
         # Snapshot path: render once and exit. The transient dual-row
@@ -2562,6 +2581,7 @@ def status(config_path: str, short: bool, pending: bool, by_backend: bool,
         console.print(_build_status_renderable(
             engine, short=short, pending=pending,
             by_backend=by_backend, with_progress=True,
+            with_presence=presence, config=cfg, storage=storage,
         ))
         return
 
@@ -2578,6 +2598,7 @@ def status(config_path: str, short: bool, pending: bool, by_backend: bool,
                 renderable = _build_status_renderable(
                     engine, short=short, pending=pending,
                     by_backend=by_backend, with_progress=False,
+                    with_presence=presence, config=cfg, storage=storage,
                 )
                 live.update(renderable)
                 _status_watch_sleep(watch_interval)
@@ -2596,6 +2617,106 @@ def _status_watch_sleep(interval: int) -> None:
     surfaced as "Aborted!" exit_code 1 in CI on Python 3.11/3.12/3.13.
     """
     time.sleep(interval)
+
+
+def _fetch_presence(
+    config: Config,
+    storage: StorageBackend,
+    *,
+    on_progress: Optional[Callable[[str], None]],
+) -> list[PresenceEntry]:
+    """Pull `_sync_log.json` from the backend and aggregate presence rows.
+
+    Returns an empty list when the log doesn't exist yet (fresh project,
+    no pushes). Network / parse failures bubble up so the surrounding
+    --json error envelope or Rich error path can surface them — we don't
+    swallow exceptions here, the same way `claude-mirror log` doesn't.
+
+    `on_progress` receives short status strings as the fetch advances
+    ("locating sync log…", "downloading…", "parsing…"), wired into the
+    snapshot path's transient Progress. Pass None when no live region is
+    available (--json mode, --watch tick).
+    """
+    if on_progress is not None:
+        on_progress("locating sync log…")
+    logs_folder_id = storage.get_file_id(LOGS_FOLDER, config.root_folder)
+    log_file_id = (
+        storage.get_file_id(SYNC_LOG_NAME, logs_folder_id)
+        if logs_folder_id else None
+    )
+    if not log_file_id:
+        if on_progress is not None:
+            on_progress("no remote log yet")
+        return []
+    if on_progress is not None:
+        on_progress("downloading sync log…")
+    raw = storage.download_file(log_file_id)
+    if on_progress is not None:
+        on_progress(f"parsing {len(raw)} byte(s)…")
+    sync_log = SyncLog.from_bytes(raw)
+    entries: list[dict[str, Any]] = []
+    for ev in sync_log.events:
+        entries.append({
+            "user": ev.user,
+            "machine": ev.machine,
+            "action": ev.action,
+            "timestamp": ev.timestamp,
+            "files": list(ev.files),
+            "project": ev.project,
+        })
+    if on_progress is not None:
+        on_progress("done.")
+    return aggregate_presence(
+        entries,
+        ignore_self=True,
+        self_user=config.user,
+        self_machine=config.machine_name,
+        max_age_hours=24,
+    )
+
+
+def _presence_entry_to_dict(p: PresenceEntry) -> dict[str, Any]:
+    """Serialise a PresenceEntry for the v1.1 JSON envelope."""
+    return {
+        "user": p.user,
+        "machine": p.machine,
+        "last_action": p.last_action,
+        "last_timestamp": p.last_timestamp.isoformat(),
+        "recent_files": list(p.recent_files),
+    }
+
+
+def _build_presence_renderable(
+    presence_entries: list[PresenceEntry],
+) -> RenderableType:
+    """Render the 'Recent collaborator activity (last 24h)' table.
+
+    Empty input renders the dim empty-state message rather than an empty
+    table — keeps the status output readable when nobody else is around.
+    """
+    if not presence_entries:
+        return Text.from_markup(
+            "[dim]No other collaborators active in the last 24 hours.[/]"
+        )
+    table = Table(
+        title="Recent collaborator activity (last 24h)",
+        show_header=True,
+    )
+    table.add_column("User", style="cyan")
+    table.add_column("Machine")
+    table.add_column("Last action")
+    table.add_column("When", style="dim")
+    table.add_column("Files", style="dim")
+    for p in presence_entries:
+        files_text = ", ".join(p.recent_files) if p.recent_files else ""
+        table.add_row(
+            p.user,
+            p.machine,
+            p.last_action,
+            humanize_age(p.last_timestamp),
+            files_text,
+        )
+    return table
 
 
 def _status_result_dict(
@@ -2660,6 +2781,9 @@ def _build_status_renderable(
     pending: bool,
     by_backend: bool = False,
     with_progress: bool = False,
+    with_presence: bool = False,
+    config: Optional[Config] = None,
+    storage: Optional[StorageBackend] = None,
 ) -> RenderableType:
     """Build a Rich renderable describing the engine's current sync state.
 
@@ -2674,6 +2798,13 @@ def _build_status_renderable(
     True for the one-shot snapshot path (so the user sees live updates
     during the scan); False for the watch-mode loop where the outer
     rich.live.Live already owns the live region.
+
+    `with_presence` appends a "Recent collaborator activity (last 24h)"
+    table sourced from `_sync_log.json`. Composes with --watch (refreshes
+    every tick); the surrounding rich.live.Live owns redraws so the
+    section is rebuilt as one Rich Group rather than appended in place,
+    which preserves scroll behaviour. `config` and `storage` are required
+    when `with_presence=True`.
 
     Returns a Rich object (Group / Table / Text) that callers can either
     `console.print(...)` or pass to `Live.update(...)`.
@@ -2711,8 +2842,44 @@ def _build_status_renderable(
                 progress.update(remote_task, detail=msg)
 
             states = engine.get_status(on_local=_on_local, on_remote=_on_remote)
+
+            presence_entries: list[PresenceEntry] = []
+            if with_presence and config is not None and storage is not None:
+                presence_task = progress.add_task(
+                    "Presence", total=None,
+                    detail="Fetching collaborator presence…",
+                    show_time=False,
+                )
+
+                def _on_presence(msg: str) -> None:
+                    progress.update(presence_task, detail=msg)
+
+                try:
+                    presence_entries = _fetch_presence(
+                        config, storage, on_progress=_on_presence,
+                    )
+                    progress.update(
+                        presence_task,
+                        detail="Fetching collaborator presence… done.",
+                    )
+                except Exception as exc:
+                    progress.update(
+                        presence_task,
+                        detail=f"presence fetch failed: {redact_error(exc)}",
+                    )
+                    presence_entries = []
     else:
         states = engine.get_status()
+        presence_entries = []
+        if with_presence and config is not None and storage is not None:
+            try:
+                presence_entries = _fetch_presence(
+                    config, storage, on_progress=None,
+                )
+            except Exception:
+                # Watch-mode tick: never let a presence-fetch hiccup take
+                # down the live status loop. The next tick retries.
+                presence_entries = []
 
     # Per-file table (omitted in --short mode).
     parts: list[RenderableType] = []
@@ -2801,6 +2968,9 @@ def _build_status_renderable(
         size_parts.append(f"[red]⚠ {_human_size(conflict_bytes)} (conflict)[/]")
     if size_parts:
         parts.append(Text.from_markup("  " + "  ·  ".join(size_parts)))
+
+    if with_presence:
+        parts.append(_build_presence_renderable(presence_entries))
 
     return Group(*parts)
 

@@ -19,7 +19,6 @@ A cron-paranoid operator can now preview exactly what a scheduled `claude-mirror
 
 ### Tests
 - `pytest tests/test_push_dry_run.py tests/test_pull_dry_run.py` — **36 passed locally** on macOS (under 0.5s total; every test under 20ms).
-- `pytest tests/test_push_dry_run.py tests/test_pull_dry_run.py` — **36 passed locally** on macOS (under 0.5s total; every test under 20ms).
 
 ### Added — log --follow for live log streaming
 - `claude-mirror log --follow` (alias `-f`) is the `tail -f` of the cross-machine sync activity log. Prints the recent tail first (so the user has context), then enters a poll loop that re-pulls `_sync_log.json` from the configured backend on a configurable cadence and prints only the new entries as they arrive. Closes the long-standing wart that "live" follow mode required cron-wrapping `claude-mirror log` from a shell loop.
@@ -38,7 +37,24 @@ A cron-paranoid operator can now preview exactly what a scheduled `claude-mirror
 
 ### Tests
 - `pytest tests/test_log_follow.py` — **7 passed locally** on macOS, all under 25ms each.
-- `pytest tests/test_log_follow.py` — **7 passed locally** on macOS, all under 25ms each.
+
+### Added — `status --presence` for collaborator visibility
+
+`claude-mirror status --presence` answers "who else is editing this project right now?". It aggregates the shared `_sync_log.json` on the backend into one row per `(user, machine)` tuple — newest first — and renders a `Recent collaborator activity (last 24h)` table below the existing sync-status output. The calling machine's own entries are filtered by default; entries older than 24 hours are excluded; each row surfaces the most recent action, a humanised "When" delta (`3m ago`, `2h ago`, `5d ago`), and up to 5 of the most recently-touched files for that pair.
+
+The flag composes with `--watch` (every tick re-fetches presence along with the rest of the status renderable, inside the same outer `rich.live.Live`, so the section is rebuilt as one Group rather than appended in place — scroll behaviour is preserved). It also composes with `--json`: the envelope schema is bumped to v1.1 (additive only — `version: 1` on the wire stays unchanged) with a new `presence: [...]` key under `result`. Existing v1 consumers see no behavioural change because `presence` is only emitted when `--presence` is set.
+
+The presence-fetch phase appears as a progress row labelled "Presence" with a live `Fetching collaborator presence… done.` detail, matching the dual-line phase progress contract used by every other top-level command. A presence-fetch hiccup never takes down the watch loop — the next tick retries.
+
+### Updated docs/files
+- `claude_mirror/_presence.py` (NEW, 173 lines) — pure aggregation: `PresenceEntry` dataclass + `aggregate_presence()` reduces a flat log list into per-`(user, machine)` rows; `humanize_age()` for the Rich render. No I/O, no clocks except the injectable `now=` kwarg, easy to unit-test without mocks.
+- `claude_mirror/cli.py` — `status` gains `--presence/--no-presence`; new helpers `_fetch_presence`, `_presence_entry_to_dict`, `_build_presence_renderable`; `_build_status_renderable` accepts `with_presence`/`config`/`storage` and appends the table to the returned `Group`. Snapshot, watch, and JSON paths all share the same fetch helper.
+- `tests/test_presence.py` (NEW, 17 tests) — pure-function coverage of `aggregate_presence` (empty / single / collapsed / multi-pair sort / `ignore_self` semantics / 24h window / 5-file cap / malformed-entry resilience / `Z`-suffix timestamps), plus 5 CLI-level tests against the FakeStorageBackend (rendered table, empty-state message, v1.1 JSON envelope, no-fetch when flag omitted, omitted `presence` key in plain `--json`).
+- `docs/cli-reference.md` — `--presence` documented in the `status` flag table; the `### status --json` schema section adds the v1.1 `presence` key with a worked example.
+- `docs/admin.md` — new "Who else is editing this project?" subsection under Notifications pointing at `status --presence`.
+
+### Tests
+- `pytest tests/test_presence.py` — **17 passed** locally on macOS in 0.23s.
 
 ---
 

@@ -32,6 +32,7 @@ claude-mirror auth        [--check] [--config PATH]
 claude-mirror status      [--short] [--config PATH]
 claude-mirror status --pending                  [--config PATH]
 claude-mirror status --by-backend               [--config PATH]   # Tier 2: per-file table with one column per backend
+claude-mirror status --presence                 [--config PATH]   # Append a "Recent collaborator activity (last 24h)" table
 claude-mirror sync        [--no-prompt --strategy {keep-local|keep-remote}] [--config PATH]
 claude-mirror push        [FILES...] [--force-local] [--config PATH]
 claude-mirror pull        [FILES...] [--output PATH] [--config PATH]
@@ -160,6 +161,42 @@ Output is formatted with `indent=2`, key order preserved, UTF-8 in strings (no `
 `--watch` is incompatible with `--json` (a streaming live region is not a single JSON document) and is ignored when `--json` is set. `--pending` and `--by-backend` are mutually exclusive; passing both with `--json` produces a JSON error envelope on stderr and exits 1.
 
 Hash fields are nullable: `local_hash` is null when the file is remote-only, `remote_hash` is null when the file hasn't been pushed yet, `manifest_hash` is null when the manifest has no record of the file.
+
+#### `status --presence --json` (schema v1.1, additive)
+
+When `--presence` is set, the same v1 envelope grows an additive `presence` key under `result`. The on-the-wire `version` field stays `1` so existing v1 consumers keep working unchanged — they simply ignore the new key. Schemas that explicitly opt into v1.1 read `result.presence` as a list of objects:
+
+```json
+{
+  "version": 1,
+  "command": "status",
+  "result": {
+    "config_path": "/home/alice/.config/claude_mirror/notes.yaml",
+    "summary": { "...": "as above" },
+    "files": [ ],
+    "presence": [
+      {
+        "user": "bob",
+        "machine": "desktop",
+        "last_action": "sync",
+        "last_timestamp": "2026-05-09T11:50:00+00:00",
+        "recent_files": ["memory/notes.md", "CLAUDE.md"]
+      },
+      {
+        "user": "alice",
+        "machine": "laptop",
+        "last_action": "push",
+        "last_timestamp": "2026-05-09T10:00:00+00:00",
+        "recent_files": ["a.md"]
+      }
+    ]
+  }
+}
+```
+
+`presence` is newest-first (`last_timestamp` descending). Each entry collapses every event for one `(user, machine)` tuple in the activity window into a single row; `last_action` and `last_timestamp` reflect the most recent event for that pair, while `recent_files` aggregates the files touched across all events for that pair (newest first, capped at 5, deduplicated). The calling machine's own activity is filtered out. The default activity window is the last 24 hours.
+
+When `--presence` is omitted, the `result` object does NOT carry a `presence` key — v1 envelope shape is unchanged.
 
 ### `history PATH --json`
 
@@ -338,7 +375,19 @@ Since v0.5.50: `--backend` value list is enumerated dynamically at completion ti
 
 Show what has changed since the last sync — per-file table plus a color-coded summary. Use `--short` for a one-line view (no table) — what the Claude Code skill uses internally. Use `--pending` (Tier 2) to list files with non-ok state on any mirror. Use `--by-backend` (Tier 2) for a per-file table with one column per configured backend.
 
-See [README — Check sync status](../README.md#check-sync-status).
+Flags:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--config PATH` | auto-detected from cwd | Path to a specific config YAML when more than one project lives under `~/.config/claude_mirror/`. |
+| `--short` | off | One-line summary; suppresses the per-file table. |
+| `--pending` | off | Tier 2 only: list files with non-ok mirror state. |
+| `--by-backend` | off | Tier 2 only: per-file table with one column per backend. Mutually exclusive with `--pending`. |
+| `--watch N` | off | Live-updating display, refreshes every N seconds (1–3600). |
+| `--json` | off | Emit a single JSON document instead of the Rich render (see [JSON output](#json-output---json)). |
+| `--presence` / `--no-presence` | `--no-presence` | Append a `Recent collaborator activity (last 24h)` table sourced from the shared `_sync_log.json` on the backend. Aggregates by `(user, machine)`; the calling machine's own entries are filtered. Composes with `--watch` (refreshes every tick) and with `--json` (additive `presence` key in the v1.1 envelope; see [`status --json`](#status---json)). |
+
+See [README — Check sync status](../README.md#check-sync-status). For "who else is editing this project right now?" see [admin.md — Who else is editing this project?](admin.md#who-else-is-editing-this-project).
 
 ### `push`
 

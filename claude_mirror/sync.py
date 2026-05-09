@@ -1308,6 +1308,7 @@ class SyncEngine:
                 "[yellow]Push succeeded; the failed snapshot will be retried "
                 "on the next push.[/]"
             )
+        return None
 
     def pull(
         self,
@@ -1364,6 +1365,7 @@ class SyncEngine:
             console.print(f"[blue]Pulled {len(pulled)} file(s) → {dest}[/]")
         else:
             console.print("[dim]Nothing to pull.[/]")
+        return None
 
     # ------------------------------------------------------------------
     # Internal operations

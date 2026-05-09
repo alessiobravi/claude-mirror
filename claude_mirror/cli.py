@@ -3202,7 +3202,7 @@ def _build_status_renderable(
                 except Exception as exc:
                     progress.update(
                         presence_task,
-                        detail=f"presence fetch failed: {redact_error(exc)}",
+                        detail=f"presence fetch failed: {redact_error(str(exc))}",
                     )
                     presence_entries = []
     else:
@@ -3971,6 +3971,7 @@ def push(files: tuple[Any, ...], config_path: str, force_local: bool, dry_run: b
     engine, cfg, _ = _load_engine(_resolve_config(config_path))
     if dry_run:
         plan = engine.push(list(files) if files else None, dry_run=True)
+        assert plan is not None
         _render_push_plan(plan)
         return
     engine.push(list(files) if files else None, force_local=force_local)
@@ -4187,6 +4188,7 @@ def pull(files: tuple[Any, ...], config_path: str, output: str, dry_run: bool) -
     )
     if dry_run:
         plan = engine.pull(list(files) if files else None, dry_run=True)
+        assert plan is not None
         _render_pull_plan(plan)
         return
     engine.pull(list(files) if files else None, output_dir=output or None)

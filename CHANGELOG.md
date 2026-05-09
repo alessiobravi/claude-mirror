@@ -4,6 +4,52 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.52] — 2026-05-09
+
+Two internal-quality additions: Windows in the CI matrix and `mypy --strict` as a separate CI gate. **MYPY caught a real runtime bug** — `redact_error` was called at four sites in `cli.py` but never imported, which would have raised `NameError` on every invocation. Plus 5 latent type-correctness issues that mypy surfaced as real defects (not just style).
+
+### Added — Windows runner in CI matrix (WIN-CI)
+- Test matrix expanded from `[ubuntu-latest] × [3.11, 3.12, 3.13, 3.14]` to `[ubuntu-latest, windows-latest] × [3.11, 3.12, 3.13, 3.14]` = **8 parallel jobs**. `fail-fast: false` so a Windows-flaky run doesn't mask Linux results.
+- New `.gitattributes` pins `* text=auto eol=lf` so contributors on Windows with `core.autocrlf=true` don't accidentally commit CRLF files that confuse Linux text-comparing tests.
+- **22 tests skipped on Windows with explicit reasons:**
+  - `tests/test_watcher.py` (6 tests) — `watch-all` uses `signal.SIGHUP` for hot-reload, which is POSIX-only; the daemon's hot-reload IS the module's whole purpose.
+  - `tests/test_doctor_sftp_deep.py` (15 tests) — POSIX file-permission semantics required (`os.chmod(path, 0o600)` is a no-op on Windows for non-readonly bits, so the "Key file permissions: 0600" assertion can't hold).
+  - `tests/test_install_completion.py::test_detect_shell_empty_falls_back_to_platform_default` (1 test) — Windows-default fallback already covered by `test_detect_shell_windows_default_to_powershell` in the powershell completion test file.
+- **No source-code bugs found** — the two limitations are intentional design decisions. `_check_watcher_running` already had a `try/except` for missing `pgrep` (Windows / minimal containers); `notifier.py` already conditionally imports `fcntl`. 809 of 831 tests run on each Windows job.
+
+### Added — `mypy --strict` static-type checking in CI (MYPY)
+- New `[tool.mypy]` config in `pyproject.toml` with `strict = true`, `disallow_untyped_defs = true`, `no_implicit_optional = true`. `[[tool.mypy.overrides]]` block with `ignore_missing_imports = true` for SDKs without bundled stubs (`paramiko.*`, `dropbox.*`, `msal.*`, `googleapiclient.*`, `google.*`, `yaml.*`, `requests.*`, `plyer.*`).
+- New top-level `mypy` job in `.github/workflows/test.yml`. Runs on `ubuntu-latest` × Python 3.11 (the lowest supported version, so the static check catches errors that 3.12+ would silently accept). Separate from the `test` matrix so the GitHub PR check list shows "tests" and "mypy" as two clearly distinguishable failure modes.
+- **`mypy --strict claude_mirror/`** now reports `Success: no issues found in 36 source files`.
+- **Real bug caught:** `redact_error` was called in `cli.py` at four sites (`850`, `878`, `2872`, `3119`) but never imported. Every invocation would raise `NameError` at runtime. Fix: one line — `from .backends import StorageBackend, redact_error`.
+- **5 latent issues fixed** — `config.py` had 12 `Optional[...]` annotations without `Optional` imported (lazy annotations meant no import-time crash, but `get_type_hints()` introspection would have failed); `SnapshotManager.list()` and `HashCache.set()` method names shadowed `list[...]` / `set[...]` in same-class annotations (fixed via `typing.List` aliases); `SyncEngine._classify` had untyped `manifest_entry` (actually `Optional[FileState]`); two backends had implicit-`None` parameter defaults; the abstract `StorageBackend.upload_file` / `download_file` were missing `progress_callback` from their signatures even though every concrete backend already accepted it (PROG-ETA in v0.5.49 wired it through every concrete backend but forgot the ABC).
+- **18 `# type: ignore[error-code]` directives added** with specific error codes + one-line comments per the rule. Most-common codes: `[no-untyped-call]` (6× — `google.oauth2.credentials.Credentials` methods are unannotated despite shipping `py.typed`), `[attr-defined]` (6× — `backend.config.root_folder` access; abstract `StorageBackend` doesn't declare `config` but every concrete subclass carries it), `[attr-defined,assignment]` (4× — `_JsonMode`'s test-mode Progress-factory rebinding), `[assignment]` (2× — `_progress_mod.make_phase_progress = _no_op_progress` swap + POSIX-only `import fcntl` fallback to `None`).
+- New `tests/test_mypy_smoke.py` (3 tests) runs `mypy --strict` as a subprocess from pytest so a regression surfaces at `pytest` time on the contributor's machine, not after the CI feedback loop. Skipped when `mypy` is not on PATH.
+- `CONTRIBUTING.md` extended with a "Type checking" subsection: every PR must keep the strict-mode pass; `# type: ignore` is reserved for genuine third-party-stub gaps with a one-line comment.
+
+### Documented
+- `README.md` — Quality gates line updated to "**834 automated tests** on Linux and Windows on Python 3.11, 3.12, 3.13, and 3.14 in parallel via GitHub Actions, plus a separate `mypy --strict` static-type-checking job on every commit and PR".
+- `CONTRIBUTING.md` — Updated CI section documents both the Windows + 4-Python matrix AND the separate mypy job; new POSIX-only-skip-set paragraph; Type checking subsection.
+- `.gitattributes` (NEW) — pins LF endings cross-platform.
+
+### Updated docs/files
+- `pyproject.toml` (`[tool.mypy]` config block + 12-module override list).
+- `.github/workflows/test.yml` (matrix expanded to 2 OS × 4 Python; new `mypy` top-level job).
+- `.gitattributes` (NEW).
+- `claude_mirror/cli.py` (real bug fix: import `redact_error`; 6 `[attr-defined]` ignores for `backend.config.root_folder`; 4 `_JsonMode` rebinding ignores).
+- `claude_mirror/config.py` (Optional import; type ignores for fcntl fallback).
+- `claude_mirror/sync.py`, `claude_mirror/snapshots.py`, `claude_mirror/backends/__init__.py`, `claude_mirror/backends/googledrive.py` + 19 other source files (annotation polish).
+- `tests/test_watcher.py`, `tests/test_doctor_sftp_deep.py`, `tests/test_install_completion.py` (Windows skipif markers with explicit reasons).
+- `tests/test_mypy_smoke.py` (NEW, 3 tests).
+- `README.md`, `CONTRIBUTING.md`.
+- `pyproject.toml` (version 0.5.51 → 0.5.52).
+
+### Tests
+- `pytest tests/` — **834 passed in ~3.5s** locally (831 baseline + 3 new mypy smoke tests; the 3 smoke tests skip when `mypy` isn't on the PATH-based detection — they run on CI where `pip install mypy` puts mypy on PATH). All offline.
+- `mypy --strict claude_mirror/` — `Success: no issues found in 36 source files`.
+
+---
+
 ## [0.5.51] — 2026-05-09
 
 Hotfix for v0.5.50 — same banner-leak pattern that bit `--json` mode in v0.5.39 hit the new `_list-backends` hidden subcommand.

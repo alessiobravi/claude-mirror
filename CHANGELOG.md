@@ -4,6 +4,18 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.64] — 2026-05-09
+
+<!-- subsumes: v0.5.63 -->
+
+CI hotfix for v0.5.63: Windows CI flagged 5 ncdu CLI tests failing because they exercise behaviour reachable only on POSIX (the gate fires before any flag parsing on Windows; the gate-rejection path is covered by `test_cli_windows_gated_with_friendly_message` separately). Added per-test `@pytest.mark.skipif(sys.platform == "win32")` markers; replaced the Unicode em-dash in the gate message with an ASCII hyphen so it renders correctly on Windows console (cp1252 / cp437). v0.5.63 was tagged-but-never-published; v0.5.64 ships the same five-feature batch (TREE + NCDU + STATS + VERIFY + BACKEND-FTP) with the Windows test-skips folded in. PyPI's burn-once policy keeps v0.5.63 unpublished.
+
+### Fixed — Windows CI green for `ncdu` CLI tests
+- `tests/test_ncdu.py` — five CLI dispatch tests guarded by `@pytest.mark.skipif(sys.platform == "win32", reason="ncdu CLI flow is POSIX-only")`. Pure-data layer tests (`build_size_tree`, `top_n_paths`, `format_non_interactive`, `entries_from_backend_listing`) continue to run cross-platform.
+- `claude_mirror/cli.py::ncdu` — Windows gate message replaces `—` (em-dash, U+2014) with `-` (ASCII hyphen) so the message renders cleanly on Windows console encodings without a `�` replacement character.
+
+---
+
 ## [0.5.63] — 2026-05-09
 
 Five new user-facing surfaces ship together: `claude-mirror tree` (remote-listing visualization), `claude-mirror ncdu` (interactive disk-usage TUI), `claude-mirror stats` (usage summary aggregation), `claude-mirror verify` (end-to-end integrity audit), and the new **FTP / FTPS storage backend** (legacy shared-hosting market — cPanel / DirectAdmin / NAS — via Python's stdlib `ftplib`, no new dependencies). 1251 tests pass on macOS (1101 baseline + 150 new); mypy `--strict` clean across 46 source files.

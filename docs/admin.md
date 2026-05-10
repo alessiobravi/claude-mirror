@@ -422,6 +422,21 @@ A daily cron alongside `health` covers both halves of the monitoring story:
 0 3 * * *   /usr/local/bin/claude-mirror verify --strict --json    || /usr/local/bin/notify-monitor
 ```
 
+### Pre-push secret scanning with `redact`
+
+`claude-mirror redact PATH...` scans local markdown files for likely secrets (AWS access keys, GitHub tokens, OpenAI / Anthropic / Google API keys, Slack tokens, JWTs, password assignments, etc.) before they get pushed to a backend. Dry-run by default; `--apply` walks an interactive replace/keep/skip-file/quit prompt loop, and `--apply --yes` auto-replaces every finding non-interactively for CI / pre-commit hook usage. Replacement marker is `<REDACTED:KIND>` — re-running `redact` on already-redacted text is a no-op. Full kind catalogue + sample transcript: [`docs/cli-reference.md` — `redact`](cli-reference.md#redact).
+
+To wire `redact` into a git pre-commit hook so secrets never even reach the staged tree, drop this in `.git/hooks/pre-commit`:
+
+```sh
+#!/bin/sh
+# Auto-replace any secret-shaped match in tracked markdown files.
+# Exit non-zero if redact replaced anything so the user can re-stage.
+exec claude-mirror redact "$(git rev-parse --show-toplevel)" --apply --yes
+```
+
+Make the hook executable (`chmod +x .git/hooks/pre-commit`). The `--apply --yes` form is required for non-interactive shells (no per-finding prompt), and the `<REDACTED:KIND>` markers are unambiguous so a follow-up review pass shows exactly which kinds fired and where. For wrapping `claude-mirror push` instead, run `claude-mirror redact <project> --apply --yes && claude-mirror push` from a shell alias.
+
 ---
 
 ## Performance and bandwidth control

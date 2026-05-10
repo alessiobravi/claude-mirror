@@ -23,6 +23,7 @@ A wayfinding page. Each entry is a 30-second answer with a concrete command and 
   - [Status says 'conflict' — what do I do?](#status-says-conflict--what-do-i-do)
   - [How do I sync only some files?](#how-do-i-sync-only-some-files)
   - [How do I run sync on a schedule?](#how-do-i-run-sync-on-a-schedule)
+  - [I accidentally pasted an API key into my notes. How do I scrub it before pushing?](#i-accidentally-pasted-an-api-key-into-my-notes-how-do-i-scrub-it-before-pushing)
 - [Multi-machine and multi-user](#multi-machine-and-multi-user)
   - [I'm syncing the same project from two machines — what do I run?](#im-syncing-the-same-project-from-two-machines--what-do-i-run)
   - [We're a team of three sharing one Drive folder](#were-a-team-of-three-sharing-one-drive-folder)
@@ -273,6 +274,20 @@ Two complementary patterns:
 If you also want a single one-shot poll cycle in cron (no bidirectional sync, no conflict logic), use `claude-mirror watch --once --quiet` instead.
 
 **See also:** [docs/admin.md — Unattended sync via cron](admin.md#unattended-sync-via-cron) for additional crontab samples.
+
+### I accidentally pasted an API key into my notes. How do I scrub it before pushing?
+
+`claude-mirror redact PATH` is the pre-push safety net. Run it on the project root (or a specific file) to scan for likely-secret patterns — AWS access keys, GitHub tokens, OpenAI / Anthropic / Google API keys, Slack webhooks and bot tokens, JWTs, password assignments, and a few more.
+
+```bash
+claude-mirror redact .                    # dry-run scan (default: never writes)
+claude-mirror redact . --apply            # interactive replace/keep/skip-file/quit prompt
+claude-mirror redact . --apply --yes      # auto-replace every finding (non-interactive)
+```
+
+Dry-run by default — without `--apply`, the command lists every finding as `path:line [kind] match` and exits 0. No disk writes happen until you opt in with `--apply`. The replacement marker is `<REDACTED:KIND>` (e.g. `<REDACTED:aws-access-key>`); re-running `redact` on already-redacted text is a no-op.
+
+For a permanent guard, wire `claude-mirror redact <project> --apply --yes` into your project's `.git/hooks/pre-commit` so secrets never even reach the staged tree — see [`docs/admin.md` — Pre-push secret scanning with redact](admin.md#pre-push-secret-scanning-with-redact). Full kind catalogue + sample interactive transcript: [`docs/cli-reference.md` — `redact`](cli-reference.md#redact).
 
 ---
 

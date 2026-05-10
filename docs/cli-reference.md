@@ -109,6 +109,7 @@ claude-mirror mount       MOUNTPOINT
                           [--config PATH]
 claude-mirror umount      MOUNTPOINT [--config PATH]   # macOS: umount; Linux: fusermount -u; Windows: prints Ctrl+C hint
 claude-mirror ncdu        [--remote BACKEND] [--non-interactive] [--top N] [--config PATH]   # POSIX-only interactive disk-usage TUI (curses); --non-interactive prints top-N largest paths to stdout
+claude-mirror redact      PATH... [--apply] [--yes]   # pre-push secret scan over markdown files; dry-run by default, --apply to scrub interactively, --apply --yes for CI
 claude-mirror profile list
 claude-mirror profile show       NAME
 claude-mirror profile create     NAME --backend BACKEND [--description TEXT] [--force]
@@ -815,6 +816,80 @@ Top 10 largest paths in primary backend:
 A directory path is suffixed with `/`; a file path has no suffix. The `count` column is `1` for files and the descendant file-count for directories. The `total:` line aggregates the WHOLE tree (not just the displayed top-N), so a small project's total matches `du -sh` on the local copy.
 
 POSIX-only: `curses` is not in the CPython stdlib on Windows. On Windows, `claude-mirror ncdu` exits with a friendly hint pointing at `claude-mirror tree --depth N` (the read-only tree view) as the closest cross-platform alternative.
+
+### `redact`
+
+Pre-push secret scanner over local markdown files. The motivating scenario: a user accidentally pasted an API key into a `CLAUDE.md` or memory file and is about to push it to Drive / S3 / wherever — `claude-mirror redact` catches it before the push and offers an interactive replace-with-placeholder flow.
+
+Walks each PATH (file or directory). Directory paths are recursively scanned for `*.md` files; dotted directories (`.git/`, `.claude/`) and the project's own `_claude_mirror_snapshots` / `_claude_mirror_blobs` folders are skipped automatically. Each match is reported as `path:line [kind]` with the matched text rendered inline.
+
+```bash
+claude-mirror redact .                         # dry-run scan over the current project
+claude-mirror redact memory/ CLAUDE.md         # explicit path list
+claude-mirror redact . --apply                 # interactive scrub (per-finding prompt)
+claude-mirror redact . --apply --yes           # auto-replace every finding (CI / pre-commit hook)
+```
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--apply` | off | Actually scrub findings out of the files. Without this flag, the command runs in dry-run mode and exits without writing. |
+| `--yes` | off | With `--apply`, replace every finding non-interactively (no per-finding prompt). Required when stdin is not a TTY (CI / pre-commit hook usage). |
+
+Detected kinds (the starting catalogue; expanding is a follow-up release):
+
+| Kind | What it matches |
+|---|---|
+| `aws-access-key` | `AKIA…` / `ASIA…` 20-char access key IDs |
+| `aws-secret-key` | 40-char base64 secret keys label-gated by `aws_secret_access_key`-style names |
+| `github-token` | `ghp_` / `gho_` / `ghs_` / `ghu_` / `ghr_` + 36 alphanumeric chars |
+| `slack-webhook` | `https://hooks.slack.com/services/T*/B*/<token>` |
+| `slack-bot-token` | `xoxb-` / `xoxp-` / `xoxa-` / `xoxr-` + dashed digits + alnum suffix |
+| `openai-api-key` | `sk-` prefix + 20+ alphanumeric chars |
+| `anthropic-api-key` | `sk-ant-` prefix + alnum (incl. dashes) |
+| `google-api-key` | `AIza…` 35-char Google API key |
+| `gcp-service-account-key` | `private_key` field inside a service-account JSON pasted as a fenced block |
+| `private-key-block` | `-----BEGIN [...] PRIVATE KEY-----` PEM block (multi-line) |
+| `jwt` | `eyJ`-prefixed three-segment dotted token (header.body.signature) |
+| `password-assignment` | `PASSWORD=`, `api_key:`, `secret:`, `token=`, `auth=` followed by a quoted body of 6+ chars |
+| `generic-high-entropy` | 40+ char base64-y / hex-y body assigned to a key-shaped name (lowest confidence; backstop) |
+
+Replacement marker is `<REDACTED:KIND>` (e.g. `<REDACTED:aws-access-key>`). Re-running `redact` on already-redacted text is a no-op — the marker shape is excluded from the catalogue patterns.
+
+Sample dry-run output:
+
+```
+$ claude-mirror redact memory/
+
+  Location                  Kind            Match
+  memory/notes.md:3         aws-access-key  AKIAIOSFODNN7EXAMPLE
+  memory/notes.md:4         aws-secret-key  wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+  memory/auth.md:12         github-token    ghp_1234567890abcdefghijklmnopqrstuvwxyzABCD
+
+Found 3 likely secret(s) across 2 file(s). Run with --apply to redact interactively, or --apply --yes to auto-replace all.
+```
+
+Sample interactive transcript (`--apply` on a TTY):
+
+```
+memory/notes.md:3  [aws-access-key]
+  > AWS_ACCESS_KEY_ID = AKIAIOSFODNN7EXAMPLE
+                        ^^^^^^^^^^^^^^^^^^^^
+[r]eplace  [k]eep  [s]kip file  [q]uit (default: r) >
+```
+
+Per-finding choices: `r` replaces the match with `<REDACTED:KIND>`, `k` keeps it as-is (returns to scan output), `s` aborts the current file (no further prompts for that file, no writes for it), `q` exits the loop entirely. `q` exits with code 1 because the user did NOT clear the full slate — already-applied replacements stay on disk (the previous `r` choices are not rolled back).
+
+**Dry-run by default.** Without `--apply`, no disk writes happen — consistent with the project's `feedback_destructive_safe_default.md` rule. The dry-run prints the findings table and exits 0; the user can review which kinds were detected and which spans are false positives before committing to `--apply`.
+
+**Non-TTY without `--yes` is rejected.** With `--apply` set on a non-TTY (cron / pre-commit hook / piped stdin) AND no `--yes`, the command exits 1 with a fix-hint pointing at `--yes`. We never silently default to "replace all" or "keep all" — that's the wrong failure mode.
+
+When to use:
+
+* **Before every push.** Run `claude-mirror redact .` on the project root before `claude-mirror push` so any secret accidentally pasted into a memory file gets caught locally.
+* **As a `pre-commit` hook.** Drop the four-line shell script in [admin.md "Pre-push secret scanning with redact"](admin.md#pre-push-secret-scanning-with-redact) into `.git/hooks/pre-commit` to wire the check into git's commit flow.
+* **After a session that handled credentials.** If a Claude Code session involved auth-flow setup, OAuth pasting, or anything else that touched secret material, run `redact` over the project before the next push.
+
+The kind catalogue is a high-confidence subset. Patterns deliberately omit common-but-noisy shapes (Stripe / Square / Twilio / Mailgun / standalone bare 40-char hashes without label gates) so the dry-run report does not flood the user with false positives on every README or snippet block. Expanding the catalogue is a follow-up.
 
 ---
 

@@ -146,6 +146,7 @@ claude-mirror gc       --backend NAME                    --config <config-path> 
 claude-mirror migrate-snapshots --to {blobs|full}        --config <config-path>   # convert snapshots between formats (admin-only; rarely skill-triggered)
 claude-mirror log       --config <config-path>
 claude-mirror inbox     --config <config-path>
+claude-mirror redact   <project-path>                                        # pre-push secret scan (dry-run); --apply to scrub interactively, --apply --yes for non-interactive
 claude-mirror check-update                                                   # check GitHub for a newer version (no --config needed)
 claude-mirror update                                                         # dry-run: report what update would do
 claude-mirror update --apply                                                 # actually upgrade (git pull + pipx install -e . --force, with confirmation)
@@ -362,12 +363,19 @@ claude-mirror push --config <config-path>
 
 SMB2/3 only — SMBv1 is rejected as a security gate. No native push notifications; polling only.
 
+## Pre-push safety: scrub secrets before pushing
+
+If the user mentions secrets, API keys, OAuth tokens, or auth material being involved in recent edits — or if the conversation has touched credentials at all — run `claude-mirror redact <project-path>` (no `--apply`) as a sanity check before any push. This is a dry-run scan that flags `AKIA…` AWS keys, `ghp_`-style GitHub tokens, OpenAI / Anthropic / Google API keys, Slack webhooks and bot tokens, JWTs, password assignments, and a few more. The dry-run never writes to disk; it just prints the findings table.
+
+If findings appear, surface them to the user and offer to scrub via `claude-mirror redact <project-path> --apply` (interactive) or `claude-mirror redact <project-path> --apply --yes` (auto-replace every finding with a `<REDACTED:KIND>` marker). Never run `--apply` automatically without user confirmation — `--apply` rewrites the user's files in place.
+
 ## Important rules
 
 - Always run `find-config` as a standalone Bash call first — capture its output as the config path, never use shell variable substitution `$()` inline
 - Always pass `--config <config-path>` on every command — never omit it
 - Never run `claude-mirror restore` to the project path without explicit user confirmation
-- Never run destructive operations (restore, delete) without confirming with the user first
+- Never run destructive operations (restore, delete, redact --apply) without confirming with the user first
 - The `delete` command requires explicit file arguments — it will not delete all files
+- `claude-mirror redact` is dry-run by default; `--apply` rewrites files in place and requires user confirmation
 - If a command fails, show the full error and suggest a fix
 - Notifications are stored in `{project_path}/.claude_mirror_inbox.jsonl` — they are project-scoped and will not mix with other projects

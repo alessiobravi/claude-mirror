@@ -396,6 +396,12 @@ _NO_WATCHER_CHECK_CMDS = {
     # leak failure mode as `health` / `log` etc. is gated by the
     # json_mode check below.
     "stats",
+    # `redact` (REDACT) operates on local markdown files only — it never
+    # touches a backend, so the watcher banner would just be noise. It
+    # also doubles as a pre-push hook (`--apply --yes` from a git
+    # pre-commit), where any banner-leak on stderr/stdout would
+    # interfere with the hook's exit-code-driven contract.
+    "redact",
 }
 
 
@@ -14343,3 +14349,305 @@ def ncdu(
         project_label=project_label,
         backend_label=target_label,
     )
+
+
+def _redact_stdin_isatty() -> bool:
+    """Return whether sys.stdin is currently a TTY.
+
+    Wrapping `sys.stdin.isatty()` in a module-level function gives the
+    test suite a stable seam to monkeypatch (`monkeypatch.setattr(
+    cli_module, '_redact_stdin_isatty', lambda: True)`) without
+    rebinding the stdlib global handle. CliRunner.invoke installs its
+    own sys.stdin replacement during the test, so a direct patch of
+    `sys.stdin.isatty` does not survive into the command body — this
+    wrapper does.
+    """
+    return sys.stdin.isatty()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# `claude-mirror redact` — pre-push secret scrubbing (REDACT)
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Interactively scrubs likely secrets out of project markdown files BEFORE
+# they get pushed to a backend. Motivating scenario: a user accidentally
+# pasted an API key into a `CLAUDE.md` or memory file and is about to push
+# it to Drive / S3 / wherever. REDACT catches it.
+#
+# Pure scanner + replacement live in `claude_mirror._redact`. This handler
+# is a thin Click wrapper that drives the dry-run report or the
+# interactive prompt loop and writes back to disk.
+#
+# Safety contract (matches `feedback_destructive_safe_default.md`):
+#   * Without --apply, the command is dry-run only — no disk writes.
+#   * With --apply on an interactive TTY, every finding gets a
+#     replace/keep/skip-file/quit prompt.
+#   * With --apply --yes, every finding is auto-replaced (CI / pre-commit
+#     hook usage). The user is consenting to bulk-replace by typing --yes.
+#   * --apply on a non-TTY without --yes is rejected with a fix-hint.
+#     Never silently default to "replace all" or "keep all" — that's the
+#     wrong failure mode (the user did not consent to either choice).
+@cli.command()
+@click.argument("paths", nargs=-1, required=True, type=click.Path(
+    exists=False, file_okay=True, dir_okay=True, readable=True,
+))
+@click.option("--apply", "do_apply", is_flag=True, default=False,
+              help="Actually scrub findings out of the files. Without "
+                   "this flag, the command runs in dry-run mode and "
+                   "exits without writing — the safe default.")
+@click.option("--yes", "skip_prompts", is_flag=True, default=False,
+              help="With --apply, replace every finding non-interactively "
+                   "(no per-finding prompt). Required when stdin is not "
+                   "a TTY (CI / pre-commit hook usage).")
+def redact(paths: tuple[str, ...], do_apply: bool, skip_prompts: bool) -> None:
+    """Scan markdown files for likely-secret patterns; optionally scrub them.
+
+    Walks each PATH (file or directory). Directory paths are recursively
+    scanned for `*.md` files. Each match is reported as `path:line [kind]`
+    with the matched text underlined. Detected kinds:
+
+    \b
+        aws-access-key            AKIAIOSFODNN7EXAMPLE-style key IDs
+        aws-secret-key            40-char base64 secret keys (label-gated)
+        github-token              ghp_/gho_/ghs_/ghu_/ghr_ + 36 chars
+        slack-webhook             https://hooks.slack.com/services/...
+        slack-bot-token           xoxb-/xoxp-/xoxa-/xoxr- + suffix
+        openai-api-key            sk- prefix + 20+ alnum
+        anthropic-api-key         sk-ant- prefix + alnum
+        google-api-key            AIza... 35-char key
+        gcp-service-account-key   private_key field in service-account JSON
+        private-key-block         -----BEGIN ... PRIVATE KEY----- block
+        jwt                       eyJ-prefixed three-segment dotted token
+        password-assignment       PASSWORD = "..." / api_key: "..."
+        generic-high-entropy      40+ char base64-y/hex-y assigned to a
+                                  key-shaped name (lowest confidence)
+
+    \b
+    Safe by default — without --apply, just prints the findings table
+    and exits. To actually scrub:
+        claude-mirror redact ~/projects/myproject --apply              # interactive
+        claude-mirror redact ~/projects/myproject --apply --yes        # auto-replace all (CI)
+    Replacement marker is `<REDACTED:KIND>` (e.g. `<REDACTED:aws-access-key>`).
+    Re-running redact on already-redacted text is a no-op.
+
+    \b
+    Pre-push hook recipe (drop in .git/hooks/pre-commit):
+        #!/bin/sh
+        claude-mirror redact "$(git rev-parse --show-toplevel)" --apply --yes
+    """
+    from . import _redact as _r
+    from ._progress import make_phase_progress
+
+    files: list[Path] = []
+    for raw_path in paths:
+        p = Path(raw_path).expanduser()
+        if not p.exists():
+            console.print(f"[yellow]⚠[/]  [dim]not found:[/] {p}")
+            continue
+        if p.is_file():
+            files.append(p)
+            continue
+        # Directory: recurse for *.md files. Skip dotted dirs (.git/,
+        # .claude/, etc.) and the project's own snapshot/blob folders to
+        # match the rest of the toolchain.
+        for entry in sorted(p.rglob("*.md")):
+            rel_parts = entry.relative_to(p).parts
+            if any(part.startswith(".") for part in rel_parts):
+                continue
+            if any(part in {"_claude_mirror_snapshots", "_claude_mirror_blobs"}
+                   for part in rel_parts):
+                continue
+            files.append(entry)
+
+    if not files:
+        console.print("[dim]No markdown files found at the given paths.[/]")
+        return
+
+    findings_by_file: dict[Path, list[_r.Finding]] = {}
+
+    # Live progress only when scanning more than ~5 files (the overhead
+    # of a Progress widget is greater than the value below that count).
+    show_progress = len(files) >= 5
+    if show_progress:
+        with make_phase_progress(console) as progress:
+            task = progress.add_task(
+                "Scanning", total=None, detail="0 file(s) checked, 0 finding(s) so far",
+                show_time=True,
+            )
+            for idx, fp in enumerate(files, 1):
+                try:
+                    findings = _r.scan_file(fp)
+                except (PermissionError, FileNotFoundError, OSError) as e:
+                    console.print(f"[yellow]⚠[/]  [dim]skipped {fp}: {e}[/]")
+                    progress.update(
+                        task,
+                        detail=f"{idx} file(s) checked, "
+                               f"{sum(len(v) for v in findings_by_file.values())} "
+                               f"finding(s) so far",
+                    )
+                    continue
+                if findings:
+                    findings_by_file[fp] = findings
+                progress.update(
+                    task,
+                    detail=f"{idx} file(s) checked, "
+                           f"{sum(len(v) for v in findings_by_file.values())} "
+                           f"finding(s) so far",
+                )
+    else:
+        for fp in files:
+            try:
+                findings = _r.scan_file(fp)
+            except (PermissionError, FileNotFoundError, OSError) as e:
+                console.print(f"[yellow]⚠[/]  [dim]skipped {fp}: {e}[/]")
+                continue
+            if findings:
+                findings_by_file[fp] = findings
+
+    total_findings = sum(len(v) for v in findings_by_file.values())
+
+    if total_findings == 0:
+        console.print("[green]✓[/] no secrets detected in "
+                      f"{len(files)} file(s).")
+        return
+
+    # Build the findings table — same visual contract as `status --short`.
+    table = Table(show_header=True, header_style="bold", box=None)
+    table.add_column("Location", overflow="fold")
+    table.add_column("Kind", style="yellow")
+    table.add_column("Match", overflow="fold", style="dim")
+    for fp in sorted(findings_by_file.keys()):
+        for f in findings_by_file[fp]:
+            # Truncate long matches so a 200-char private-key block
+            # doesn't blow up the column.
+            shown = f.matched_text
+            if len(shown) > 60:
+                shown = shown[:57] + "..."
+            table.add_row(
+                f"{fp}:{f.line_no}",
+                f.kind,
+                shown,
+            )
+    console.print(table)
+
+    if not do_apply:
+        console.print(
+            f"\n[bold]Found {total_findings} likely secret(s) across "
+            f"{len(findings_by_file)} file(s).[/] Run with [bold]--apply[/] "
+            f"to redact interactively, or [bold]--apply --yes[/] to "
+            f"auto-replace all."
+        )
+        return
+
+    # --apply path: drive the per-finding prompt loop or the bulk
+    # auto-replace.
+    #
+    # `_redact_stdin_isatty()` is a thin module-level wrapper around
+    # sys.stdin.isatty() so the test suite can monkeypatch the boolean
+    # without owning the global stdin handle (CliRunner.invoke installs
+    # its own sys.stdin replacement). Per `feedback_no_global_time_sleep_patch.md`
+    # we never patch the stdlib global directly.
+    is_tty = _redact_stdin_isatty()
+    if not is_tty and not skip_prompts:
+        raise click.ClickException(
+            "stdin is not a TTY but --apply was passed without --yes. "
+            "Pass --yes to auto-replace every finding non-interactively, "
+            "or run the command in an interactive terminal so the per-"
+            "finding prompt loop can run."
+        )
+
+    quit_requested = False
+    files_written = 0
+    findings_replaced = 0
+    findings_kept = 0
+    findings_skipped_via_skip_file = 0
+
+    for fp in sorted(findings_by_file.keys()):
+        if quit_requested:
+            break
+        file_findings = findings_by_file[fp]
+        try:
+            text = fp.read_text(encoding="utf-8")
+        except (PermissionError, FileNotFoundError, OSError) as e:
+            console.print(f"[yellow]⚠[/]  [dim]skipped {fp}: {e}[/]")
+            continue
+
+        kept: list[_r.Finding] = []
+        skip_this_file = False
+
+        if skip_prompts:
+            # Bulk auto-replace path — no interactive prompts.
+            pass
+        else:
+            for f in file_findings:
+                # Render a per-finding prompt block.
+                console.print(
+                    f"\n[bold]{fp}:{f.line_no}[/]  [yellow][{f.kind}][/]"
+                )
+                console.print(f"  > {f.raw_line}")
+                # Underline the matched span. The spaces match the leading
+                # `  > ` indent so the carets line up with raw_line on stdout.
+                pad = " " * (4 + f.column_start)
+                caret = "^" * max(1, f.column_end - f.column_start)
+                console.print(f"  {pad}[bold red]{caret}[/]")
+                choice = click.prompt(
+                    "[r]eplace  [k]eep  [s]kip file  [q]uit",
+                    default="r",
+                    show_default=True,
+                    type=click.Choice(
+                        ["r", "k", "s", "q", "replace", "keep", "skip", "quit"],
+                        case_sensitive=False,
+                    ),
+                )
+                first = choice.lower()[0]
+                if first == "r":
+                    findings_replaced += 1
+                    continue
+                if first == "k":
+                    kept.append(f)
+                    findings_kept += 1
+                    continue
+                if first == "s":
+                    skip_this_file = True
+                    findings_skipped_via_skip_file += (
+                        len(file_findings) - file_findings.index(f)
+                    )
+                    break
+                if first == "q":
+                    quit_requested = True
+                    break
+
+        if quit_requested or skip_this_file:
+            continue
+
+        if skip_prompts:
+            findings_replaced += len(file_findings)
+            new_text = _r.apply_replacements(text, file_findings)
+        else:
+            new_text = _r.apply_replacements(text, file_findings, kept=kept)
+
+        if new_text != text:
+            try:
+                fp.write_text(new_text, encoding="utf-8")
+            except (PermissionError, OSError) as e:
+                raise click.ClickException(
+                    f"Failed to write back to {fp}: {e}"
+                ) from None
+            files_written += 1
+
+    summary = (
+        f"\n[bold]Summary:[/] {findings_replaced} replaced, "
+        f"{findings_kept} kept"
+    )
+    if findings_skipped_via_skip_file:
+        summary += f", {findings_skipped_via_skip_file} skipped (skip-file)"
+    summary += f"; {files_written} file(s) written."
+    console.print(summary)
+
+    if quit_requested:
+        # Already-applied changes stay on disk; the user is consenting
+        # to bail out mid-loop. Exit 1 so a CI / hook caller knows the
+        # user did NOT clear the full slate.
+        console.print("[yellow]Quit before reviewing every finding. "
+                      "Already-written files were not rolled back.[/]")
+        sys.exit(1)

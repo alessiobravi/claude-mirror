@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from ._filelock import exclusive_lock
+
 
 MANIFEST_FILE = ".claude_mirror_manifest.json"
 
@@ -111,6 +113,13 @@ class Manifest:
         self._path = self.project_path / (manifest_filename or MANIFEST_FILE)
         self._data: dict[str, FileState] = {}
         self._lock = threading.Lock()
+        # Track keys this process has explicitly removed via `remove()`
+        # so the cross-process save() merge can distinguish "another
+        # process added this key after we loaded" from "we deleted this
+        # key and another process happens to still have an old copy on
+        # disk". Without this, the merge would silently undo our
+        # deletes by treating the disk's stale entry as authoritative.
+        self._removed_keys: set[str] = set()
         self.load()
 
     def load(self) -> None:
@@ -206,17 +215,119 @@ class Manifest:
         )
 
     def save(self) -> None:
-        # Hold the lock around the ENTIRE write+replace sequence: two
-        # concurrent save() calls share the same `<file>.json.tmp` path,
-        # so without serialisation one os.replace can move a partially-
-        # written file. Serialising under self._lock makes the tmp path
-        # safe to reuse and keeps the on-disk manifest consistent.
+        # Two concurrent processes (the watcher daemon + a foreground
+        # `claude-mirror sync`) can both call save() against the same
+        # project. The in-process `self._lock` only serialises threads
+        # in THIS process — across processes it's a no-op, so without
+        # the OS-level file lock both processes would race on the same
+        # tmp path and one os.replace would clobber the other's bytes.
+        #
+        # Two-layer locking:
+        #   * `self._lock` keeps thread-level fairness intact (the
+        #     in-process semantics every caller relies on);
+        #   * a sibling `<manifest>.lock` file held under
+        #     `_filelock.exclusive_lock` serialises across processes.
+        # The sibling file is touched lazily and never deleted —
+        # leaving an empty .lock file on disk is cheaper than racing
+        # to recreate it.
+        #
+        # Inside the OS lock we re-read the on-disk manifest so two
+        # processes writing DISJOINT entries don't clobber each other:
+        # each process's in-memory `_data` knows about its OWN updates
+        # but not the other process's. Merging on disk under the lock
+        # makes "watcher writes file A while sync writes file B" land
+        # both A and B in the final manifest.
+        #
+        # Defence-in-depth: per-process tmp suffix so even if the
+        # OS-level lock somehow fails (hostile filesystem without
+        # working flock(2), bind-mount weirdness, …) two writers don't
+        # share the same tmp path.
         with self._lock:
-            raw = {k: self._dump_entry(v) for k, v in self._data.items()}
-            # Atomic write: tmp + os.replace so a crash mid-write can't corrupt the manifest.
-            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-            tmp.write_text(json.dumps(raw, indent=2))
-            os.replace(tmp, self._path)
+            lock_path = self._path.with_suffix(self._path.suffix + ".lock")
+            try:
+                lock_fd = open(lock_path, "a+")
+            except OSError:
+                # If we can't even open the lockfile (read-only FS,
+                # missing parent), fall back to thread-only locking
+                # rather than crashing — single-process behaviour is
+                # still correct and matches the pre-fix contract.
+                self._write_atomic(self._dump_all(self._data))
+                return
+            try:
+                with exclusive_lock(lock_fd):
+                    merged = self._merge_with_disk(self._data)
+                    self._write_atomic(self._dump_all(merged))
+                    # Refresh in-memory view so the caller's next
+                    # operation sees what we just wrote (including any
+                    # entries another process committed concurrently).
+                    self._data = merged
+            finally:
+                lock_fd.close()
+
+    def _dump_all(self, data: dict[str, FileState]) -> str:
+        """Serialise the in-memory manifest dict to its on-disk JSON
+        text. Pure helper so `save()` can compute the payload BEFORE
+        opening the lock (cheaper) when the lockfile path is unwritable,
+        AND inside the lock when we've merged disk state in."""
+        raw = {k: self._dump_entry(v) for k, v in data.items()}
+        return json.dumps(raw, indent=2)
+
+    def _write_atomic(self, payload: str) -> None:
+        """Write `payload` to the manifest path via tmp + os.replace.
+        Uses a per-process / per-thread tmp suffix so even when the
+        OS-level lock is somehow defeated, two writers never share a
+        single tmp path. Caller is responsible for holding any locks."""
+        tmp = self._path.with_suffix(
+            self._path.suffix
+            + f".{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        tmp.write_text(payload)
+        os.replace(tmp, self._path)
+
+    def _merge_with_disk(
+        self, in_memory: dict[str, FileState],
+    ) -> dict[str, FileState]:
+        """Re-read on-disk manifest under the cross-process lock and
+        merge with this process's in-memory updates.
+
+        Merge policy:
+          * paths only on disk (another process's commit while we
+            held in-memory state) → keep them, EXCEPT when this
+            process explicitly removed the key (`self._removed_keys`),
+            in which case the deletion wins;
+          * paths only in memory (our own commits) → keep them;
+          * paths in both → in-memory wins (this process did the work
+            after the previous writer committed to disk, so our entry
+            is fresher).
+
+        The `_removed_keys` exception keeps `manifest.remove(...)`
+        propagating across the cross-process lock — without it, the
+        merge would silently undo a delete by re-reading the stale
+        on-disk entry. Disjoint adds from two processes both land
+        because each process's `_removed_keys` set is disjoint from
+        the other's added keys.
+        """
+        if not self._path.exists():
+            return dict(in_memory)
+        try:
+            raw = json.loads(self._path.read_text())
+        except (json.JSONDecodeError, OSError):
+            # Disk view unparseable — fall back to in-memory only.
+            # save() will overwrite the corrupt file with valid JSON.
+            return dict(in_memory)
+        merged: dict[str, FileState] = {}
+        for k, v in raw.items():
+            if not self._is_safe_relpath(k):
+                continue
+            if not isinstance(v, dict):
+                continue
+            if k in self._removed_keys:
+                # Explicit local deletion — drop the disk entry.
+                continue
+            merged[k] = self._load_entry(v)
+        # In-memory updates win on collision per the merge policy.
+        merged.update(in_memory)
+        return merged
 
     @staticmethod
     def _dump_entry(s: FileState) -> dict[str, Any]:
@@ -282,6 +393,8 @@ class Manifest:
                 synced_remote_hash=synced_remote_hash or synced_hash,
                 remotes=remotes,
             )
+            # Re-adding overrides any previous explicit removal.
+            self._removed_keys.discard(rel_path)
 
     def update_remote(
         self,
@@ -362,10 +475,17 @@ class Manifest:
                 synced_remote_hash=existing.synced_remote_hash,
                 remotes=remotes,
             )
+            self._removed_keys.discard(rel_path)
 
     def remove(self, rel_path: str) -> None:
         with self._lock:
             self._data.pop(rel_path, None)
+            # Record the explicit deletion so the cross-process save
+            # merge doesn't resurrect this key from a stale on-disk
+            # copy left by another process (or by ourselves before the
+            # delete). Cleared only when the key gets re-added through
+            # update() / update_remote(), to keep the set bounded.
+            self._removed_keys.add(rel_path)
 
     def all(self) -> dict[str, FileState]:
         with self._lock:

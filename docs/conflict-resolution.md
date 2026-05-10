@@ -80,6 +80,8 @@ Three subcommands cover the lifecycle:
 
 The envelope schema is **version 1**. Future breaking changes bump the version; older CLIs that encounter a newer envelope refuse it cleanly with a "this CLI understands version N" error rather than misinterpreting the shape.
 
+The conflicts directory itself is created with mode `0o700` (owner-only RWX) — same hygiene as `~/.ssh` — so a world-readable directory listing cannot expose project-internal rel-path filenames like `memory__keys__deploy.md.merge.json` to other local users; envelope files inside the dir are also `0o600`.
+
 ## See also
 
 - [faq.md](faq.md) — 30-second answers to common questions, including conflict-resolution recipes for cron / unattended use.

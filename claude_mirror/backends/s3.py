@@ -32,7 +32,7 @@ from typing import Any, Callable, Optional
 
 from ..config import Config
 from . import BackendError, ErrorClass, StorageBackend
-from ._util import write_token_secure
+from ._util import validate_server_rel_path, write_token_secure
 
 
 # Multipart-upload threshold. boto3's TransferConfig defaults to 8 MiB; we
@@ -344,6 +344,15 @@ class S3Backend(StorageBackend):
                     continue
                 if excluded and any(c in excluded for c in rel.split("/")):
                     continue
+                # Defence-in-depth: an S3 bucket may legitimately
+                # contain a key like ``../escape`` (S3 has no path
+                # constraints — every key is just a string). The
+                # downstream sync engine relies on `_safe_join` to
+                # convert these into local paths, but a future caller
+                # that skips the safe-join would compose the project
+                # root with the relative path and read outside the
+                # tree. Reject at the backend boundary.
+                validate_server_rel_path(rel, backend_name=self.backend_name)
                 etag = (obj.get("ETag", "") or "").strip('"')
                 size = int(obj.get("Size", 0) or 0)
                 results.append({

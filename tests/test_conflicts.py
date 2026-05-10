@@ -268,6 +268,71 @@ def test_two_projects_have_disjoint_envelope_dirs(tmp_path: Path):
     assert e1 != e2
 
 
+# ─── M2: envelope dir mode is 0o700 ────────────────────────────────────────────
+
+
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="Windows chmod is a no-op for non-readonly bits — same skip "
+    "convention as the SFTP-deep test suite. The mkdir(mode=0o700) call "
+    "still happens; we just can't verify the bits via stat().",
+)
+def test_envelope_dir_is_chmod_0o700_on_creation(tmp_path: Path):
+    """The envelope dir holds project-internal rel-paths in its
+    filenames (e.g. `memory__keys__deploy.md.merge.json`). A
+    world-readable directory listing would expose those paths to any
+    other local user. Same hygiene as ~/.ssh."""
+    project = tmp_path / "project-mode"
+    d = envelope_dir(project)
+    actual_mode = d.stat().st_mode & 0o777
+    assert actual_mode == 0o700, (
+        f"envelope_dir created with mode {oct(actual_mode)}; expected 0o700"
+    )
+
+
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="POSIX-only mode test (see test above).",
+)
+def test_envelope_dir_chmod_tightens_permissive_existing_dir(tmp_path: Path):
+    """If the dir was created earlier (e.g. by a prior version of
+    claude-mirror with the default umask 0o022 → mode 0o755),
+    `envelope_dir(...)` MUST tighten it to 0o700 on next call."""
+    import os as _os
+
+    # Construct the path manually with mode 0o755 to simulate an old
+    # version having created it before the fix.
+    state = tmp_path / "_state"
+    state.mkdir()
+    monkeypatch_env = state
+    import os
+    os.environ["XDG_STATE_HOME"] = str(monkeypatch_env)
+    try:
+        target = state / "claude-mirror" / "_proj_slug" / "conflicts"
+        target.mkdir(parents=True)
+        _os.chmod(target, 0o755)
+        assert (target.stat().st_mode & 0o777) == 0o755
+
+        # Now invoke envelope_dir with a project path whose slug matches
+        # — easier to bypass: just call envelope_dir on a fresh path
+        # and verify post-call mode is 0o700.
+        project = tmp_path / "fresh-project"
+        d = envelope_dir(project)
+        # Verify the call's own dir is 0o700.
+        assert (d.stat().st_mode & 0o777) == 0o700
+
+        # Manually pre-create the EXACT path envelope_dir would target
+        # for `project` and chmod it permissive, then re-call.
+        _os.chmod(d, 0o755)
+        assert (d.stat().st_mode & 0o777) == 0o755
+        # Re-call must tighten.
+        d2 = envelope_dir(project)
+        assert d == d2
+        assert (d2.stat().st_mode & 0o777) == 0o700
+    finally:
+        os.environ.pop("XDG_STATE_HOME", None)
+
+
 # ─── list_envelopes ──────────────────────────────────────────────────────────
 
 

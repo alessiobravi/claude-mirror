@@ -111,19 +111,19 @@ class TestDiscordPayload:
 
     def test_delete_uses_red_color(self) -> None:
         event = _make_event(action="delete", files=["x.md"])
-        notifier = DiscordWebhookNotifier("https://example.com/hook")
+        notifier = DiscordWebhookNotifier("https://discord.com/api/webhooks/123/abc")
         payload = notifier._format_event(event)
         assert payload["embeds"][0]["color"] == 0xEF4444
 
     def test_pull_and_sync_use_blue_color(self) -> None:
         for action in ("pull", "sync"):
-            notifier = DiscordWebhookNotifier("https://example.com/hook")
+            notifier = DiscordWebhookNotifier("https://discord.com/api/webhooks/123/abc")
             payload = notifier._format_event(_make_event(action=action))
             assert payload["embeds"][0]["color"] == 0x3B82F6
 
     def test_file_list_cap_at_ten_with_and_n_more(self) -> None:
         files = [f"file{i}.md" for i in range(12)]
-        notifier = DiscordWebhookNotifier("https://example.com/hook")
+        notifier = DiscordWebhookNotifier("https://discord.com/api/webhooks/123/abc")
         payload = notifier._format_event(_make_event(files=files))
         files_block = payload["embeds"][0]["fields"][-1]["value"]
         # First ten visible.
@@ -135,7 +135,7 @@ class TestDiscordPayload:
         assert "and 2 more" in files_block
 
     def test_empty_files_renders_no_files_marker(self) -> None:
-        notifier = DiscordWebhookNotifier("https://example.com/hook")
+        notifier = DiscordWebhookNotifier("https://discord.com/api/webhooks/123/abc")
         payload = notifier._format_event(_make_event(files=[]))
         assert payload["embeds"][0]["fields"][-1]["value"] == "(no files)"
 
@@ -167,7 +167,7 @@ class TestTeamsPayload:
 
     def test_file_list_cap_at_ten_with_and_n_more(self) -> None:
         files = [f"deep/path/file{i}.md" for i in range(12)]
-        notifier = TeamsWebhookNotifier("https://example.com/hook")
+        notifier = TeamsWebhookNotifier("https://contoso.webhook.office.com/abc")
         payload = notifier._format_event(_make_event(files=files))
         text = payload["sections"][0]["text"]
         for i in range(10):
@@ -176,7 +176,7 @@ class TestTeamsPayload:
         assert "and 2 more" in text
 
     def test_delete_uses_red_theme_color(self) -> None:
-        notifier = TeamsWebhookNotifier("https://example.com/hook")
+        notifier = TeamsWebhookNotifier("https://contoso.webhook.office.com/abc")
         payload = notifier._format_event(_make_event(action="delete"))
         assert payload["themeColor"] == "ef4444"
 
@@ -271,7 +271,7 @@ class TestPostJsonTransport:
     def test_url_error_returns_false_no_exception_no_warn_log(
         self, caplog: pytest.LogCaptureFixture,
     ) -> None:
-        notifier = DiscordWebhookNotifier("https://example.com/hook")
+        notifier = DiscordWebhookNotifier("https://discord.com/api/webhooks/123/abc")
         with caplog.at_level(logging.DEBUG, logger="claude_mirror.notifications.webhooks"):
             with patch(
                 "claude_mirror.notifications.webhooks.urlopen",
@@ -287,7 +287,7 @@ class TestPostJsonTransport:
     def test_403_response_returns_false_no_exception(
         self, caplog: pytest.LogCaptureFixture,
     ) -> None:
-        notifier = TeamsWebhookNotifier("https://example.com/hook")
+        notifier = TeamsWebhookNotifier("https://contoso.webhook.office.com/abc")
         # HTTPError is what urllib raises for non-2xx. Wrap construction +
         # close in a try/finally so the underlying tempfile (fp) doesn't
         # leak a ResourceWarning if pytest sweeps unraisable exceptions.
@@ -313,7 +313,7 @@ class TestPostJsonTransport:
             err.close()
 
     def test_500_response_returns_false(self) -> None:
-        notifier = TeamsWebhookNotifier("https://example.com/hook")
+        notifier = TeamsWebhookNotifier("https://contoso.webhook.office.com/abc")
         err = HTTPError(
             url="https://example.com/hook",
             code=500,
@@ -340,7 +340,7 @@ class TestPostJsonTransport:
         mock_urlopen.assert_not_called()
 
     def test_non_serialisable_payload_returns_false(self) -> None:
-        notifier = DiscordWebhookNotifier("https://example.com/hook")
+        notifier = DiscordWebhookNotifier("https://discord.com/api/webhooks/123/abc")
 
         class NotJsonable:
             pass
@@ -512,9 +512,9 @@ class TestEngineDispatch:
             project_path=str(tmp_path),
             drive_folder_id="x",
             discord_enabled=True,
-            discord_webhook_url="https://discord.example/hook",
+            discord_webhook_url="https://discord.com/api/webhooks/hook",
             teams_enabled=True,
-            teams_webhook_url="https://teams.example/hook",
+            teams_webhook_url="https://contoso.webhook.office.com/hook",
             webhook_enabled=True,
             webhook_url="https://n8n.example/hook",
         )

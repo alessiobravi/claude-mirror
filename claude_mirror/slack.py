@@ -7,6 +7,7 @@ from typing import Any, Optional
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
+from ._webhook_url import validate_slack_webhook_url
 from .config import Config
 from .events import SyncEvent
 
@@ -403,7 +404,21 @@ def _build_failure_alert_blocks(
 
 
 def _send_webhook(url: str, payload: dict[str, Any]) -> None:
-    """Fire-and-forget POST to a Slack incoming webhook URL."""
+    """Fire-and-forget POST to a Slack incoming webhook URL.
+
+    Validates the URL's scheme + host before reaching urllib so a
+    misconfigured project YAML can't turn this into a local-file read
+    (`file://...`) or an internal-endpoint probe
+    (`http://169.254.169.254/...`). Validation failures are swallowed
+    silently here — the contract is best-effort delivery, and
+    `Config.__post_init__` already raises loudly on bad URLs at
+    config-load time, so by the time we reach send the URL has already
+    been validated once.
+    """
+    try:
+        validate_slack_webhook_url(url)
+    except ValueError:
+        return
     data = json.dumps(payload).encode("utf-8")
     req = Request(url, data=data, headers={"Content-Type": "application/json"})
     try:

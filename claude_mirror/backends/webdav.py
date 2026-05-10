@@ -15,7 +15,7 @@ from requests.auth import HTTPBasicAuth
 from ..config import Config
 from ..throttle import get_throttle
 from . import BackendError, ErrorClass, StorageBackend
-from ._util import write_token_secure
+from ._util import validate_server_rel_path, write_token_secure
 
 # WebDAV XML namespaces
 DAV_NS = "DAV:"
@@ -299,7 +299,15 @@ class WebDAVBackend(StorageBackend):
         return base
 
     def _rel_from_url(self, url: str) -> str:
-        """Extract relative path from a full URL or href."""
+        """Extract relative path from a full URL or href.
+
+        Used both for stripping the project-root prefix and for sub-
+        folder iteration. Path-traversal validation is applied per-entry
+        at the listing site (`_parse_file_list`, `_list_recursive_manual`)
+        on the FINAL relative path that gets inserted into the result
+        dict — that's where a hostile server's `..`-bearing href can
+        actually escape the project root.
+        """
         base = self._base_url()
         # href may be URL-encoded path without host
         from urllib.parse import urlparse
@@ -468,6 +476,18 @@ class WebDAVBackend(StorageBackend):
             checksum = self._get_oc_checksum(response)
             hash_value = checksum or etag
 
+            # Defence-in-depth: a hostile or buggy server can return a
+            # `..`-bearing href, an absolute path, or a NUL byte that
+            # would slip through `_safe_join` only because the engine
+            # currently re-validates at the boundary. Reject at the
+            # backend so a future caller that forgets to re-validate
+            # can't be tricked into reading outside the project root.
+            # Raises BackendError(FILE_REJECTED) on rejection — bubbles
+            # up to the engine, which surfaces it as the entire listing
+            # being unsafe (better fail-loud than silently drop entries
+            # that may have been the legitimate ones the user wanted).
+            validate_server_rel_path(rel, backend_name=self.backend_name)
+
             results.append({
                 "id": rel,
                 "name": Path(rel).name,
@@ -527,6 +547,9 @@ class WebDAVBackend(StorageBackend):
                 etag = self._get_etag(response)
                 checksum = self._get_oc_checksum(response)
                 hash_value = checksum or etag
+
+                # Defence-in-depth — see `_parse_file_list` above.
+                validate_server_rel_path(file_rel, backend_name=self.backend_name)
 
                 results.append({
                     "id": file_rel,

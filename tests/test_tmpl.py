@@ -72,14 +72,14 @@ class TestNoTemplateBackCompat:
     backwards-compatibility."""
 
     def test_discord_default_when_no_templates(self) -> None:
-        notifier = DiscordWebhookNotifier("https://discord.example/hook")
+        notifier = DiscordWebhookNotifier("https://discord.com/api/webhooks/hook")
         payload = notifier._format_event(_make_event(files=["x.md"]))
         # Built-in Discord title.
         assert "alice@laptop" in payload["embeds"][0]["title"]
         assert "pushed 1 file" in payload["embeds"][0]["title"]
 
     def test_teams_default_when_no_templates(self) -> None:
-        notifier = TeamsWebhookNotifier("https://teams.example/hook")
+        notifier = TeamsWebhookNotifier("https://contoso.webhook.office.com/hook")
         payload = notifier._format_event(_make_event(files=["x.md"]))
         # Built-in Teams summary.
         assert "alice@laptop" in payload["summary"]
@@ -101,7 +101,7 @@ class TestNoTemplateBackCompat:
 class TestDiscordTemplate:
     def test_push_template_replaces_embed_title(self) -> None:
         notifier = DiscordWebhookNotifier(
-            "https://discord.example/hook",
+            "https://discord.com/api/webhooks/hook",
             templates={
                 "push": "**{user}** pushed {n_files} files to **{project}**",
             },
@@ -118,7 +118,7 @@ class TestDiscordTemplate:
     def test_action_not_in_template_falls_back_to_default(self) -> None:
         # Only `push` templated; a `sync` event fires.
         notifier = DiscordWebhookNotifier(
-            "https://discord.example/hook",
+            "https://discord.com/api/webhooks/hook",
             templates={"push": "PUSH: {user}"},
         )
         payload = notifier._format_event(_make_event(action="sync"))
@@ -131,7 +131,7 @@ class TestDiscordTemplate:
         self, capsys: pytest.CaptureFixture,
     ) -> None:
         notifier = DiscordWebhookNotifier(
-            "https://discord.example/hook",
+            "https://discord.com/api/webhooks/hook",
             templates={"push": ""},
         )
         payload = notifier._format_event(_make_event())
@@ -143,7 +143,7 @@ class TestDiscordTemplate:
         self, capsys: pytest.CaptureFixture,
     ) -> None:
         notifier = DiscordWebhookNotifier(
-            "https://discord.example/hook",
+            "https://discord.com/api/webhooks/hook",
             templates={"push": "weird {nonexistent} field"},
         )
         payload = notifier._format_event(_make_event())
@@ -161,7 +161,7 @@ class TestDiscordTemplate:
 class TestTeamsTemplate:
     def test_push_template_carries_through_to_activity_subtitle(self) -> None:
         notifier = TeamsWebhookNotifier(
-            "https://teams.example/hook",
+            "https://contoso.webhook.office.com/hook",
             templates={"push": "{user}@{machine} pushed {n_files} file(s)"},
         )
         payload = notifier._format_event(_make_event(files=["x.md", "y.md"]))
@@ -178,7 +178,7 @@ class TestTeamsTemplate:
 
     def test_template_does_not_change_theme_color_or_facts(self) -> None:
         notifier = TeamsWebhookNotifier(
-            "https://teams.example/hook",
+            "https://contoso.webhook.office.com/hook",
             templates={"delete": "{user} deleted {n_files} files"},
         )
         payload = notifier._format_event(_make_event(action="delete"))
@@ -309,7 +309,7 @@ class TestSlackTemplate:
             project_path=str(tmp_path),
             drive_folder_id="x",
             slack_enabled=True,
-            slack_webhook_url="https://hooks.slack.example/services/aaa/bbb/ccc",
+            slack_webhook_url="https://hooks.slack.com/services/aaa/bbb/ccc",
             slack_template_format=slack_template_format,
         )
 
@@ -359,7 +359,7 @@ class TestSlackTemplate:
 class TestPlaceholderVocabulary:
     def test_n_files_first_file_file_list_all_render(self) -> None:
         notifier = DiscordWebhookNotifier(
-            "https://discord.example/hook",
+            "https://discord.com/api/webhooks/hook",
             templates={
                 "push": "{n_files} | {first_file} | {file_list}",
             },
@@ -369,7 +369,7 @@ class TestPlaceholderVocabulary:
 
     def test_first_file_empty_when_no_files(self) -> None:
         notifier = DiscordWebhookNotifier(
-            "https://discord.example/hook",
+            "https://discord.com/api/webhooks/hook",
             templates={"push": "first=[{first_file}] count={n_files}"},
         )
         payload = notifier._format_event(_make_event(files=[]))
@@ -395,7 +395,7 @@ class TestPlaceholderVocabulary:
 
     def test_action_placeholder_resolves(self) -> None:
         notifier = TeamsWebhookNotifier(
-            "https://teams.example/hook",
+            "https://contoso.webhook.office.com/hook",
             templates={"delete": "[{action}] {user} -> {n_files} files"},
         )
         payload = notifier._format_event(

@@ -383,3 +383,102 @@ def test_install_completion_does_not_set_activation_pending_on_unsupported_shell
     install_mod._completion_activation_pending = False
     install_completion()
     assert install_mod._completion_activation_pending is False
+
+
+# ── M3: shlex / PowerShell quoting of `_find_binary()` paths ───────────────────
+
+# `shutil.which("claude-mirror")` can return paths with spaces on
+# Windows (`C:\Program Files\Python311\Scripts\claude-mirror.exe`),
+# inside a custom pyenv install (`/Users/Bob with space/.pyenv/...`),
+# or anywhere the user has put their venv. Without proper quoting the
+# emitted shell snippet would word-split into a broken eval invocation.
+# These tests lock in the quoting per-shell.
+
+
+def test_zsh_eval_line_quotes_path_with_spaces(tmp_path, monkeypatch):
+    """POSIX shells: shlex.quote wraps a path with spaces in single
+    quotes so command substitution doesn't word-split."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    monkeypatch.setattr("claude_mirror.install._confirm", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        "claude_mirror.install._find_binary",
+        lambda: "/path with spaces/claude-mirror",
+    )
+
+    install_completion()
+
+    rc = home / ".zshrc"
+    content = rc.read_text()
+    # shlex.quote produces single-quoted form for paths with spaces.
+    assert "'/path with spaces/claude-mirror'" in content
+    # Old buggy form (bare path) MUST NOT appear unquoted.
+    assert " /path with spaces/claude-mirror " not in content
+
+
+def test_zsh_eval_line_no_extra_quoting_for_simple_path(tmp_path, monkeypatch):
+    """shlex.quote leaves shell-safe paths unwrapped — verify the
+    legacy path (`claude-mirror`) doesn't suddenly get extra quotes
+    that would break someone's hand-edited rc file."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    monkeypatch.setattr("claude_mirror.install._confirm", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        "claude_mirror.install._find_binary", lambda: "claude-mirror",
+    )
+
+    install_completion()
+
+    rc = home / ".zshrc"
+    content = rc.read_text()
+    # The simple path needs no quoting → bare token in the eval line.
+    assert 'eval "$(claude-mirror completion zsh)"' in content
+
+
+def test_powershell_invoke_quotes_path_with_spaces(tmp_path, monkeypatch):
+    """PowerShell: paths get single-quoted with internal apostrophes
+    doubled (PowerShell's literal-string convention)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr("claude_mirror.install.platform.system", lambda: "Darwin")
+    monkeypatch.setenv("SHELL", "/usr/local/bin/pwsh")
+    monkeypatch.setattr("claude_mirror.install._confirm", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        "claude_mirror.install._find_binary",
+        lambda: "/path with spaces/claude-mirror",
+    )
+
+    install_completion()
+
+    target = home / ".config" / "powershell" / "profile.ps1"
+    content = target.read_text()
+    # Single-quoted form is the PowerShell-safe transport.
+    assert "'/path with spaces/claude-mirror'" in content
+
+
+def test_powershell_invoke_doubles_internal_apostrophes(tmp_path, monkeypatch):
+    """PowerShell single-quote escape is doubling: `don't` → `don''t`.
+    A path containing an apostrophe must be encoded that way so the
+    PowerShell parser doesn't terminate the string early."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr("claude_mirror.install.platform.system", lambda: "Darwin")
+    monkeypatch.setenv("SHELL", "/usr/local/bin/pwsh")
+    monkeypatch.setattr("claude_mirror.install._confirm", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        "claude_mirror.install._find_binary",
+        lambda: "/Users/o'malley/bin/claude-mirror",
+    )
+
+    install_completion()
+
+    target = home / ".config" / "powershell" / "profile.ps1"
+    content = target.read_text()
+    # Internal apostrophes must be doubled.
+    assert "'/Users/o''malley/bin/claude-mirror'" in content

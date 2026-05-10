@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import platform
+import shlex
 import shutil
 import os
 import subprocess
@@ -18,6 +19,22 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 import click
+
+
+def _ps_single_quote(value: str) -> str:
+    """Quote a string for safe inclusion inside PowerShell single quotes.
+
+    PowerShell single-quote rules: the contents are treated literally
+    (no variable expansion, no backtick escapes); the only special
+    character is a single quote itself, which is escaped by doubling
+    (`'don''t'` → ``don't``). That makes single-quoting the safest
+    transport for arbitrary filesystem paths — including ones with
+    spaces, parentheses, or apostrophes in them.
+
+    Returns the value already wrapped in single quotes so callers can
+    drop it straight into a PowerShell expression.
+    """
+    return "'" + value.replace("'", "''") + "'"
 
 # ── well-known paths ───────────────────────────────────────────────────────────
 
@@ -556,8 +573,15 @@ def install_completion() -> None:
     # idioms. The marker block is identical in shape — same begin/end
     # tokens — so `_replace_completion_block` reuses cleanly.
     if shell == "powershell":
+        # Single-quote the binary path so spaces / parens / apostrophes
+        # in `C:\Program Files\Python311\Scripts\claude-mirror.exe`
+        # don't break the PowerShell expression. The `& 'path' arg`
+        # form is the canonical way to invoke a path-quoted executable
+        # in PowerShell — passing the path bare would word-split on
+        # whitespace and try to run the first token as a command.
+        binary_quoted = _ps_single_quote(_find_binary())
         invoke_line = (
-            f"Invoke-Expression (& {_find_binary()} completion powershell | Out-String)"
+            f"Invoke-Expression (& {binary_quoted} completion powershell | Out-String)"
         )
         block = "\n".join([_COMPLETION_MARK_BEGIN, invoke_line, _COMPLETION_MARK_END])
 
@@ -589,8 +613,12 @@ def install_completion() -> None:
         return
 
     # zsh / bash — eval the dynamic completion script from rc, wrapped
-    # in markers so we can find / remove it cleanly.
-    eval_line = f'eval "$({_find_binary()} completion {shell})"'
+    # in markers so we can find / remove it cleanly. Quote the binary
+    # path via shlex.quote so a path with spaces (`/Library/Python
+    # Frameworks/.../claude-mirror`, `/Users/Bob with space/.../bin/
+    # claude-mirror`) doesn't word-split into a broken `eval` invocation
+    # at command-substitution time.
+    eval_line = f'eval "$({shlex.quote(_find_binary())} completion {shell})"'
     block = "\n".join([_COMPLETION_MARK_BEGIN, eval_line, _COMPLETION_MARK_END])
 
     existing = rc.read_text() if rc.exists() else ""

@@ -712,3 +712,81 @@ def test_no_path_style_default_addressing_is_auto(make_config, config_dir):
     boto_cfg = captured["kwargs"]["config"]
     addr = getattr(boto_cfg, "s3", {}).get("addressing_style", "")
     assert addr == "auto"
+
+
+# ─── Server-returned key validation (H6) ───────────────────────────────────────
+
+# S3 has no path constraints — every key is just a string. A bucket may
+# legitimately contain a key like ``../escape`` (a previous tenant's
+# misconfigured uploader, or a deliberately hostile setup). The
+# downstream sync engine relies on `_safe_join` to convert keys into
+# local paths. To defend against a future caller that bypasses the
+# safe-join, the backend rejects the suspicious key shapes at the
+# listing boundary.
+
+
+class _FakePaginatorWithKeys:
+    """Like _FakePaginator but lets the test inject arbitrary key shapes."""
+
+    def __init__(self, keys: list[str]) -> None:
+        self._keys = keys
+
+    def paginate(self, **kwargs: Any) -> Any:
+        contents = [
+            {"Key": k, "Size": 1, "ETag": '"x"'} for k in self._keys
+        ]
+        yield {"Contents": contents, "CommonPrefixes": []}
+
+
+def _wire_with_keys(
+    backend: S3Backend, keys: list[str],
+) -> None:
+    """Bypass _get_client with a tiny mock that returns the given keys
+    for any list_objects_v2 paginator call."""
+    client = MagicMock()
+    client.get_paginator.return_value = _FakePaginatorWithKeys(keys)
+    backend._client = client
+
+
+def test_list_rejects_parent_directory_traversal_key(make_config, config_dir):
+    """A bucket key like `myproject/../../etc/passwd` MUST be rejected
+    at the backend boundary."""
+    backend = _make_backend(make_config, config_dir, s3_prefix="myproject")
+    _wire_with_keys(backend, ["myproject/../../etc/passwd"])
+    with pytest.raises(BackendError) as exc_info:
+        backend.list_files_recursive("myproject/")
+    assert exc_info.value.error_class == ErrorClass.FILE_REJECTED
+
+
+def test_list_rejects_nul_byte_in_key(make_config, config_dir):
+    """A NUL byte in an S3 key would let some downstream path code
+    truncate the rest — reject at the boundary."""
+    backend = _make_backend(make_config, config_dir, s3_prefix="myproject")
+    _wire_with_keys(backend, ["myproject/foo\x00bar.md"])
+    with pytest.raises(BackendError) as exc_info:
+        backend.list_files_recursive("myproject/")
+    assert exc_info.value.error_class == ErrorClass.FILE_REJECTED
+
+
+def test_list_rejects_windows_drive_prefix(make_config, config_dir):
+    """A Windows drive-letter prefix would slip past PurePath joins on
+    that platform — reject server-returned keys carrying one."""
+    backend = _make_backend(make_config, config_dir, s3_prefix="myproject")
+    # Strip-prefix gives `C:Windows/system32/config` — the C: prefix
+    # triggers the drive-letter rejection.
+    _wire_with_keys(backend, ["myproject/C:Windows/system32/config"])
+    with pytest.raises(BackendError) as exc_info:
+        backend.list_files_recursive("myproject/")
+    assert exc_info.value.error_class == ErrorClass.FILE_REJECTED
+
+
+def test_list_accepts_normal_keys(make_config, config_dir):
+    """Sanity check: a normal key shape is NOT rejected."""
+    backend = _make_backend(make_config, config_dir, s3_prefix="myproject")
+    _wire_with_keys(
+        backend,
+        ["myproject/CLAUDE.md", "myproject/memory/notes.md"],
+    )
+    files = backend.list_files_recursive("myproject/")
+    rels = sorted(f["relative_path"] for f in files)
+    assert rels == ["CLAUDE.md", "memory/notes.md"]

@@ -123,3 +123,103 @@ def test_upload_file_uses_PUT(make_config, config_dir, project_dir):
     assert len(responses.calls) == 1
     assert responses.calls[0].request.method == "PUT"
     assert responses.calls[0].request.url == expected_url
+
+
+# ─── 6. server-returned path validation (H6) ───────────────────────────────────
+
+# A hostile or buggy WebDAV server can return `<href>` values that
+# contain path traversal segments, absolute paths, NUL bytes, or
+# similar shapes that would let a downstream caller read or write
+# outside the project root. The backend rejects them at the boundary
+# via `validate_server_rel_path` so a future caller that forgets to
+# re-validate after `_safe_join` cannot be tricked. Each rejection
+# raises BackendError(FILE_REJECTED) — bubbles up as the entire
+# listing being unsafe, NOT as a silent skip.
+
+import pytest as _pytest  # local alias to avoid clashing with the module-level import
+from claude_mirror.backends import BackendError, ErrorClass
+
+
+def _propfind_with_href(base: str, hrefs: list[str]) -> str:
+    """Build a minimal multistatus PROPFIND response listing each href
+    as a non-collection resource."""
+    parts = []
+    for href in hrefs:
+        parts.append(
+            f"<d:response>"
+            f"  <d:href>{href}</d:href>"
+            f"  <d:propstat>"
+            f"    <d:prop>"
+            f"      <d:resourcetype/>"
+            f"      <d:getetag>\"abc\"</d:getetag>"
+            f"    </d:prop>"
+            f"    <d:status>HTTP/1.1 200 OK</d:status>"
+            f"  </d:propstat>"
+            f"</d:response>"
+        )
+    return (
+        '<?xml version="1.0"?>'
+        '<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">'
+        + "".join(parts)
+        + "</d:multistatus>"
+    )
+
+
+@responses.activate
+def test_listing_rejects_parent_directory_traversal(make_config, config_dir):
+    """Server returns `../../etc/passwd` → backend raises FILE_REJECTED."""
+    base = "https://dav.example.com/remote.php/dav/files/u/test"
+    backend = _make_backend(make_config, config_dir, url=base)
+    import requests
+    backend._session = requests.Session()
+
+    body = _propfind_with_href(
+        base, [f"{base}/../../etc/passwd"],
+    )
+    responses.add(
+        responses.Response(method="PROPFIND", url=base, status=207, body=body),
+    )
+    with _pytest.raises(BackendError) as exc_info:
+        backend.list_files_recursive("")
+    assert exc_info.value.error_class == ErrorClass.FILE_REJECTED
+
+
+@responses.activate
+def test_listing_rejects_absolute_path(make_config, config_dir):
+    """Server returns an href that decodes to a leading-slash absolute
+    path → FILE_REJECTED."""
+    base = "https://dav.example.com/remote.php/dav/files/u/test"
+    backend = _make_backend(make_config, config_dir, url=base)
+    import requests
+    backend._session = requests.Session()
+
+    # The href doesn't start with the configured base so _rel_from_url
+    # falls through to `path.lstrip("/")`. We use a path that starts
+    # with `/` and DOES NOT share the base prefix so the backend ends
+    # up with `/etc/passwd` to validate, which then fails the absolute-
+    # path check after lstrip... actually lstrip removes leading /, so
+    # we need to use a path that explicitly contains `..` to hit the
+    # absolute-shape rejection. Use a `\` (Windows-style) leader.
+    body = _propfind_with_href(base, ["\\windows\\system32\\config"])
+    responses.add(
+        responses.Response(method="PROPFIND", url=base, status=207, body=body),
+    )
+    with _pytest.raises(BackendError) as exc_info:
+        backend.list_files_recursive("")
+    assert exc_info.value.error_class == ErrorClass.FILE_REJECTED
+
+
+@responses.activate
+def test_listing_rejects_normal_path_succeeds(make_config, config_dir):
+    """Sanity check: a server returning a normal path is NOT rejected."""
+    base = "https://dav.example.com/remote.php/dav/files/u/test"
+    backend = _make_backend(make_config, config_dir, url=base)
+    import requests
+    backend._session = requests.Session()
+
+    body = _propfind_with_href(base, [f"{base}/memory/notes.md"])
+    responses.add(
+        responses.Response(method="PROPFIND", url=base, status=207, body=body),
+    )
+    files = backend.list_files_recursive("")
+    assert any(f["relative_path"] == "memory/notes.md" for f in files)

@@ -31,6 +31,11 @@ from typing import Any, Optional, Union
 from urllib.error import URLError, HTTPError
 from urllib.request import Request, urlopen
 
+from .._webhook_url import (
+    validate_discord_webhook_url,
+    validate_generic_webhook_url,
+    validate_teams_webhook_url,
+)
 from ..events import SyncEvent
 
 
@@ -247,6 +252,20 @@ class WebhookNotifier(ABC):
         """Friendly backend name for log lines."""
         return self.BACKEND_LABEL or type(self).__name__
 
+    def _validate_url(self, url: str) -> None:
+        """Backend-specific URL validation hook.
+
+        Default implementation enforces the generic-webhook rule
+        (https-only, no host gate). Subclasses override to assert
+        backend-specific host allow-lists (Slack ⇒ ``hooks.slack.com``,
+        Discord ⇒ ``discord.com``, Teams ⇒ ``*.webhook.office.com``).
+
+        Raises :class:`ValueError` on rejection; ``post_json`` catches
+        and converts it into a ``False`` return so a hostile / malformed
+        URL never breaks the calling sync.
+        """
+        validate_generic_webhook_url(url)
+
     def post_json(self, payload: dict[str, Any], *, timeout_seconds: float = 5.0) -> bool:
         """POST ``payload`` as JSON to ``self.webhook_url``.
 
@@ -256,6 +275,11 @@ class WebhookNotifier(ABC):
         spam every sync command. No exception escapes this method.
         """
         if not self.webhook_url:
+            return False
+        try:
+            self._validate_url(self.webhook_url)
+        except ValueError as e:
+            logger.debug("webhook URL rejected by validator: %s", e)
             return False
         try:
             data = json.dumps(payload).encode("utf-8")
@@ -330,6 +354,9 @@ class DiscordWebhookNotifier(WebhookNotifier):
 
     BACKEND_LABEL = "Discord"
 
+    def _validate_url(self, url: str) -> None:
+        validate_discord_webhook_url(url)
+
     def _format_event(self, event: SyncEvent) -> dict[str, Any]:
         _hex, decimal_color = _color_for(event.action)
         file_count = len(event.files)
@@ -395,6 +422,9 @@ class TeamsWebhookNotifier(WebhookNotifier):
     """
 
     BACKEND_LABEL = "Teams"
+
+    def _validate_url(self, url: str) -> None:
+        validate_teams_webhook_url(url)
 
     def _format_event(self, event: SyncEvent) -> dict[str, Any]:
         hex_color, _decimal = _color_for(event.action)

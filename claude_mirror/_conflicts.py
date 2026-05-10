@@ -155,9 +155,26 @@ def envelope_dir(project_path: Path) -> Path:
     Created on demand (mkdir parents=True, exist_ok=True) so callers
     don't have to guard the first-use path. Returning the Path object
     rather than a string mirrors `manifest.py`'s convention.
+
+    Permissions: the conflicts/ dir gets mode 0o700 (owner-only RWX).
+    The envelope FILES inside are already 0o600 (good), but a
+    world-readable directory listing would expose project-internal
+    rel-path filenames like `memory__keys__deploy.md.merge.json` to
+    any other local user. Same hygiene as `~/.ssh`. We `chmod`
+    unconditionally after `mkdir(exist_ok=True)` so dirs created by an
+    older version (or with a permissive umask) get tightened on first
+    use under the new code.
     """
     target = _state_root() / "claude-mirror" / _project_slug(project_path) / "conflicts"
-    target.mkdir(parents=True, exist_ok=True)
+    target.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(target, 0o700)
+    except OSError:
+        # Windows + a few network filesystems treat chmod as a no-op
+        # for non-readonly bits; the mkdir mode is the best we can do
+        # there. Don't crash on a chmod failure — the envelopes still
+        # work, they're just not as locked-down as on POSIX.
+        pass
     return target
 
 

@@ -108,7 +108,7 @@ class TestRouteValidation:
                 project_path=str(tmp_path),
                 drive_folder_id="x",
                 teams_routes=[{
-                    "webhook_url": "https://example.com/hook",
+                    "webhook_url": "https://contoso.webhook.office.com/abc",
                     "on": ["push", "frobnicate"],  # not a valid action
                 }],
             )
@@ -223,8 +223,8 @@ class TestLegacyVsListPrecedence:
             project_path=str(tmp_path),
             drive_folder_id="x",
             discord_enabled=True,
-            discord_webhook_url="https://discord.example/legacy",
-            discord_routes=[{"webhook_url": "https://discord.example/new"}],
+            discord_webhook_url="https://discord.com/api/webhooks/legacy",
+            discord_routes=[{"webhook_url": "https://discord.com/api/webhooks/new"}],
         )
         assert cfg.has_legacy_routes_conflict("discord") is True
         # Other backends are unconfigured so don't flag.
@@ -298,14 +298,14 @@ class TestEngineDispatch:
             project_path=str(tmp_path),
             drive_folder_id="x",
             discord_enabled=True,
-            discord_webhook_url="https://discord.example/legacy",
+            discord_webhook_url="https://discord.com/api/webhooks/legacy",
         )
         stub = _stub_engine(cfg)
         with patch(
             "claude_mirror.notifications.webhooks.DiscordWebhookNotifier"
         ) as MockDiscord:
             stub._dispatch_extra_webhooks(_make_event(action="push"))
-        MockDiscord.assert_called_once_with("https://discord.example/legacy", templates=None)
+        MockDiscord.assert_called_once_with("https://discord.com/api/webhooks/legacy", templates=None)
         MockDiscord.return_value.notify.assert_called_once()
 
     def test_three_slack_routes_one_event_triggers_two(
@@ -363,12 +363,12 @@ class TestEngineDispatch:
             project_path=str(tmp_path),
             drive_folder_id="x",
             discord_routes=[{
-                "webhook_url": "https://discord.example/r1",
+                "webhook_url": "https://discord.com/api/webhooks/r1",
                 "on": ["push"],
                 "paths": ["**/*"],
             }],
             teams_routes=[{
-                "webhook_url": "https://teams.example/r1",
+                "webhook_url": "https://contoso.webhook.office.com/r1",
                 "on": ["push"],
                 "paths": ["**/*"],
             }],
@@ -382,8 +382,8 @@ class TestEngineDispatch:
             "claude_mirror.notifications.webhooks.GenericWebhookNotifier"
         ) as MockGeneric:
             stub._dispatch_extra_webhooks(_make_event(action="push"))
-        MockDiscord.assert_called_once_with("https://discord.example/r1", templates=None)
-        MockTeams.assert_called_once_with("https://teams.example/r1", templates=None)
+        MockDiscord.assert_called_once_with("https://discord.com/api/webhooks/r1", templates=None)
+        MockTeams.assert_called_once_with("https://contoso.webhook.office.com/r1", templates=None)
         MockGeneric.assert_not_called()
 
     def test_per_route_paths_scopes_event_at_dispatch(
@@ -399,12 +399,12 @@ class TestEngineDispatch:
             drive_folder_id="x",
             discord_routes=[
                 {
-                    "webhook_url": "https://discord.example/memory",
+                    "webhook_url": "https://discord.com/api/webhooks/memory",
                     "on": ["push"],
                     "paths": ["memory/**"],
                 },
                 {
-                    "webhook_url": "https://discord.example/claude-md",
+                    "webhook_url": "https://discord.com/api/webhooks/claude-md",
                     "on": ["push"],
                     "paths": ["**/CLAUDE.md"],
                 },
@@ -423,8 +423,8 @@ class TestEngineDispatch:
         # Two notifiers built — one per route — each with the route URL.
         urls = [c.args[0] for c in MockDiscord.call_args_list]
         assert urls == [
-            "https://discord.example/memory",
-            "https://discord.example/claude-md",
+            "https://discord.com/api/webhooks/memory",
+            "https://discord.com/api/webhooks/claude-md",
         ]
         # Each notify() got a scoped event with the right file subset.
         notify_calls = MockDiscord.return_value.notify.call_args_list
@@ -461,7 +461,7 @@ class TestEngineDispatch:
             project_path=str(tmp_path),
             drive_folder_id="x",
             teams_routes=[{
-                "webhook_url": "https://teams.example/r1",
+                "webhook_url": "https://contoso.webhook.office.com/r1",
                 "on": ["delete"],  # only deletes
                 "paths": ["**/*"],
             }],
@@ -496,7 +496,7 @@ class TestRoutesYamlRoundTrip:
                 },
             ],
             discord_routes=[{
-                "webhook_url": "https://discord.example/dx",
+                "webhook_url": "https://discord.com/api/webhooks/dx",
                 "on": ["push"],
                 "paths": ["docs/**"],
             }],
@@ -511,7 +511,7 @@ class TestRoutesYamlRoundTrip:
         assert loaded.slack_routes[0]["paths"] == ["**/CLAUDE.md", "memory/**"]
         assert loaded.slack_routes[1]["on"] == ["delete"]
         assert loaded.discord_routes is not None
-        assert loaded.discord_routes[0]["webhook_url"] == "https://discord.example/dx"
+        assert loaded.discord_routes[0]["webhook_url"] == "https://discord.com/api/webhooks/dx"
 
     def test_yaml_with_minimal_route_fills_defaults_on_load(
         self, tmp_path: Path,
@@ -524,12 +524,12 @@ class TestRoutesYamlRoundTrip:
             "backend": "googledrive",
             "drive_folder_id": "x",
             "teams_routes": [
-                {"webhook_url": "https://teams.example/m1"},
+                {"webhook_url": "https://contoso.webhook.office.com/m1"},
             ],
         }))
         cfg = Config.load(str(cfg_path))
         assert cfg.teams_routes is not None
-        assert cfg.teams_routes[0]["webhook_url"] == "https://teams.example/m1"
+        assert cfg.teams_routes[0]["webhook_url"] == "https://contoso.webhook.office.com/m1"
         assert cfg.teams_routes[0]["on"] == ["push", "pull", "sync", "delete"]
         assert cfg.teams_routes[0]["paths"] == ["**/*"]
 
@@ -561,9 +561,9 @@ class TestEngineStartupInfo:
                 "paths": ["**/*"],
             }],
             discord_enabled=True,
-            discord_webhook_url="https://discord.example/legacy",
+            discord_webhook_url="https://discord.com/api/webhooks/legacy",
             discord_routes=[{
-                "webhook_url": "https://discord.example/new",
+                "webhook_url": "https://discord.com/api/webhooks/new",
             }],
         )
 

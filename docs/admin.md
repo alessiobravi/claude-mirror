@@ -633,6 +633,8 @@ pgrep -f "claude-mirror watch-all"      # PID(s) if running, exit 1 if not
 claude-mirror watch-all                 # foreground run; Ctrl+C to stop
 ```
 
+**Manifest cross-process safety:** the watcher daemon and a foreground `claude-mirror sync` both write the project manifest concurrently. `Manifest.save()` holds a sibling `<manifest>.lock` file under an OS-level exclusive lock (`fcntl.flock` on POSIX, `msvcrt.locking` on Windows) for the entire read-merge-write sequence, so disjoint entries from two processes both land in the final manifest — neither side silently clobbers the other's bytes via a tmp-path race. Each writer also uses a per-PID-per-thread tmp suffix as defence in depth.
+
 **Windows:** `watch-all` is fully supported on Windows since v0.5.59 — same one-process-per-config model as POSIX. Hot-reload uses a sentinel file (`%USERPROFILE%\.config\claude_mirror\.reload_signal`) the daemon polls every 2 seconds, so `claude-mirror reload` works the same way it does on macOS / Linux. The inbox file lock that serializes concurrent watcher threads is also cross-platform now (`msvcrt.locking` on Windows, `fcntl.flock` on POSIX), so the previous v0.5.54 caveat about Windows watchers losing lines under concurrent drains is closed — the strict TOCTOU regression test runs on every platform. To start it on login, use Task Scheduler:
 
 ```powershell
@@ -895,6 +897,8 @@ For broader selective-sync guidance — picking what to mirror in the first plac
 ## Notifications
 
 claude-mirror posts every sync event (push / pull / sync / delete) to one or more **chat / automation backends** AND surfaces native **desktop banners** on the running watcher's machine. All channels are **per-project**, **opt-in**, and **best-effort**: a notification failure (network error, bad URL, 4xx, 5xx, missing notification daemon) never blocks or fails a sync. The Slack integration is the most feature-rich (rich blocks, per-backend Tier 2 status, ACTION REQUIRED alerts on permanent failures); the other webhooks are simpler one-shot posts.
+
+**Webhook URL scheme + host validation.** Every webhook URL goes through a strict scheme + host gate at config-load time and again at send-time. Only `https://` URLs are accepted (no `file://`, no `http://`, no other schemes — these would let a misconfigured project YAML turn the notifier into a local-file read or an internal-endpoint probe like `http://169.254.169.254/...` for AWS metadata). Per backend, the host must match: Slack → `hooks.slack.com`; Discord → `discord.com` or `discordapp.com`; Microsoft Teams → `outlook.office.com` or any `*.webhook.office.com` per-tenant subdomain; the Generic webhook keeps the https-only rule but accepts any host (that is the whole point of "generic"). A bad URL surfaces during `claude-mirror init` as a clean `ValueError` naming the offending field and 1-indexed route position, NOT as a silent best-effort drop at first event-fire.
 
 Multiple channels can be enabled simultaneously on the same project — every enabled channel fires on every event, in sequence. One channel's failure does not stop the others.
 

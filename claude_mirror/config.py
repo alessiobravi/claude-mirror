@@ -8,6 +8,13 @@ from typing import Any, Iterable, Optional
 
 import yaml
 
+from ._webhook_url import (
+    validate_discord_webhook_url,
+    validate_generic_webhook_url,
+    validate_slack_webhook_url,
+    validate_teams_webhook_url,
+)
+
 # Closed set of event-action strings accepted by `*_routes[*].on`. Anything
 # outside this set is a typo or a forward-compat schema drift; we reject at
 # `Config.__post_init__` time rather than waiting for the first event-fire.
@@ -42,6 +49,14 @@ def set_global_profile_override(name: str) -> None:
 def get_global_profile_override() -> str:
     """Return the current process-wide profile override (or empty string)."""
     return _GLOBAL_PROFILE_OVERRIDE
+
+
+_ROUTE_URL_VALIDATORS = {
+    "slack_routes": validate_slack_webhook_url,
+    "discord_routes": validate_discord_webhook_url,
+    "teams_routes": validate_teams_webhook_url,
+    "webhook_routes": validate_generic_webhook_url,
+}
 
 
 def _normalise_routes(
@@ -89,6 +104,16 @@ def _normalise_routes(
                 f"{field_name}[{idx}] is missing required string field "
                 f"'webhook_url' (got {url!r})"
             )
+        # Per-backend URL gate — same scheme/host policy as the legacy
+        # single-channel fields below. Rejects file://, http://, and
+        # off-host URLs at config-load time so a typo / hostile YAML
+        # surfaces here, not at first-event-fire.
+        validator = _ROUTE_URL_VALIDATORS.get(field_name)
+        if validator is not None:
+            try:
+                validator(url.strip(), field_name=f"{field_name}[{idx}].webhook_url")
+            except ValueError:
+                raise
         on_raw = entry.get("on")
         if on_raw is None:
             on_list: list[str] = list(_DEFAULT_ROUTE_ACTIONS)
@@ -202,7 +227,13 @@ class Config:
     # WebDAV-specific
     webdav_url: str = ""       # e.g. "https://my-server.com/remote.php/dav/files/user/claude-mirror/"
     webdav_username: str = ""
-    webdav_password: str = ""  # or app password
+    # Credential-bearing fields use repr=False so a stray
+    # `console.print(f"... {config}")`, exception trace dumping `config`
+    # in locals to a log/Slack channel, or `logger.debug(config)` cannot
+    # leak the secret. The non-sensitive identifier next to each secret
+    # (e.g. `webdav_username` here, `s3_access_key_id` below) stays
+    # visible — the secret half is what's masked.
+    webdav_password: str = field(default="", repr=False)  # or app password
     # Allow http:// WebDAV URLs (cleartext basic-auth + payloads).
     # Default false: backend construction raises if the URL scheme is
     # `http` and this flag is not explicitly set. Intended only for
@@ -217,7 +248,7 @@ class Config:
     # sftp_password is fallback only and should be reserved for closed LAN
     # test setups — claude-mirror doctor warns when it's set in YAML.
     sftp_key_file: str = ""
-    sftp_password: str = ""
+    sftp_password: str = field(default="", repr=False)
     sftp_known_hosts_file: str = "~/.ssh/known_hosts"
     # Set False only for one-shot test setups; leaving this True (default)
     # means an unrecognised host fingerprint aborts the connection with
@@ -234,7 +265,7 @@ class Config:
     ftp_host: str = ""
     ftp_port: int = 21
     ftp_username: str = ""
-    ftp_password: str = ""
+    ftp_password: str = field(default="", repr=False)
     ftp_folder: str = ""
     # `explicit` = AUTH TLS on the standard control port (default + recommended).
     # `implicit` = legacy FTPS-on-990 (entire control channel in TLS from the
@@ -250,7 +281,11 @@ class Config:
     s3_bucket: str = ""
     s3_region: str = ""
     s3_access_key_id: str = ""
-    s3_secret_access_key: str = ""
+    # Access key ID is the public half (visible in logs / IAM dashboards);
+    # only the secret half is repr-masked. Leaving s3_access_key_id
+    # visible matches AWS conventions and helps users identify which
+    # principal is logging.
+    s3_secret_access_key: str = field(default="", repr=False)
     s3_prefix: str = ""        # within-bucket path prefix; empty = use project name
     # Path-style addressing (https://endpoint/bucket/key) is required by
     # MinIO and a few S3-compat services that don't terminate TLS for
@@ -265,7 +300,7 @@ class Config:
     # Stored plain in YAML at chmod 0600 — same posture as sftp_password.
     # Internet-reachable shares should rely on SMB3 encryption (default on)
     # to keep credentials and payloads off the wire in cleartext.
-    smb_password: str = ""
+    smb_password: str = field(default="", repr=False)
     smb_domain: str = ""        # AD/NTLM domain; empty for workgroup auth
     smb_folder: str = ""        # path within the share, e.g. "claude-mirror/myproject"
     # Force SMB3 per-message AES encryption. SMB2-only servers negotiate
@@ -273,29 +308,34 @@ class Config:
     # negotiated state so the user can see when encryption was downgraded.
     smb_encryption: bool = True
     poll_interval: int = 30    # seconds between polling checks (WebDAV, OneDrive)
-    # Slack notifications (optional, per-project)
+    # Slack notifications (optional, per-project). Webhook URL is
+    # repr-masked: the token at the end of the URL grants post access to
+    # the channel and acts as a bearer credential, so it must not appear
+    # in logs / exception dumps / debug prints.
     slack_enabled: bool = False
-    slack_webhook_url: str = ""
+    slack_webhook_url: str = field(default="", repr=False)
     slack_channel: str = ""    # override channel (optional, webhook default used if empty)
     # Discord notifications (optional, per-project) — POSTs an embed card
     # to a Discord incoming webhook (https://discord.com/api/webhooks/{id}/{token}).
     # Same opt-in / best-effort contract as Slack: failures never block sync.
     discord_enabled: bool = False
-    discord_webhook_url: str = ""
+    discord_webhook_url: str = field(default="", repr=False)
     # Microsoft Teams notifications (optional, per-project) — POSTs a
     # MessageCard payload to a Teams incoming webhook (legacy connector at
     # outlook.office.com/webhook/... OR the newer {tenant}.webhook.office.com/...
     # form). Same opt-in / best-effort contract as Slack and Discord.
     teams_enabled: bool = False
-    teams_webhook_url: str = ""
+    teams_webhook_url: str = field(default="", repr=False)
     # Generic webhook (optional, per-project) — POSTs a schema-stable JSON
     # envelope (version 1: event/user/machine/project/files/timestamp) to
     # any URL. Designed for n8n / Make / Zapier / internal endpoints that
     # need a stable structured payload. `webhook_extra_headers` carries
-    # auth tokens (e.g. {"Authorization": "Bearer abc"}) onto the request.
+    # auth tokens (e.g. {"Authorization": "Bearer abc"}) onto the request —
+    # also repr-masked because Authorization headers are usually bearer
+    # tokens or HTTP basic-auth blobs.
     webhook_enabled: bool = False
-    webhook_url: str = ""
-    webhook_extra_headers: Optional[dict[str, str]] = None
+    webhook_url: str = field(default="", repr=False)
+    webhook_extra_headers: Optional[dict[str, str]] = field(default=None, repr=False)
 
     # Per-project multi-channel notification routing (v0.5.50+).
     #
@@ -566,6 +606,20 @@ class Config:
         self.discord_routes = _normalise_routes(self.discord_routes, "discord_routes")
         self.teams_routes = _normalise_routes(self.teams_routes, "teams_routes")
         self.webhook_routes = _normalise_routes(self.webhook_routes, "webhook_routes")
+
+        # Validate legacy single-channel webhook URLs at config-load time.
+        # An empty string is fine ("not configured"); anything else gets
+        # gated through the per-backend scheme/host policy. file://,
+        # http://, and off-host URLs raise a clean ValueError naming the
+        # offending field, NOT a silent best-effort drop at send time.
+        if self.slack_webhook_url:
+            validate_slack_webhook_url(self.slack_webhook_url)
+        if self.discord_webhook_url:
+            validate_discord_webhook_url(self.discord_webhook_url)
+        if self.teams_webhook_url:
+            validate_teams_webhook_url(self.teams_webhook_url)
+        if self.webhook_url:
+            validate_generic_webhook_url(self.webhook_url)
 
     def iter_routes(self, backend: str) -> Iterable[dict[str, Any]]:
         """Yield the resolved route list for ``backend``.

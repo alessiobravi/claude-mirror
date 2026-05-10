@@ -4,7 +4,7 @@ All notable changes to claude-mirror.
 
 ---
 
-## [Unreleased]
+## [0.5.68] — 2026-05-10
 
 A new `claude-mirror conflict` subcommand group plus an envelope-handoff flow that lets the LLM agent already running alongside the user (Claude Code, Cursor, Codex, Antigravity, VSCode Copilot Chat, …) merge sync conflicts via the skill instead of forcing the user to make `keep-local` / `keep-remote` decisions alone in a terminal. claude-mirror itself binds to NO LLM API — the CLI is purely file plumbing over a v1 JSON envelope on disk; the skill describes the agent contract, and the agent does the merge cognition. 1436 tests pass on macOS (1388 baseline + 48 new); `mypy --strict` clean across 50 source files (was 49 + the new `_conflicts.py`).
 

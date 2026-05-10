@@ -98,10 +98,16 @@ def test_repr_keeps_non_sensitive_identifiers_visible(tmp_path: Path) -> None:
         "alice-PUBLIC",      # webdav_username (non-sensitive identifier)
         "folder-123-PUBLIC", # drive_folder_id
     ]
+    # Compare against the repr-escaped form so the test holds on Windows where
+    # tmp_path contains backslashes that repr() doubles inside the dataclass
+    # rendering. `repr(value)[1:-1]` strips the surrounding quotes and yields
+    # the exact substring that appears inside `repr(Config)`. POSIX paths and
+    # ASCII identifiers are unchanged by this transform.
     for value in visible_expected:
-        assert value in rendered, (
-            f"repr(Config) over-masks: expected {value!r} to remain visible "
-            f"in {rendered!r}"
+        needle = repr(value)[1:-1]
+        assert needle in rendered, (
+            f"repr(Config) over-masks: expected {needle!r} (the repr-form of "
+            f"{value!r}) to remain visible in {rendered!r}"
         )
 
 

@@ -4,7 +4,9 @@ All notable changes to claude-mirror.
 
 ---
 
-## [Unreleased]
+## [0.5.67] — 2026-05-10
+
+A new `claude-mirror redact PATH...` subcommand for pre-push secret scrubbing, plus a documentation sweep that brings every page in line with the eight-backend reality post-v0.5.65. 1388 tests pass on macOS (1345 baseline + 43 new); `mypy --strict` clean across 49 source files (was 48 + new `_redact.py`).
 
 ### Added — `claude-mirror redact` for pre-push secret scrubbing (REDACT)
 
@@ -24,6 +26,21 @@ A new top-level `claude-mirror redact PATH...` subcommand interactively scrubs l
 - `docs/admin.md` — new `### Pre-push secret scanning with redact` subsection under Snapshots and disaster recovery (next to "End-to-end integrity audit"), with a 4-line shell hook example wiring `claude-mirror redact <project> --apply --yes` into `.git/hooks/pre-commit`.
 - `docs/faq.md` — new Q/A entry "I accidentally pasted an API key into my notes. How do I scrub it before pushing?" under Sync workflow, pointing at `redact PATH`, the dry-run-default safety, and the cli-reference subsection.
 - `skills/claude-mirror.md` — new "Pre-push safety: scrub secrets before pushing" section directing the skill to run `claude-mirror redact <project>` (dry-run) when secrets / API keys / OAuth tokens are mentioned in the conversation; `redact --apply` is added to the destructive-ops list that requires user confirmation; the available-commands list grew the `redact` line.
+
+### Documentation — backends-matrix sweep across the doc tree
+
+Post-v0.5.65 the supported-backends matrix went from six to eight (BACKEND-S3 + BACKEND-SMB) and several pages had drifted. This release sweeps every doc so each page accurately reflects the eight-backend reality. No source-code or test changes from this sub-section.
+
+- `README.md` — polling-list, `## How it works` polling line, install-time tab-completion claim ("five valid backends" → eight), documentation index gains FTP and SMB rows, scenarios bullet list grew Scenario J (FUSE mount), file-locations table grew FTP/S3/SMB token-file rows, data-loss disclaimer enumerates all eight remote stores, duplicate L43 line collapsed.
+- `docs/README.md` — backends index gains FTP/S3 entries; scenarios list grew I + J ("seven topologies" → "nine").
+- `docs/admin.md` — credentials-skipped row collapsed (was split across two contradictory rows); doctor "all five backends" → "every backend"; "Where to go next" + final "See also" gain FTP/S3/SMB.
+- `docs/cli-reference.md` — three contradictory `--backend` lines on `init` collapsed to one (lists all eight); same for `clone`; doctor's `--backend` choice list extended; `init` per-backend pages list gains `smb.md`; `clone` identity-flag list gains FTP and SMB rows; three new per-backend doctor narratives (ftp, s3, smb) mirroring the Drive/Dropbox/OneDrive/WebDAV/SFTP shape.
+- `docs/faq.md` — "Which backend should I pick?" decision tree grew S3-compatible / SMB / FTP bullets; deep-check enumeration grew FTP and SMB; "all 5 backends" throttle claim → "all eight"; "topologies A through H" → "A through J, E omitted"; polling-list enumeration extends to FTP/S3/SMB.
+- `docs/scenarios.md` — Scenario A backend-choice prose extends to mention FTP / S3 / SMB cross-links.
+- `docs/profiles.md` — opening sentence enumerates all eight backend shapes; new sample profile YAML subsections for FTP / S3 / SMB.
+- `CONTRIBUTING.md` — fixtures list grows FakeS3 + FakeShare + the SFTP/FTP fixtures; mypy expected-output literal source-file count dropped (drift-prone).
+- `skills/claude-mirror.md` — `drive-ahead` → `remote-ahead` in Step 4 + the project-memory rules; `pushing to Drive` → `pushing to remote` in PRE-SYNC and POST-PULL rules; authentication-error block split into two paragraphs (browser-OAuth backends vs inline-credential backends — fix the YAML and run `doctor --backend NAME`); completion-subcommand list grew `powershell`.
+- `docs/backends/{s3,smb,ftp}.md` — see-also cross-link extensions per the "Docs must be browseable" rule (Documentation-index back-links, sibling-backend cross-links, `admin.md#<backend>-deep-checks`).
 
 ### Tests
 - `pytest tests/` — **1388 passed, 3 skipped** locally on macOS (was 1345 + 43 new). The 3 skips are the pre-existing `test_mypy_smoke.py` "mypy not installed" guards.

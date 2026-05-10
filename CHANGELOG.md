@@ -4,11 +4,11 @@ All notable changes to claude-mirror.
 
 ---
 
-## [Unreleased]
+## [0.5.69] — 2026-05-10
 
 ### Fixed — security + correctness polish (SECURITY-POLISH)
 
-A six-finding pass tightening the credential-handling, cross-process, and server-trust surfaces. No version bump — the release notes will fold this into the next tagged release. 1486 tests pass on macOS (1436 baseline + 50 new); `mypy --strict` clean across 51 source files (was 50 + the new `_webhook_url.py`).
+A six-finding pass tightening the credential-handling, cross-process, and server-trust surfaces, driven by a global security + best-practices audit. 1486 tests pass on macOS (1436 baseline + 50 new); `mypy --strict` clean across 51 source files (was 50 + the new `_webhook_url.py`).
 
 - **H1 — Credential-bearing fields hidden from `repr(Config)`.** Every credential-bearing dataclass field (`webdav_password`, `sftp_password`, `ftp_password`, `s3_secret_access_key`, `smb_password`, `slack_webhook_url`, `discord_webhook_url`, `teams_webhook_url`, `webhook_url`, `webhook_extra_headers`) now uses `field(repr=False)`. A stray `console.print(f"... {config}")`, exception with `config` in locals dumped to logs / Slack, or `logger.debug(config)` can no longer leak secrets. Non-sensitive identifiers (`project_path`, `backend`, `s3_bucket`, `s3_access_key_id`, `webdav_username`) stay visible — over-masking would make debug output useless. Webhook URLs are repr-masked because the token at the end of the URL acts as a bearer credential, and `webhook_extra_headers` typically carries `Authorization: Bearer …`.
 - **H2 — Webhook URL scheme + host validation.** Every Slack / Discord / Teams / Generic webhook URL now goes through a strict scheme + host gate at `Config.__post_init__` time AND at every `_send_webhook` / `WebhookNotifier.post_json` callsite. Only `https://` is accepted (no `file://`, no `http://`, no other schemes — these would let a misconfigured project YAML turn the notifier into a local-file read or an internal-endpoint probe like `http://169.254.169.254/...` for AWS metadata). Per backend, the host must match: Slack → `hooks.slack.com`; Discord → `discord.com` or `discordapp.com`; Microsoft Teams → `outlook.office.com` or any `*.webhook.office.com` per-tenant subdomain; the Generic webhook keeps the https-only rule but accepts any host (that is the whole point of "generic"). Bad URLs surface during `claude-mirror init` as a clean `ValueError` naming the offending field and 1-indexed route position. New module `claude_mirror/_webhook_url.py` (~120 lines) holds the helpers; lazy-imports only — no Click, no Rich.

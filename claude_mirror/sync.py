@@ -36,6 +36,12 @@ from .config import (
     _DEFAULT_ROUTE_ACTIONS,
     _DEFAULT_ROUTE_PATHS,
 )
+from ._conflicts import (
+    clear_envelope,
+    is_eligible as _envelope_is_eligible,
+    make_envelope,
+    write_envelope,
+)
 from .events import SyncEvent, SyncLog, SYNC_LOG_NAME, LOGS_FOLDER
 from .hash_cache import HashCache
 from .ignore import IgnoreSet, IGNORE_FILENAME
@@ -1980,20 +1986,68 @@ class SyncEngine:
         """
         Interactively resolve a conflict.
         Returns 'pushed', 'pulled', or None if skipped.
+
+        AGENT-MERGE: BEFORE the interactive prompt fires, every
+        text-file conflict gets a structured envelope written to
+        `~/.local/state/claude-mirror/<project-slug>/conflicts/`. The
+        envelope is information ALSO STORED for the running LLM agent
+        (Claude Code, Cursor, Codex, …) to pick up via the skill —
+        existing interactive behaviour is unchanged. The envelope is
+        cleared if the user picks `keep-local` / `keep-remote` /
+        `editor` (the conflict is resolved by the engine), and persists
+        on `skip` so the agent can still help later. Binary-file
+        conflicts skip the envelope write entirely; the prompt fires
+        unchanged.
         """
-        local_content = _safe_join(self._project, state.rel_path).read_text(errors="replace")
+        local_path = _safe_join(self._project, state.rel_path)
+        local_bytes = local_path.read_bytes()
         # Conflict path implies the remote already has a record of the file.
         assert state.drive_file_id is not None
         drive_bytes = self.storage.download_file(state.drive_file_id)
+
+        # AGENT-MERGE envelope write — additive, never blocks the prompt.
+        # Failures here are logged and swallowed: the user's interactive
+        # path must keep working even if the state directory is somehow
+        # unwritable (read-only home, full disk, etc.).
+        if _envelope_is_eligible(local_bytes, drive_bytes):
+            try:
+                local_text_for_env = local_bytes.decode("utf-8", errors="replace")
+                drive_text_for_env = drive_bytes.decode("utf-8", errors="replace")
+                manifest_entry = self.manifest.get(state.rel_path)
+                base_hash = manifest_entry.synced_hash if manifest_entry else None
+                env = make_envelope(
+                    rel_path=state.rel_path,
+                    local_text=local_text_for_env,
+                    remote_text=drive_text_for_env,
+                    base_text=None,
+                    base_hash=base_hash or None,
+                    project_path=self._project,
+                    backend=self.storage.backend_name,
+                )
+                env_path = write_envelope(env, project_path=self._project)
+                console.print(
+                    f"  [dim][envelope][/] {state.rel_path} → {env_path}"
+                )
+            except Exception as exc:
+                # Never fail the conflict resolver because envelope
+                # plumbing failed. Surface a one-line warning so the
+                # user knows the agent-handoff didn't get written.
+                console.print(
+                    f"  [yellow]⚠[/] {state.rel_path}: envelope write "
+                    f"failed ({exc}); continuing with interactive prompt."
+                )
+
+        local_content = local_bytes.decode(errors="replace")
         drive_content = drive_bytes.decode(errors="replace")
 
         result = self.merge.resolve_conflict(state.rel_path, local_content, drive_content)
         if result is None:
             console.print(f"  [dim]Skipped {state.rel_path}[/]")
+            # AGENT-MERGE: leave the envelope on disk on skip so the
+            # agent can still pick it up later via `conflict list`.
             return None
 
         resolved_content, winner = result
-        local_path = _safe_join(self._project, state.rel_path)
         local_path.write_text(resolved_content)
 
         if winner == "drive":
@@ -2012,11 +2066,16 @@ class SyncEngine:
                 self._fan_out_to_mirrors(
                     state.rel_path, str(local_path), synced_hash,
                 )
+            # AGENT-MERGE: conflict resolved — clear the envelope so
+            # `conflict list` doesn't keep showing it as pending.
+            clear_envelope(self._project, state.rel_path)
             return "pulled"
         else:
             # Local or merged — push the resolved content to Drive
             state.local_hash = Manifest.hash_file(str(local_path))
             self._push_file(state)
+            # AGENT-MERGE: conflict resolved — clear the envelope.
+            clear_envelope(self._project, state.rel_path)
             return "pushed"
 
     def _delete_drive_file(self, state: FileSyncState) -> None:

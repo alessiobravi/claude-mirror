@@ -25,9 +25,17 @@ from rich.table import Table
 from rich.text import Text
 
 from . import _byo_wizard
+from . import _conflicts
 from .backends import StorageBackend, redact_error
 from .backends.googledrive import GoogleDriveBackend
 from .config import Config, CONFIG_DIR
+from ._conflicts import (
+    ConflictEnvelope,
+    clear_envelope,
+    envelope_path,
+    list_envelopes,
+    read_envelope,
+)
 from ._diff import render_diff
 from .events import SyncEvent, SyncLog, SYNC_LOG_NAME, LOGS_FOLDER
 from .manifest import Manifest
@@ -402,6 +410,11 @@ _NO_WATCHER_CHECK_CMDS = {
     # pre-commit), where any banner-leak on stderr/stdout would
     # interfere with the hook's exit-code-driven contract.
     "redact",
+    # `conflict` (AGENT-MERGE) is the envelope-handoff CLI surface
+    # consumed by the skill — `conflict list --json` emits a v1
+    # envelope to stdout, so the watcher banner would corrupt it
+    # exactly like the `health` / `prompt` / `log` cases. Same gate.
+    "conflict",
 }
 
 
@@ -14651,3 +14664,294 @@ def redact(paths: tuple[str, ...], do_apply: bool, skip_prompts: bool) -> None:
         console.print("[yellow]Quit before reviewing every finding. "
                       "Already-written files were not rolled back.[/]")
         sys.exit(1)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# `conflict` subcommand group — AGENT-MERGE
+#
+# The envelope-handoff surface for the LLM agent (Claude Code, Cursor,
+# Codex, …) running alongside the user. The CLI itself binds to NO
+# LLM API — it is purely file plumbing over the on-disk envelopes
+# written by `sync.py::_resolve_conflict` (see `_conflicts.py`).
+#
+# Three subcommands:
+#   * `conflict list   [--json]`         — pretty Rich table or v1 JSON
+#   * `conflict show   PATH [--format]`  — envelope JSON or 3-way markers
+#   * `conflict apply  PATH --merged-…`  — write merged content + push
+#
+# The skill describes the agent contract; this CLI just emits + consumes
+# the envelopes. See `skills/claude-mirror.md` "Conflict-resolution mode"
+# and `docs/conflict-resolution.md` for the full handoff narrative.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@cli.group("conflict")
+def conflict_group() -> None:
+    """Inspect and resolve sync conflicts via the AGENT-MERGE envelope.
+
+    When `claude-mirror sync` finds a file changed on BOTH sides since
+    the last sync, it writes a structured JSON envelope to
+    `~/.local/state/claude-mirror/<project>/conflicts/` BEFORE prompting
+    interactively. The envelope is intended for the running LLM agent
+    (Claude Code, Cursor, Codex, …) to read via the skill, propose a
+    merge, and apply via `conflict apply`. Use `conflict list` to see
+    every pending envelope and `conflict show <PATH>` to fetch one for
+    review.
+    """
+
+
+@conflict_group.command("list")
+@click.option("--config", "config_path", default="",
+              help="Config file path. Auto-detected from cwd if omitted.")
+@click.option("--json", "json_output", is_flag=True, default=False,
+              help="Emit a v1 JSON envelope instead of the Rich table. "
+                   "Designed for skill / script consumption.")
+def conflict_list(config_path: str, json_output: bool) -> None:
+    """Show every pending conflict envelope for the current project.
+
+    Each row is one file with a pending merge to land. Empty case
+    prints a one-line "No pending conflicts" message and exits 0 — so
+    a polling skill can string-grep on it without parsing the table.
+    """
+    if json_output:
+        with _JsonMode():
+            try:
+                _emit_conflict_list_json(config_path)
+            except SystemExit:
+                raise
+            except BaseException as exc:
+                _emit_json_error("conflict-list", exc)
+        return
+
+    config = Config.load(_resolve_config(config_path))
+    project_path = Path(config.project_path)
+    envelopes = list_envelopes(project_path)
+    if not envelopes:
+        console.print("[dim]No pending conflicts.[/]")
+        return
+
+    table = Table(
+        show_header=True,
+        header_style="bold",
+        title=f"Pending conflicts ({len(envelopes)})",
+    )
+    table.add_column("Path", style="bold")
+    table.add_column("Created")
+    table.add_column("Local hash")
+    table.add_column("Remote hash")
+    table.add_column("Backend")
+    for env in envelopes:
+        table.add_row(
+            env.path,
+            env.created_at,
+            env.local_hash[:8],
+            env.remote_hash[:8],
+            env.backend,
+        )
+    console.print(table)
+    console.print(
+        "\n[dim]Resolve with[/] [bold]claude-mirror conflict show <PATH>[/] "
+        "[dim]+ [/][bold]claude-mirror conflict apply <PATH> --merged-file FILE[/]."
+    )
+
+
+def _emit_conflict_list_json(config_path: str) -> None:
+    """v1 JSON envelope for `conflict list --json`.
+
+    Shape: `{schema, command, generated_at, conflicts: [...]}` mirroring
+    the existing v1 envelope shape used by `status --json` / `log
+    --json` / `stats --json`. Each conflict is the full ConflictEnvelope
+    serialised verbatim — the agent can roundtrip it through
+    `read_envelope` if it wants to.
+    """
+    config = Config.load(_resolve_config(config_path))
+    project_path = Path(config.project_path)
+    envelopes = list_envelopes(project_path)
+    payload = {
+        "schema": f"v{JSON_SCHEMA_VERSION}",
+        "command": "conflict-list",
+        "generated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "conflicts": [dataclass_to_dict(e) for e in envelopes],
+    }
+    click.echo(_json.dumps(payload, indent=2, sort_keys=False, ensure_ascii=False))
+
+
+def dataclass_to_dict(env: ConflictEnvelope) -> dict[str, Any]:
+    """Serialise a ConflictEnvelope to a JSON-safe dict.
+
+    Module-private alias around dataclasses.asdict; centralising it
+    means the envelope-emission path is one line rather than three at
+    every callsite. (`_conflicts.py` doesn't expose this directly so
+    that module can stay pure / Click-free.)
+    """
+    import dataclasses as _dc
+    return _dc.asdict(env)
+
+
+@conflict_group.command("show")
+@click.argument("path", type=str)
+@click.option("--config", "config_path", default="",
+              help="Config file path. Auto-detected from cwd if omitted.")
+@click.option(
+    "--format", "fmt",
+    type=click.Choice(["envelope", "markers"]),
+    default="envelope",
+    show_default=True,
+    help=(
+        "envelope: full JSON envelope (machine-friendly, default). "
+        "markers: file content wrapped in 3-way <<<<<<< / ||||||| / "
+        "======= / >>>>>>> markers — the legacy format every agent "
+        "IDE knows how to merge."
+    ),
+)
+@click.option("--json", "json_output", is_flag=True, default=False,
+              help="Shorthand for --format envelope. Mutually compatible "
+                   "with --format envelope; conflicts with --format markers.")
+def conflict_show(path: str, config_path: str, fmt: str, json_output: bool) -> None:
+    """Print a single conflict envelope for review.
+
+    PATH is the project-relative path of the conflicted file (the same
+    string that appears in `conflict list`'s Path column). With
+    `--format envelope` (the default), prints the full JSON envelope
+    so the agent can read every field. With `--format markers`, prints
+    the file content wrapped in conventional 3-way merge markers — the
+    format every agent IDE / merge tool knows how to handle.
+    """
+    if json_output and fmt == "markers":
+        console.print("[red]--json conflicts with --format markers.[/]")
+        sys.exit(1)
+    if json_output:
+        fmt = "envelope"
+
+    config = Config.load(_resolve_config(config_path))
+    project_path = Path(config.project_path)
+    target = envelope_path(project_path, path)
+    if not target.exists():
+        console.print(
+            f"[red]No pending conflict for[/] [bold]{path}[/]\n"
+            f"[dim]Looked at:[/] {target}\n"
+            f"[dim]Tip:[/] run [bold]claude-mirror conflict list[/] "
+            f"to see every pending conflict."
+        )
+        sys.exit(1)
+
+    env = read_envelope(target)
+    if fmt == "envelope":
+        click.echo(_json.dumps(
+            dataclass_to_dict(env), indent=2, sort_keys=False, ensure_ascii=False,
+        ))
+        return
+
+    # `markers` mode: emit the conventional 3-way merge format. Order
+    # follows git's `merge.conflictStyle = diff3`:
+    #   <<<<<<< local
+    #   <local content>
+    #   ||||||| base
+    #   <base content>     (only if base_text is available)
+    #   =======
+    #   <remote content>
+    #   >>>>>>> remote
+    parts: list[str] = []
+    parts.append("<<<<<<< local\n")
+    parts.append(env.local_text)
+    if not env.local_text.endswith("\n"):
+        parts.append("\n")
+    if env.base_text is not None:
+        parts.append("||||||| base\n")
+        parts.append(env.base_text)
+        if not env.base_text.endswith("\n"):
+            parts.append("\n")
+    parts.append("=======\n")
+    parts.append(env.remote_text)
+    if not env.remote_text.endswith("\n"):
+        parts.append("\n")
+    parts.append(">>>>>>> remote\n")
+    click.echo("".join(parts), nl=False)
+
+
+@conflict_group.command("apply")
+@click.argument("path", type=str)
+@click.option("--config", "config_path", default="",
+              help="Config file path. Auto-detected from cwd if omitted.")
+@click.option("--merged-file", "merged_file", default="",
+              help="File containing the agent's proposed merged content. "
+                   "Mutually exclusive with --merged-stdin.")
+@click.option("--merged-stdin", "merged_stdin", is_flag=True, default=False,
+              help="Read the merged content from stdin instead of a file. "
+                   "Mutually exclusive with --merged-file.")
+@click.option("--push/--no-push", "do_push", default=True,
+              help="After writing the merged content locally, run "
+                   "`push --force-local PATH` to land it on the remote. "
+                   "--no-push lets the user batch multiple resolves "
+                   "before one push. Default: --push.")
+def conflict_apply(
+    path: str,
+    config_path: str,
+    merged_file: str,
+    merged_stdin: bool,
+    do_push: bool,
+) -> None:
+    """Write the agent's merged content for PATH and clear the envelope.
+
+    Reads the merged content from --merged-file FILE or --merged-stdin
+    (mutually exclusive — one is required). Writes the content to the
+    project file, clears the envelope, and (default --push) runs
+    `push --force-local PATH` so the resolved version lands on the
+    remote. Idempotent: re-running on a path whose envelope is already
+    cleared prints a friendly "already resolved" notice and exits 0.
+    """
+    if bool(merged_file) == bool(merged_stdin):
+        console.print(
+            "[red]conflict apply requires exactly one of "
+            "--merged-file FILE or --merged-stdin.[/]"
+        )
+        sys.exit(1)
+
+    config = Config.load(_resolve_config(config_path))
+    project_path = Path(config.project_path)
+    target_envelope = envelope_path(project_path, path)
+    if not target_envelope.exists():
+        console.print(
+            f"[dim]Envelope for[/] [bold]{path}[/] [dim]is already "
+            f"resolved — nothing to apply.[/]"
+        )
+        return
+
+    if merged_file:
+        merged_content = Path(merged_file).read_text(encoding="utf-8")
+    else:
+        merged_content = sys.stdin.read()
+
+    # Write merged content to the project file. Use the project's
+    # safe-join helper so a malicious PATH (e.g. `../../etc/passwd`)
+    # can never escape the project root.
+    from .snapshots import _safe_join
+    local_path = _safe_join(project_path, path)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_text(merged_content, encoding="utf-8")
+    console.print(f"  [green]✓[/] {path} (merged content written, {len(merged_content)} bytes)")
+
+    # Clear the envelope first — the conflict is resolved regardless
+    # of whether the subsequent push succeeds (the user can re-run
+    # `push --force-local <PATH>` later).
+    clear_envelope(project_path, path)
+
+    if not do_push:
+        console.print(
+            f"  [dim]--no-push: skipping remote upload. "
+            f"Run[/] [bold]claude-mirror push {path} --force-local[/] "
+            f"[dim]to land it on the remote.[/]"
+        )
+        return
+
+    # Drive a real push — same code path as `claude-mirror push <PATH>
+    # --force-local`. We load the engine here rather than going through
+    # subprocess so a single CLI invocation does both.
+    engine, _, _ = _load_engine(_resolve_config(config_path))
+    engine.push([path], force_local=True)
+
+
+# Re-export the dataclass utility on the module level so the
+# ConflictEnvelope import at the top of this file stays referenced for
+# mypy --strict (otherwise the import is flagged as unused).
+__all__ = [name for name in globals() if not name.startswith("_")]

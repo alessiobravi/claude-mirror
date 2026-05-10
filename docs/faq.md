@@ -236,6 +236,22 @@ Every auto-resolution is logged to `_sync_log.json` with the strategy that won, 
 
 **See also:** [docs/conflict-resolution.md](conflict-resolution.md) — full prompt walkthrough and the `$EDITOR` merge flow.
 
+### I have a conflict and I'm not sure how to merge it. Can the agent help?
+
+Yes — the **AGENT-MERGE** flow is built for exactly that. When `claude-mirror sync` finds a file changed on BOTH sides since the last sync, it writes a structured JSON envelope to `~/.local/state/claude-mirror/<project-slug>/conflicts/` per conflicted file. The [skill](../skills/claude-mirror.md) running in your agent (Claude Code, Cursor, Codex, …) picks up the envelope, proposes a merged version, **shows you the proposal and asks for explicit confirmation**, and applies it on your "yes":
+
+```bash
+claude-mirror conflict list                                      # see what's pending
+claude-mirror conflict show <path> --format markers              # 3-way <<<<<<< / ======= / >>>>>>> markers — every agent IDE knows this
+claude-mirror conflict apply <path> --merged-file <tmp>          # write merged content + clear envelope + push
+```
+
+claude-mirror itself binds to NO LLM API — no Anthropic SDK call, no Ollama HTTP call, no API key requirement. The CLI is purely file plumbing; the skill describes the agent contract, and your agent does the merge cognition. **The user is always in the loop:** the skill is instructed to never apply a merge without showing the proposed content and getting explicit confirmation first.
+
+Existing behaviour is unchanged for users without the skill — the interactive `[L]ocal / [D]rive / [E]ditor / [S]kip` prompt still fires on `sync`, and the envelope is just additional information stored on disk. If you skip a conflict interactively, the envelope persists so the agent can still help later.
+
+**See also:** [docs/conflict-resolution.md — Agent-driven merge via the skill](conflict-resolution.md#agent-driven-merge-via-the-skill-agent-merge), [docs/cli-reference.md — `conflict`](cli-reference.md#conflict).
+
 ### How do I sync only some files?
 
 Two complementary mechanisms:

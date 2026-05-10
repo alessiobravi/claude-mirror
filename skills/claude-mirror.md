@@ -97,6 +97,44 @@ After writing the merged result to the local file(s), report a summary of what w
 claude-mirror push <file1> <file2> ... --force-local --config <config-path>
 ```
 
+## Conflict-resolution mode (AGENT-MERGE)
+
+When `claude-mirror sync` finds a file changed on BOTH sides since the last sync, it writes a structured JSON envelope per file to `~/.local/state/claude-mirror/<project-slug>/conflicts/` BEFORE the interactive prompt fires. These envelopes are intended for the skill (you) to pick up and resolve via the LLM agent — every envelope you successfully merge with the user is one less manual `keep-local` / `keep-remote` decision the user has to make alone.
+
+After every `claude-mirror sync` (or whenever the user asks "are there any pending conflicts?"), check:
+
+```bash
+claude-mirror conflict list --config <config-path>
+```
+
+If pending envelopes exist, walk them one by one. For each:
+
+### 1. Fetch the envelope in the legacy 3-way merge format
+
+```bash
+claude-mirror conflict show <rel-path> --format markers --config <config-path>
+```
+
+`--format markers` emits the file content wrapped in conventional `<<<<<<< local / ||||||| base / ======= / >>>>>>> remote` markers — the format every agent IDE / merge tool already knows how to handle. Use `--format envelope` (or `--json`) instead if you need the full structured JSON (local hash, remote hash, project path, backend, precomputed unified diff).
+
+### 2. Propose a merged version and SHOW IT TO THE USER
+
+Read the markers output, compute a merged version that incorporates BOTH sides' intent, and present the proposed merge to the user as a clear diff. **Do not apply yet.** Ask the user explicit confirmation before writing anything to disk.
+
+### 3. Apply on confirmation
+
+When the user confirms, write the merged content to a temp file and run:
+
+```bash
+claude-mirror conflict apply <rel-path> --merged-file <tmp-path> --config <config-path>
+```
+
+By default `apply` writes the merged content to the project file, clears the envelope, AND runs `push --force-local <rel-path>` to land it on the remote in one step. Pass `--no-push` if the user wants to batch multiple resolves before one push. `apply` is idempotent — re-running on a path whose envelope is already cleared prints "already resolved" and exits 0.
+
+### 4. Defer if the user wants
+
+If the user wants to come back to the conflict later, just leave the envelope in place — `conflict list` will keep showing it. They can also resolve it via the existing interactive `claude-mirror sync` prompt at any time; that flow clears the envelope as part of its own resolution path.
+
 ## Step 5: Ask what the user wants to do (no pending remote changes)
 
 If status shows no remote changes:
@@ -147,6 +185,9 @@ claude-mirror migrate-snapshots --to {blobs|full}        --config <config-path> 
 claude-mirror log       --config <config-path>
 claude-mirror inbox     --config <config-path>
 claude-mirror redact   <project-path>                                        # pre-push secret scan (dry-run); --apply to scrub interactively, --apply --yes for non-interactive
+claude-mirror conflict list                              --config <config-path>   # AGENT-MERGE: show every pending conflict envelope (also: --json)
+claude-mirror conflict show <rel-path> --format markers  --config <config-path>   # fetch a conflict in 3-way <<<<<<< / ||||||| / ======= / >>>>>>> markers
+claude-mirror conflict apply <rel-path> --merged-file <tmp> --config <config-path>   # write merged content + clear envelope + push (default --push; --no-push to batch)
 claude-mirror check-update                                                   # check GitHub for a newer version (no --config needed)
 claude-mirror update                                                         # dry-run: report what update would do
 claude-mirror update --apply                                                 # actually upgrade (git pull + pipx install -e . --force, with confirmation)
@@ -377,5 +418,6 @@ If findings appear, surface them to the user and offer to scrub via `claude-mirr
 - Never run destructive operations (restore, delete, redact --apply) without confirming with the user first
 - The `delete` command requires explicit file arguments — it will not delete all files
 - `claude-mirror redact` is dry-run by default; `--apply` rewrites files in place and requires user confirmation
+- Never run `conflict apply` without showing the user the proposed merge and getting explicit confirmation. The whole point of AGENT-MERGE is human-in-the-loop — auto-applying a merge defeats the entire workflow
 - If a command fails, show the full error and suggest a fix
 - Notifications are stored in `{project_path}/.claude_mirror_inbox.jsonl` — they are project-scoped and will not mix with other projects

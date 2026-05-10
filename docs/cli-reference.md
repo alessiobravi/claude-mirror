@@ -110,6 +110,9 @@ claude-mirror mount       MOUNTPOINT
 claude-mirror umount      MOUNTPOINT [--config PATH]   # macOS: umount; Linux: fusermount -u; Windows: prints Ctrl+C hint
 claude-mirror ncdu        [--remote BACKEND] [--non-interactive] [--top N] [--config PATH]   # POSIX-only interactive disk-usage TUI (curses); --non-interactive prints top-N largest paths to stdout
 claude-mirror redact      PATH... [--apply] [--yes]   # pre-push secret scan over markdown files; dry-run by default, --apply to scrub interactively, --apply --yes for CI
+claude-mirror conflict list                                                  [--config PATH] [--json]   # AGENT-MERGE: every pending conflict envelope
+claude-mirror conflict show       PATH                                       [--config PATH] [--format envelope|markers] [--json]   # full envelope JSON (default) or 3-way <<<<<<< / ||||||| / ======= / >>>>>>> markers
+claude-mirror conflict apply      PATH (--merged-file FILE | --merged-stdin) [--config PATH] [--push/--no-push]   # write the agent's merge + clear envelope + push (default --push)
 claude-mirror profile list
 claude-mirror profile show       NAME
 claude-mirror profile create     NAME --backend BACKEND [--description TEXT] [--force]
@@ -564,6 +567,107 @@ Every auto-resolution is appended to `_sync_log.json` on the remote with a `auto
 If you run `claude-mirror sync` (no flags) and stdin is not a TTY (cron / launchd / systemd), the command fails fast at entry with a hint pointing at `--no-prompt --strategy` rather than hanging on a prompt nobody can answer.
 
 Sample crontab entries are in [admin.md](admin.md#unattended-sync-via-cron). For the interactive prompt menu, see [conflict-resolution.md](conflict-resolution.md).
+
+### `conflict`
+
+Inspect and resolve sync conflicts via the **AGENT-MERGE** envelope flow. When `claude-mirror sync` finds a file changed on BOTH sides since the last sync, it writes a structured JSON envelope per file to `~/.local/state/claude-mirror/<project-slug>/conflicts/` BEFORE the interactive prompt fires. The envelope is consumed by the [skill](../skills/claude-mirror.md), which proposes a merge, asks the user for explicit confirmation, and applies it via `conflict apply`. The CLI itself binds to NO LLM API — it is purely file plumbing.
+
+Three subcommands cover the lifecycle:
+
+```
+claude-mirror conflict list   [--config PATH] [--json]
+claude-mirror conflict show   PATH [--config PATH] [--format envelope|markers] [--json]
+claude-mirror conflict apply  PATH [--config PATH] (--merged-file FILE | --merged-stdin) [--push/--no-push]
+```
+
+#### `conflict list`
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--config PATH` | auto-detected from cwd | Path to a specific config YAML when more than one project lives under `~/.config/claude_mirror/`. |
+| `--json` | off | Emit a v1 JSON envelope instead of the Rich table. |
+
+Empty case prints `No pending conflicts.` and exits 0 — so a polling skill can string-grep on it without parsing the table. The Rich table has columns `Path / Created / Local hash / Remote hash / Backend` (hashes truncated to 8 chars for visual scannability — the full hash is in the JSON envelope and in `conflict show`).
+
+`--json` envelope shape (v1):
+
+```json
+{
+  "schema": "v1",
+  "command": "conflict-list",
+  "generated_at": "2026-05-10T12:00:00Z",
+  "conflicts": [
+    {
+      "version": 1,
+      "path": "memory/CLAUDE.md",
+      "local_text": "...",
+      "remote_text": "...",
+      "base_text": null,
+      "local_hash": "<sha256-hex>",
+      "remote_hash": "<sha256-hex>",
+      "base_hash": "<sha256-hex>",
+      "created_at": "2026-05-10T12:00:00Z",
+      "project_path": "/Users/alice/myproject",
+      "backend": "googledrive",
+      "unified_diff": "--- remote/memory/CLAUDE.md\n+++ local/memory/CLAUDE.md\n@@ ..."
+    }
+  ]
+}
+```
+
+#### `conflict show`
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--config PATH` | auto-detected from cwd | Path to a specific config YAML. |
+| `--format envelope\|markers` | `envelope` | `envelope`: full JSON envelope (machine-friendly). `markers`: file content wrapped in conventional 3-way `<<<<<<< local / \|\|\|\|\|\|\| base / ======= / >>>>>>> remote` markers — the legacy format every agent IDE knows how to merge. |
+| `--json` | off | Shorthand for `--format envelope`. Conflicts with `--format markers` (exits 1). |
+
+Markers format (the `||||||| base` block only appears when the manifest carried base content; today the manifest stores hashes only, so this block is reserved for a future enhancement that recovers base content from snapshots):
+
+```
+<<<<<<< local
+my local edit
+=======
+their remote edit
+>>>>>>> remote
+```
+
+Missing envelope (path was never conflicted, or the conflict was already resolved) exits 1 with a `No pending conflict for <path>` message.
+
+#### `conflict apply`
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--config PATH` | auto-detected from cwd | Path to a specific config YAML. |
+| `--merged-file FILE` | none | Read merged content from FILE. Mutually exclusive with `--merged-stdin`. |
+| `--merged-stdin` | off | Read merged content from stdin. Mutually exclusive with `--merged-file`. |
+| `--push / --no-push` | `--push` | After writing, run `push --force-local PATH` to land the merge on the remote. `--no-push` lets the user batch multiple resolves before one push. |
+
+`apply` writes the merged content to the project file (via the same `_safe_join` helper that protects every other write path against `../../etc/passwd`-style escapes), clears the envelope, and (default `--push`) pushes the resolved file to the remote with `--force-local`. Idempotent: re-running on a path whose envelope is already cleared prints `Envelope for <path> is already resolved` and exits 0. Exactly one of `--merged-file` / `--merged-stdin` is required — passing neither, or both, exits 1 with a clean error message.
+
+#### Sample workflow
+
+```bash
+# 1. Sync writes envelopes for every text-file conflict (and fires the interactive prompt as before)
+claude-mirror sync
+
+# 2. See what's pending
+claude-mirror conflict list
+
+# 3. Fetch one in legacy 3-way marker format (every agent IDE knows this)
+claude-mirror conflict show memory/CLAUDE.md --format markers
+
+# 4. Agent proposes a merge → shows it to user → user confirms → write to /tmp/merged.md
+# 5. Apply: writes the file, clears the envelope, pushes the result with --force-local
+claude-mirror conflict apply memory/CLAUDE.md --merged-file /tmp/merged.md
+```
+
+#### Agent-handoff narrative
+
+The CLI imports nothing from any LLM SDK. The envelope is a JSON file on disk; the skill (a markdown file shipped with the package) instructs the running agent on how to read it, propose a merge, and apply it. Existing behaviour is unchanged for users without the skill — the interactive prompt still fires on `sync`, the envelope is just additional information stored on disk. Binary-file conflicts skip envelope writing entirely (the agent can't usefully merge them) and fall through to the existing prompt.
+
+The envelope schema is **version 1** (`ENVELOPE_VERSION` in `claude_mirror/_conflicts.py`). Future breaking changes bump the version; older CLIs that encounter a newer envelope refuse it cleanly with a "this CLI understands version N" `ValueError` rather than misinterpreting the shape. Additive fields are forward-compatible — `read_envelope` filters JSON keys to known dataclass fields so an extra field on disk never crashes an older CLI.
 
 ### `diff`
 

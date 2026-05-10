@@ -437,6 +437,17 @@ exec claude-mirror redact "$(git rev-parse --show-toplevel)" --apply --yes
 
 Make the hook executable (`chmod +x .git/hooks/pre-commit`). The `--apply --yes` form is required for non-interactive shells (no per-finding prompt), and the `<REDACTED:KIND>` markers are unambiguous so a follow-up review pass shows exactly which kinds fired and where. For wrapping `claude-mirror push` instead, run `claude-mirror redact <project> --apply --yes && claude-mirror push` from a shell alias.
 
+### Monitoring pending conflicts
+
+`claude-mirror conflict list --json` (since the AGENT-MERGE release) emits a structured v1 envelope listing every pending conflict envelope on disk — useful for piping into a monitoring dashboard or driving an `at`/`cron` nudge when a project accumulates unresolved conflicts. The `conflicts` array is empty when nothing is pending; consumers can check `length` cheaply.
+
+```sh
+# Hourly: nag if any conflicts have been sitting unresolved for more than 0 minutes
+0 * * * *  count=$(claude-mirror conflict list --config ~/.config/claude_mirror/proj.yaml --json | jq '.conflicts | length'); [ "$count" -gt 0 ] && /usr/bin/osascript -e "display notification \"$count pending conflict(s)\" with title \"claude-mirror\""
+```
+
+Pair with `claude-mirror conflict show <path> --format markers` from your editor to fetch a conflicted file in conventional 3-way merge markers, and `claude-mirror conflict apply <path> --merged-file <tmp>` to apply the resolved version. The full agent-handoff narrative is in [conflict-resolution.md — Agent-driven merge via the skill](conflict-resolution.md#agent-driven-merge-via-the-skill-agent-merge); the per-flag reference is [cli-reference.md — `conflict`](cli-reference.md#conflict).
+
 ---
 
 ## Performance and bandwidth control

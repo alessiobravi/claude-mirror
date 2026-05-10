@@ -324,6 +324,9 @@ claude-mirror delete file.md --dry-run  # preview what a real delete would remov
 claude-mirror delete file.md --local    # remove from remote AND local disk
 claude-mirror sync                      # full bidirectional with conflict prompts
 claude-mirror sync --no-prompt --strategy keep-local   # cron-friendly: auto-resolve all conflicts
+claude-mirror conflict list             # AGENT-MERGE: every pending conflict envelope (skill-driven)
+claude-mirror conflict show <path> --format markers   # fetch a conflict in 3-way <<<<<<< / ======= / >>>>>>> markers
+claude-mirror conflict apply <path> --merged-file <tmp>   # write the agent's merge + clear envelope + push
 claude-mirror watch                     # foreground watcher; system notification on remote pushes
 claude-mirror watch --once --quiet      # single polling cycle (cron-friendly: */5 * * * * ...)
 claude-mirror watch-all                 # watch every config in ~/.config/claude_mirror/

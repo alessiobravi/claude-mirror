@@ -574,13 +574,17 @@ def test_cli_conflict_apply_writes_merged_file_and_clears_envelope(
 ):
     project = tmp_path / "project"
     project.mkdir()
-    (project / "x.md").write_text("OLD LOCAL\n", encoding="utf-8")
+    # Binary write to avoid Windows text-mode \n -> \r\n translation; the
+    # engine reads local content via `read_bytes()` so the on-disk bytes
+    # land in the envelope verbatim and the assertions must compare to
+    # the literal LF-only payload regardless of platform.
+    (project / "x.md").write_bytes(b"OLD LOCAL\n")
     cfg = _make_config_yaml(tmp_path, project)
     write_envelope(_make_envelope(rel_path="x.md", project=project), project_path=project)
     fake = _patch_load_engine(monkeypatch)
 
     merged = tmp_path / "merged.md"
-    merged.write_text("MERGED CONTENT\n", encoding="utf-8")
+    merged.write_bytes(b"MERGED CONTENT\n")
     runner = CliRunner()
     result = runner.invoke(
         cli, ["conflict", "apply", "x.md",
@@ -719,7 +723,8 @@ def test_engine_writes_envelope_for_text_conflict(
     project.mkdir()
     rel = "memory/note.md"
     (project / "memory").mkdir()
-    (project / "memory" / "note.md").write_text("LOCAL\n", encoding="utf-8")
+    # Binary write to avoid Windows text-mode \n -> \r\n translation.
+    (project / "memory" / "note.md").write_bytes(b"LOCAL\n")
 
     # Build a minimal FileSyncState shape — only the fields _resolve_conflict
     # actually reads.
@@ -809,7 +814,8 @@ def test_engine_clears_envelope_on_keep_local(
     project = tmp_path / "project"
     project.mkdir()
     rel = "x.md"
-    (project / "x.md").write_text("LOCAL\n", encoding="utf-8")
+    # Binary write to avoid Windows text-mode \n -> \r\n translation.
+    (project / "x.md").write_bytes(b"LOCAL\n")
 
     from claude_mirror.sync import FileSyncState, Status
 

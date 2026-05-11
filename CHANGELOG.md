@@ -4,6 +4,21 @@ All notable changes to claude-mirror.
 
 ---
 
+## [0.5.70] — 2026-05-11
+
+### Fixed — raw Google 400 HTML page leaking into push/sync terminal output
+
+Three `console.print(f"...: {e}")` sites in `claude_mirror/sync.py` were printing exception bodies verbatim. When `e` was a `googleapiclient.errors.HttpError` carrying Google's standard "Bad Request" HTML page (the `<!DOCTYPE html>...<title>Error 400 (Bad Request)!!1</title>...` body), the whole ~3 KiB HTML wall landed in the user's terminal as a single "Warning: …" line. The push itself was unaffected — these are best-effort tail-end calls (Pub/Sub publish ack, sync-log upload to `_claude_mirror_logs/`) that don't gate the upload — but the user-facing surface looked like a catastrophic failure when it was actually just a transient retry-able blip.
+
+- `claude_mirror/sync.py::_publish_event` (line ~2859), `_flush_remote_log` (~2970), `_flush_publishes` (~2978) — each now wraps `str(e)` in the project's existing `redact_error()` helper (defined at `backends/__init__.py:126`, used everywhere else in `cli.py`). The helper strips Bearer / OAuth tokens, basic-auth in URLs, `?access_token=` query params, absolute home paths, and NUL bytes, then caps the message at 160 chars. After the fix the warning collapses from ~3 KiB to a single short line.
+- `tests/test_publish_error_redaction.py` — new module, 3 tests: full HTML body truncated below 600 chars (was ~3 KiB), tail-of-body markers (`</html>`, mid-body fragments past the 160-char cap) are absent, short error messages remain readable end-to-end. The synthetic Google 400 HTML uses 2 KiB of inline-style filler to assert the truncation actually kicks in.
+
+### Tests
+- `pytest tests/` — **1489 passed, 3 skipped** locally on macOS (1486 baseline + 3 new). The 3 skips are the pre-existing `test_mypy_smoke.py` "mypy not installed" guards.
+- `mypy --strict claude_mirror/` — clean across 51 source files (unchanged).
+
+---
+
 ## [0.5.69] — 2026-05-10
 
 ### Fixed — security + correctness polish (SECURITY-POLISH)

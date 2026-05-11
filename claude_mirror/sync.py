@@ -2856,7 +2856,10 @@ class SyncEngine:
                     self._pending_publish_futures.append(future)
             self._append_to_drive_log(event)
         except Exception as e:
-            console.print(f"[yellow]Warning: could not publish event: {e}[/]")
+            console.print(
+                f"[yellow]Warning: could not publish event: "
+                f"{redact_error(str(e))}[/]"
+            )
 
         # Tier 2 multi-backend Slack enrichment — build the per-backend
         # status block + (when applicable) the ACTION REQUIRED alert
@@ -2967,7 +2970,10 @@ class SyncEngine:
             )
             self._remote_log_dirty = False
         except Exception as e:
-            console.print(f"[yellow]Warning: could not write sync log: {e}[/]")
+            console.print(
+                f"[yellow]Warning: could not write sync log: "
+                f"{redact_error(str(e))}[/]"
+            )
 
     def _flush_publishes(self) -> None:
         """Wait for any deferred Pub/Sub publishes to be acknowledged, and
@@ -2976,7 +2982,10 @@ class SyncEngine:
             try:
                 future.result(timeout=10)
             except Exception as e:
-                console.print(f"[yellow]Warning: publish ack failed: {e}[/]")
+                console.print(
+                    f"[yellow]Warning: publish ack failed: "
+                    f"{redact_error(str(e))}[/]"
+                )
         self._pending_publish_futures.clear()
         self._flush_remote_log()
 
